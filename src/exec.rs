@@ -641,15 +641,15 @@ impl Context {
             .env("CITRUS_CHECKS", self.manifest.export_file(&self.repo)?)
             .env("CITRUS_TARGETS", &wanted)
             .env(
-                "CITRUS_BASE",
-                run.base.as_deref().unwrap_or(&config.plan.base),
-            )
-            .env(
                 "CITRUS_PROFILE",
                 self.repo.config.plan.profile.clone().unwrap_or_default(),
             )
             .stdin(Stdio::null())
             .stdout(Stdio::piped());
+        // The base a run was asked to compare with (`citrus run --base`).
+        if let Some(base) = &run.base {
+            command.env("CITRUS_BASE", base);
+        }
         let mut child = command.spawn()?;
         let reader = BufReader::new(child.stdout.take().context("no stdout")?);
         let mut lines: Vec<String> = Vec::new();

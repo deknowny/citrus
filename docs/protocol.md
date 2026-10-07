@@ -10,7 +10,8 @@ with:
 - `CITRUS_TARGETS`: a file naming the checks this run needs, one per line;
 - `CITRUS_CHECKS`: their declarations, including what each one runs
   (docs/manifest.md);
-- `CITRUS_BASE` and `CITRUS_PROFILE`: what the plan was made against.
+- `CITRUS_PROFILE`: the profile planned for, and `CITRUS_BASE` when the run
+  was asked to compare with a base (`citrus run --base`).
 
 It reports in these lines:
 
