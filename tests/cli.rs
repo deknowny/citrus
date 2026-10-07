@@ -2436,6 +2436,12 @@ group vpn {
 check docs = make("ok") {
   paths = ["platform/README.md"]
 }
+
+# Runs for the platform's paths only.
+check platform-only = make("ok") {
+  paths = [platform]
+  when = not touched(["vpn/**"])
+}
 "#,
     );
     let plan_for = |paths: &str| {
@@ -2444,13 +2450,18 @@ check docs = make("ok") {
     };
     assert_eq!(
         plan_for("platform/lib.rs\n"),
-        serde_json::json!(["vpn.backend"])
+        serde_json::json!(["vpn.backend", "platform-only"])
     );
     assert_eq!(
         plan_for("vpn/backend/main.rs\n"),
         serde_json::json!(["vpn.backend"])
     );
     assert_eq!(plan_for("vpn/web/page.tsx\n"), serde_json::json!([]));
+    assert_eq!(
+        plan_for("elsewhere.txt\n"),
+        serde_json::json!([]),
+        "a group it names is not a condition"
+    );
     // A path another check names is not the group's.
     assert_eq!(
         plan_for("platform/README.md\n"),

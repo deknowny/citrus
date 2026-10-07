@@ -284,7 +284,8 @@ fn select(
         let mut added = false;
         for target in &ordered {
             if selected.contains(&target.name)
-                || (!target.inputs.is_empty() && !touched.contains(&target.name))
+                || ((!target.inputs.is_empty() || !target.via.is_empty())
+                    && !touched.contains(&target.name))
             {
                 continue;
             }
