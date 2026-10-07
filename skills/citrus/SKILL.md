@@ -29,7 +29,7 @@ commands in `next`.
 6. **New check or task** — add a `check` or `task` block to `citrus.ci`
    (steps like `run(...)`, `make(...)`, `wait.tcp(...)`, `copy(...)` — no
    shell scripts; `name = value` without aligning columns), then
-   `citrus check`; `citrus do <task>` runs a task. `citrus add <target>
+   `citrus fmt` and `citrus check`; `citrus do <task>` runs a task. `citrus add <target>
    --inputs <globs>` writes a check block for an existing Make target.
 7. **Bring in the base branch** — `citrus integrate` (merge, keep what is still
    proven, re-check the rest); `citrus integrate --push` to publish when green.

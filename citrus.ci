@@ -34,10 +34,13 @@ check "docs" {
 }
 
 check "doctor" {
-  about = "This repository's own Citrus configuration is valid"
+  about = "This repository's own Citrus configuration is valid and formatted"
   owns = ["citrus.ci"]
   reads = rust + cargo_files
-  run = run("cargo", "run", "--quiet", "--locked", "--", "doctor", "--text")
+  run = [
+    run("cargo", "run", "--quiet", "--locked", "--", "doctor", "--text"),
+    run("cargo", "run", "--quiet", "--locked", "--", "fmt", "--check", "--text"),
+  ]
   cache = true
 }
 

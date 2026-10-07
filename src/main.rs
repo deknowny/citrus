@@ -187,6 +187,12 @@ enum Command {
     },
     /// Check citrus.ci before anything runs: syntax, names, fields, globs, portability.
     Check,
+    /// Write .ci files in the canonical layout (no aligned columns).
+    Fmt {
+        /// Only report files that are not formatted; exit 1 if any.
+        #[arg(long)]
+        check: bool,
+    },
     /// Run a task declared in citrus.ci (no name: list the tasks).
     Do { task: Option<String> },
     /// Check that this repository is set up so Citrus can be trusted.
@@ -383,6 +389,7 @@ fn execute(command: Option<Command>, json: bool) -> Result<i32> {
         }
         Command::Stats { days } => stats(&context, days, json),
         Command::Check => check_command(&context, json),
+        Command::Fmt { check } => fmt_command(&context, check, json),
         Command::Do { task } => do_command(&context, task, json),
         Command::Integrate { base, push, no_run } => {
             integrate_command(&context, base, push, !no_run, json)
@@ -1971,14 +1978,46 @@ fn emit_release(context: &Context, item: &crate::state::Release, json: bool) -> 
     Ok(code)
 }
 
+fn fmt_command(context: &Context, check: bool, json: bool) -> Result<i32> {
+    let files = context
+        .project
+        .as_ref()
+        .map(|project| project.files.clone())
+        .unwrap_or_default();
+    let mut changed = Vec::new();
+    for file in &files {
+        let path = context.repo.root.join(file);
+        let text = std::fs::read_to_string(&path)?;
+        let formatted = lang::layout::format(&text);
+        if formatted != text {
+            if !check {
+                std::fs::write(&path, &formatted)?;
+            }
+            changed.push(file.clone());
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            json!({"schema": SCHEMA, "files": files, "changed": changed, "written": !check})
+        );
+    } else if changed.is_empty() {
+        println!("✓ {} .ci files are formatted", files.len());
+    } else {
+        let verb = if check { "not formatted" } else { "formatted" };
+        for file in &changed {
+            println!("  {verb}: {file}");
+        }
+    }
+    Ok(i32::from(check && !changed.is_empty()))
+}
+
 fn check_command(context: &Context, json: bool) -> Result<i32> {
     let Some(project) = &context.project else {
         if json {
             println!("{}", json!({"schema": SCHEMA, "ok": true, "file": null}));
         } else {
-            println!(
-                "no citrus.ci in this repository; nothing to check (TOML configuration is in use)"
-            );
+            println!("no citrus.ci in this repository; nothing to check (`citrus add` starts one)");
         }
         return Ok(0);
     };

@@ -2005,3 +2005,17 @@ pool "builders" { run = run("sh", "remote.sh"), progress = ["LANE"] }
         "alpha\nbeta\n"
     );
 }
+
+#[test]
+fn fmt_removes_aligned_columns_and_keeps_meaning() {
+    let project = Project::new(
+        "task \"t\" {\n    about   = \"a  b\"   # note\n  steps = [copy(\"src/a.txt\",\"out/a.txt\")]\n}\n",
+    );
+    assert_eq!(project.json(&["fmt", "--check"]).1, 1);
+    let (written, code) = project.json(&["fmt"]);
+    assert_eq!(code, 0, "{written}");
+    let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
+    assert!(text.contains("task \"t\" {\n  about = \"a  b\"  # note\n  steps = [copy(\"src/a.txt\", \"out/a.txt\")]\n}\n"), "{text}");
+    assert_eq!(project.json(&["fmt", "--check"]).1, 0);
+    assert_eq!(project.json(&["check"]).0["tasks"], 1);
+}

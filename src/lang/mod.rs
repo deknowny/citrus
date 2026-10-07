@@ -6,6 +6,7 @@ pub mod ast;
 pub mod cargo;
 pub mod compile;
 pub mod eval;
+pub mod layout;
 pub mod lexer;
 pub mod parser;
 

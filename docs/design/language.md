@@ -236,8 +236,8 @@ dashboard or returned to agents. `env(name)` — a non-secret variable.
    inputs miss files they read (when detectable), non-portable actions.
 3. Commands (`status`, `run`, `diff`, `apply`, `do`) select a part of the
    graph and execute it. The runtime records every transition as an event.
-4. `citrus fmt` (planned) prints the canonical layout, so files written by
-   different agents look the same.
+4. `citrus fmt` writes the canonical layout (`--check` only reports), so
+   files written by different agents look the same.
 
 ## Layout
 
@@ -245,7 +245,7 @@ One space around `=`, two-space indentation, one block per declaration. No
 vertical alignment of `=` or comments: aligned columns cost tokens on every
 line an agent reads or writes, and adding one longer field re-aligns its
 neighbours — noisy diffs and merge conflicts between agents working in
-parallel. `citrus fmt` will enforce this layout.
+parallel. `citrus fmt` enforces this layout.
 
 ## Execution events
 
