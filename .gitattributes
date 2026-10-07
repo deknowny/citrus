@@ -1,0 +1,2 @@
+# GitHub highlights .ci files as HCL until Citrus has its own grammar.
+*.ci linguist-language=HCL
