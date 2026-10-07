@@ -2261,3 +2261,19 @@ check "contracts" { when = touched("removed"), run = make("ok") }
         "{plan}"
     );
 }
+
+#[test]
+fn an_edited_ci_file_still_selects_the_checks_that_own_it() {
+    let project = Project::new(
+        "project { base = \"main\" }\ncheck \"config\" { owns = [\"citrus.ci\"], run = make(\"ok\") }\n",
+    );
+    project.git(&["checkout", "-q", "-b", "feature"]);
+    project.declare("# a comment\n");
+    project.commit("comment");
+    let (plan, _) = project.json(&["plan"]);
+    assert_eq!(
+        plan["plan"]["targets"],
+        serde_json::json!(["config"]),
+        "{plan}"
+    );
+}

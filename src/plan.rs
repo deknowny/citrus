@@ -239,6 +239,7 @@ fn select(
         files: paths.len(),
         ..Plan::default()
     };
+    let mut edited_surfaces = String::new();
     let edited: Vec<String> = paths
         .iter()
         .filter(|path| manifest.files.contains(path))
@@ -256,18 +257,13 @@ fn select(
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        for path in &edited {
-            plan.mapped.push((path.clone(), surfaces.clone()));
-        }
+        edited_surfaces = surfaces;
         plan.targets.extend(changed);
     }
     let found = signals(repo, manifest, &paths, fork, explicit)?;
     // Which groups and checks the changed paths touch.
     let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for path in &paths {
-        if edited.contains(path) {
-            continue;
-        }
         let owners = manifest.owners(path);
         // A path a check owns is that check's: it touches only the groups
         // that feed conditions (claims = false), not the claiming ones.
@@ -296,7 +292,12 @@ fn select(
             })
             .collect();
         if owners.is_empty() && claiming.is_empty() {
-            plan.unmapped.push(path.clone());
+            // An edited .ci file nobody owns maps to the checks it changed.
+            if edited.contains(path) {
+                plan.mapped.push((path.clone(), edited_surfaces.clone()));
+            } else {
+                plan.unmapped.push(path.clone());
+            }
             continue;
         }
         plan.mapped.push((
