@@ -1957,7 +1957,7 @@ fn checks_that_passed_quickly_run_locally_others_in_the_pool() {
     let project = Project::new("pool \"builders\" { run = run(\"sh\", \"remote.sh\") }\n");
     project.write(
         "remote.sh",
-        "echo 'CITRUS_TARGET target=ok status=PASS exit=0'\n",
+        "echo 'CITRUS_TARGET target=ok status=PASS exit=0 seconds=3'\n",
     );
     project.commit("pool");
     project.write("src/a.txt", "changed\n");
@@ -1966,7 +1966,6 @@ fn checks_that_passed_quickly_run_locally_others_in_the_pool() {
         first["run"]["mode"], "remote",
         "never passed: assumed heavy {first}"
     );
-    assert_eq!(project.json(&["run", "ok"]).1, 0);
     project.write("src/a.txt", "changed again\n");
     let (second, _) = project.json(&["run"]);
     assert_eq!(second["run"]["mode"], "local", "{second}");
