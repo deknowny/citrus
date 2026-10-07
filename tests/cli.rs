@@ -2277,3 +2277,23 @@ fn an_edited_ci_file_still_selects_the_checks_that_own_it() {
         "{plan}"
     );
 }
+
+#[test]
+fn an_exclusive_group_keeps_its_paths_from_broad_groups() {
+    let project = Project::new(
+        r#"
+group "web" { owns = ["web/**"] }
+group "vpn" { owns = ["web/apps/vpn/**"], exclusive = true }
+group "vpn" { owns = ["web/shared/**"] }
+check "web-tests" { when = touched("web"), run = make("ok") }
+check "vpn-tests" { when = touched("vpn"), run = make("ok") }
+"#,
+    );
+    project.write("paths.txt", "web/apps/vpn/page.tsx\n");
+    let (plan, _) = project.json(&["plan", "--paths-file", "paths.txt"]);
+    assert_eq!(
+        plan["plan"]["targets"],
+        serde_json::json!(["vpn-tests"]),
+        "{plan}"
+    );
+}

@@ -97,7 +97,9 @@ check "test-clyer-pipeline-contract" {
   groups contain stays unmapped (`group "main" { owns = ["**", "!clyer/**"],
   claims = false }`).
 - A path a check owns belongs to that check: it touches only groups with
-  `claims = false`, never the claiming ones.
+  `claims = false`, never the claiming ones. `exclusive = true` gives a group
+  declaration the same strength (a product's own paths are not also the
+  broad `web/**` surface).
 - `label "name" { when = … }` reports a named condition with the plan
   (`labels`), for tools that need the plan's character (Garvis' scope).
 - Declaring a group again adds paths: a path belongs to the group when any

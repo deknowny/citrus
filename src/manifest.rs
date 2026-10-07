@@ -142,12 +142,20 @@ pub struct PathGroup {
     pub note: Option<String>,
     /// False: only for conditions; a path in it alone stays unmapped.
     pub claims: bool,
-    globs: Vec<GlobList>,
+    /// Each declaration's globs, and whether its paths touch no other
+    /// claiming group (`exclusive = true`).
+    globs: Vec<(GlobList, bool)>,
 }
 
 impl PathGroup {
     pub fn owns(&self, path: &str) -> bool {
-        self.globs.iter().any(|globs| globs.matches(path))
+        self.globs.iter().any(|(globs, _)| globs.matches(path))
+    }
+
+    pub fn owns_exclusively(&self, path: &str) -> bool {
+        self.globs
+            .iter()
+            .any(|(globs, exclusive)| *exclusive && globs.matches(path))
     }
 }
 
@@ -169,7 +177,7 @@ impl Manifest {
             let globs = GlobList::new(&group.owns)?;
             match groups.iter_mut().find(|known| known.name == group.name) {
                 Some(known) => {
-                    known.globs.push(globs);
+                    known.globs.push((globs, group.exclusive));
                     if known.note.is_none() {
                         known.note = group.note.clone();
                     }
@@ -178,7 +186,7 @@ impl Manifest {
                     name: group.name.clone(),
                     note: group.note.clone(),
                     claims: group.claims,
-                    globs: vec![globs],
+                    globs: vec![(globs, group.exclusive)],
                 }),
             }
         }

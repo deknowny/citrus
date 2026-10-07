@@ -202,6 +202,8 @@ pub struct Group {
     pub note: Option<String>,
     /// False: the group only feeds conditions; it does not map a path.
     pub claims: bool,
+    /// True: its paths touch no other claiming group (like a check's `owns`).
+    pub exclusive: bool,
     pub span: Span,
 }
 
@@ -425,12 +427,13 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     .push((name, cond(value, decl.field_span("when"))?));
             }
             "group" => {
-                known_fields(decl, &["owns", "note", "claims"])?;
+                known_fields(decl, &["owns", "note", "claims", "exclusive"])?;
                 let name = label(decl)?;
                 project.groups.push(Group {
                     owns: unique(strings(decl, "owns")?),
                     note: optional_string(decl, "note")?,
                     claims: !matches!(decl.field("claims"), Some(Value::Bool(false))),
+                    exclusive: matches!(decl.field("exclusive"), Some(Value::Bool(true))),
                     name,
                     span: decl.span,
                 });

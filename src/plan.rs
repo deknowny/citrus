@@ -267,17 +267,30 @@ fn select(
         let owners = manifest.owners(path);
         // A path a check owns is that check's: it touches only the groups
         // that feed conditions (claims = false), not the claiming ones.
+        let in_group = |group: &&crate::manifest::PathGroup| {
+            group.owns(path)
+                || found
+                    .claims
+                    .iter()
+                    .any(|(claimed, name)| claimed == path && *name == group.name)
+        };
+        // An exclusive group's path, like a check's, touches no other
+        // claiming group.
+        let exclusive: Vec<&str> = manifest
+            .groups
+            .iter()
+            .filter(|group| group.owns_exclusively(path))
+            .map(|group| group.name.as_str())
+            .collect();
         let groups: Vec<&str> = manifest
             .groups
             .iter()
-            .filter(|group| owners.is_empty() || !group.claims)
             .filter(|group| {
-                group.owns(path)
-                    || found
-                        .claims
-                        .iter()
-                        .any(|(claimed, name)| claimed == path && *name == group.name)
+                !group.claims
+                    || (owners.is_empty()
+                        && (exclusive.is_empty() || exclusive.contains(&group.name.as_str())))
             })
+            .filter(in_group)
             .map(|group| group.name.as_str())
             .collect();
         touched.extend(owners.iter().map(|name| (*name).to_owned()));
