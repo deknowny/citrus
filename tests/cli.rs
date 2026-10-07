@@ -2458,3 +2458,52 @@ check docs = make("ok") {
         "{error}"
     );
 }
+
+#[test]
+fn only_checks_with_known_inputs_are_reused() {
+    let project = Project::new(
+        r#"
+project {
+  cache = false
+}
+
+group lib {
+  paths = ["lib/**"]
+  cache = true
+  check unit = make("ok")
+}
+
+# Selected by a condition: nothing tells what it reads.
+check after = make("ok") {
+  when = selected(lib.unit)
+}
+
+check named = make("ok") {
+  paths = [lib, "extra/**"]
+  cache = true
+}
+"#,
+    );
+    let (targets, _) = project.json(&["targets"]);
+    let row = |name: &str| {
+        targets["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["target"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row("lib.unit")["cache"], true, "{targets}");
+    assert_eq!(row("after")["cache"], false, "{targets}");
+    assert_eq!(
+        row("ok")["cache"],
+        false,
+        "the project's default: {targets}"
+    );
+    assert_eq!(
+        row("named")["extra_inputs"],
+        serde_json::json!(["lib/**"]),
+        "a group it names is an input: {targets}"
+    );
+}

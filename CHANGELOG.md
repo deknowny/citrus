@@ -27,7 +27,10 @@ Every element does something, names are bare, data is quoted:
   `let main = ["**", "!clyer/**"]`); `paths - other` excludes `other`.
 - `replaces = [parts]`: one check instead of several parts when the change
   goes beyond one of them.
-- A group's `needs` and `env { }` reach every check in it.
+- A group's `needs`, `cache` and `env { }` reach every check in it;
+  `project { cache = false }` makes reuse opt-in. A check with no known
+  inputs (only `when`) is never reused, and a group it names in `paths` is
+  part of its inputs.
 - Profiles are declarations with their own `env { }`; `profiles` and
   `check_env` are gone.
 - Services: started once before the first local check that needs them, or

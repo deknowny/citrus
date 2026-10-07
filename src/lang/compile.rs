@@ -242,6 +242,9 @@ pub struct Check {
     pub owns: Vec<String>,
     pub reads: Vec<String>,
     pub cache: bool,
+    /// `cache` as the check or its group says; otherwise the project's default.
+    #[serde(skip)]
+    pub cache_set: Option<bool>,
     pub resources: Vec<String>,
     /// Project-specific data for the project's own tools (`meta = { … }`).
     pub meta: BTreeMap<String, serde_json::Value>,
@@ -348,12 +351,15 @@ struct Scope<'a> {
     paths: &'a [String],
     env: &'a [(String, String)],
     needs: &'a [String],
+    cache: Option<bool>,
 }
 
 pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
     let mut project = Project::default();
     let mut runners: Vec<(String, Pool, Span)> = Vec::new();
     let mut chosen_runner: Option<(String, Span)> = None;
+    // `project { cache = false }`: checks reuse a pass only when they say so.
+    let mut default_cache = true;
     // (check index, field, names, span): references resolved after all checks are known.
     let mut covers: Vec<(String, Vec<String>, Span)> = Vec::new();
     let mut needs: Vec<(usize, Vec<String>, Span)> = Vec::new();
@@ -370,8 +376,12 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                         "receipts",
                         "after_merge",
                         "signals",
+                        "cache",
                     ],
                 )?;
+                if let Some(Value::Bool(flag)) = decl.field("cache") {
+                    default_cache = *flag;
+                }
                 known_children(decl, &[])?;
                 project.base = optional_string(decl, "main")?;
                 if let Some(value) = decl.field("runner") {
@@ -477,7 +487,7 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     .push((name, cond(value, decl.field_span("when"))?));
             }
             "group" => {
-                known_fields(decl, &["paths", "needs"])?;
+                known_fields(decl, &["paths", "needs", "cache"])?;
                 known_children(decl, &["check", "env"])?;
                 let name = label(decl)?;
                 if project.groups.iter().any(|group| group.name == name) {
@@ -500,6 +510,10 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     paths: &paths,
                     env: &env,
                     needs: &group_needs,
+                    cache: match decl.field("cache") {
+                        Some(Value::Bool(flag)) => Some(*flag),
+                        _ => None,
+                    },
                 };
                 for child in decl.children.iter().filter(|child| child.kind == "check") {
                     compile_check(child, Some(&scope), &mut project, &mut covers, &mut needs)?;
@@ -630,6 +644,27 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                 project.checks[index].covered_by.push(by.clone());
             }
         }
+    }
+    // A group a check names in its paths is part of its inputs; a check with
+    // no known inputs is never reused by them.
+    let group_paths: BTreeMap<String, Vec<String>> = project
+        .groups
+        .iter()
+        .map(|group| (group.name.clone(), group.owns.clone()))
+        .collect();
+    for check in &mut project.checks {
+        // The groups' globs first: a check's own reads may re-include what a
+        // group excludes, never the other way round.
+        let mut reads: Vec<String> = Vec::new();
+        for name in &check.via {
+            reads.extend(group_paths.get(name).into_iter().flatten().cloned());
+        }
+        if !reads.is_empty() {
+            reads.extend(check.reads.drain(..));
+            check.reads = reads;
+        }
+        check.cache = check.cache_set.unwrap_or(default_cache)
+            && !(check.owns.is_empty() && check.reads.is_empty());
     }
     for check in &project.checks {
         for name in &check.via {
@@ -960,7 +995,11 @@ fn compile_check(
         description: decl.doc.clone(),
         owns,
         reads: unique(strings(decl, "reads")?),
-        cache: !matches!(decl.field("cache"), Some(Value::Bool(false))),
+        cache: true,
+        cache_set: match decl.field("cache") {
+            Some(Value::Bool(flag)) => Some(*flag),
+            _ => group.and_then(|group| group.cache),
+        },
         resources: Vec::new(),
         profiles,
         covered_by: Vec::new(),

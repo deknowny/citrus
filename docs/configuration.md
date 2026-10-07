@@ -22,6 +22,7 @@ project {
   after_merge = run("scripts/after-merge", before)   # after `citrus integrate` merged
   logs = ".validation/logs"            # run logs in the tree (default: .git/citrus/logs)
   receipts = "citrus/receipts"         # PASS receipts, relative to the Git directory
+  cache = false                        # reuse a pass only where a check or group says `cache = true`
 }
 
 # Fast checks read committed SQLx metadata.
@@ -89,7 +90,7 @@ environment production = kubernetes(context: "prod", namespace: "api") { … }
 | `profile name` | a set of checks run together (`--profile`); the first one is the default; `env { }` applies to its checks |
 | `service name [= action] { ready, limit }` | something checks `need`: started by Citrus when it has an action, otherwise a resource the runner provides, `limit` at a time |
 | `runner name = action { status }` | runs the planned checks elsewhere (docs/protocol.md) |
-| `group name { paths, needs, env, check … }` | a set of paths and the checks that protect it; its checks inherit `needs` and `env` |
+| `group name { paths, needs, cache, env, check … }` | a set of paths and the checks that protect it; its checks inherit `needs`, `cache` and `env` |
 | `check name = action { … }` | a check; inside a group it is called `group.name` |
 | `label name { when }` | a named condition reported with the plan |
 | `task name = actions` | `citrus do name` |
@@ -108,7 +109,7 @@ environment production = kubernetes(context: "prod", namespace: "api") { … }
 | `covers = [check, …]` | it runs them itself: with it in the plan they are dropped |
 | `replaces = [check, …]` | when the change goes beyond one of them, it runs instead of them |
 | `when = condition` | selected only when this holds |
-| `cache = false` | never reuse a pass |
+| `cache` | reuse a pass while its inputs are unchanged (default: the group's, else the project's, else `true`); a check with no paths or reads is never reused |
 | `meta = { … }` | data for the project's own tools, passed through `CITRUS_CHECKS` |
 
 The action is one step or a list of steps, or `match changed { … }`: the
