@@ -90,6 +90,17 @@ your own planner, a remote runner on shared builders, npm scripts, progress
 markers — is configured in [`citrus.toml`](docs/configuration.md); see
 [examples/](examples/).
 
+## Pinning Citrus in a repository
+
+Pin an exact commit and build it once per machine — no release needed:
+
+```sh
+cargo install --git https://github.com/deknowny/citrus --rev <full-commit-sha> --locked --root .citrus/bin
+```
+
+or download a release binary and check it against the release's `SHA256SUMS`.
+A small launcher script in your repository can do either and cache the result.
+
 ## For AI agents
 
 Give your agents [skills/citrus/SKILL.md](skills/citrus/SKILL.md) (Claude Code,

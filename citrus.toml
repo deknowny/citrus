@@ -1,0 +1,5 @@
+# Citrus develops itself with Citrus (docs/configuration.md).
+toolchain_files = ["Cargo.lock"]
+
+[plan]
+base = "origin/main"

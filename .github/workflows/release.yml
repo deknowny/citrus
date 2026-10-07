@@ -21,6 +21,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - name: tag matches Cargo.toml
+        run: test "v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
       - name: package
