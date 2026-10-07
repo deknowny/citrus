@@ -2153,7 +2153,7 @@ project { base = "main", signals = run("sh", "signals.sh") }
 group "docs" { owns = ["*.md"], note = "no-heavy:docs" }
 group "pipeline" { owns = ["scripts/**"] }
 group "clyer" { owns = ["clyer/**"] }
-group "main" { owns = ["**", "!clyer/**", "!*.md"] }
+group "main" { owns = ["**", "!clyer/**", "!*.md"], claims = false }
 check "main-pipeline" { when = touched("pipeline") and touched("main") and not touched("clyer"), run = make("ok") }
 check "clyer-pipeline" { when = touched("pipeline") and touched("clyer") and not touched("main"), run = make("ok") }
 check "mixed-pipeline" { when = touched("pipeline") and touched("main") and touched("clyer"), run = make("ok") }

@@ -197,6 +197,8 @@ pub struct Group {
     pub owns: Vec<String>,
     /// Shown in the plan when the group is touched, e.g. `no-heavy:docs`.
     pub note: Option<String>,
+    /// False: the group only feeds conditions; it does not map a path.
+    pub claims: bool,
     pub span: Span,
 }
 
@@ -404,11 +406,12 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                 });
             }
             "group" => {
-                known_fields(decl, &["owns", "note"])?;
+                known_fields(decl, &["owns", "note", "claims"])?;
                 let name = label(decl)?;
                 project.groups.push(Group {
                     owns: unique(strings(decl, "owns")?),
                     note: optional_string(decl, "note")?,
+                    claims: !matches!(decl.field("claims"), Some(Value::Bool(false))),
                     name,
                     span: decl.span,
                 });

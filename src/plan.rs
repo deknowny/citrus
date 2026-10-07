@@ -272,18 +272,27 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> R
             })
             .map(|group| group.name.as_str())
             .collect();
-        if owners.is_empty() && groups.is_empty() {
+        touched.extend(owners.iter().map(|name| (*name).to_owned()));
+        touched.extend(groups.iter().map(|name| (*name).to_owned()));
+        let claiming: Vec<&&str> = groups
+            .iter()
+            .filter(|name| {
+                manifest
+                    .groups
+                    .iter()
+                    .any(|group| group.name == ***name && group.claims)
+            })
+            .collect();
+        if owners.is_empty() && claiming.is_empty() {
             plan.unmapped.push(path.clone());
             continue;
         }
-        touched.extend(owners.iter().map(|name| (*name).to_owned()));
-        touched.extend(groups.iter().map(|name| (*name).to_owned()));
         plan.mapped.push((
             path.clone(),
             owners
                 .iter()
                 .map(|owner| format!("target:{owner}"))
-                .chain(groups.iter().map(|group| format!("group:{group}")))
+                .chain(claiming.iter().map(|group| format!("group:{group}")))
                 .collect::<Vec<_>>()
                 .join(","),
         ));

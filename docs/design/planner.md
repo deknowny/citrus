@@ -90,6 +90,9 @@ check "test-clyer-pipeline-contract" {
 - `and`, `or`, `not` combine them. A check with `owns` and `when` needs
   both; a check with only `when` is chosen by the condition.
 - A touched group's `note` is listed with the plan's targets.
+- `claims = false`: the group feeds conditions only; a path that only such
+  groups contain stays unmapped (`group "main" { owns = ["**", "!clyer/**"],
+  claims = false }`).
 - Declaring a group again adds paths: a path belongs to the group when any
   declaration matches it (each with its own `!` exclusions).
 

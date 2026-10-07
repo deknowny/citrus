@@ -138,6 +138,8 @@ pub struct Manifest {
 pub struct PathGroup {
     pub name: String,
     pub note: Option<String>,
+    /// False: only for conditions; a path in it alone stays unmapped.
+    pub claims: bool,
     globs: Vec<GlobList>,
 }
 
@@ -173,6 +175,7 @@ impl Manifest {
                 None => groups.push(PathGroup {
                     name: group.name.clone(),
                     note: group.note.clone(),
+                    claims: group.claims,
                     globs: vec![globs],
                 }),
             }
