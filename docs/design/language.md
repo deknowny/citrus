@@ -138,7 +138,7 @@ Check fields:
 
 | Field | Meaning |
 |---|---|
-| `paths` | narrows the group's paths, or gives a lone check its paths |
+| `paths` | narrows the group's paths, or gives a lone check its paths; a group named in it (`[platform, "x/**"]`) selects the check too |
 | `reads` | more inputs: they invalidate a cached pass but do not select the check |
 | `profile` | the profile it belongs to |
 | `needs` | services it needs (below) |

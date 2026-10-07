@@ -21,7 +21,8 @@ Every element does something, names are bare, data is quoted:
 - `match changed { only(g) => …, without(g) => …, _ => … }`: the plan picks
   the arm the check runs, and its fingerprint follows it.
 - A path a check names in its own `paths` is that check's alone: groups
-  elsewhere do not see it; shared inputs go to `reads`.
+  elsewhere do not see it; shared inputs go to `reads`. `paths` may name a
+  group: its paths select the check and stay shared.
 - Conditions take a group, a check or a list of globs (`touched(main)` with
   `let main = ["**", "!clyer/**"]`); `paths - other` excludes `other`.
 - `replaces = [parts]`: one check instead of several parts when the change

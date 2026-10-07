@@ -33,6 +33,8 @@ pub struct Target {
     /// The group it is declared in, and whether it narrows the group's paths.
     pub group: Option<String>,
     pub narrows: bool,
+    /// Groups whose paths select it too.
+    pub via: Vec<String>,
     /// `match changed` arms; a plan picks one (or none: `steps`).
     pub arms: Vec<(crate::lang::compile::Cond, Vec<crate::lang::compile::Step>)>,
     /// `file:line` of the declaration in `citrus.ci`.
@@ -94,6 +96,7 @@ impl Target {
             arms: check.arms.clone(),
             group: check.group.clone(),
             narrows: check.narrows,
+            via: check.via.clone(),
             source: Some(source),
             profiles: check.profiles.clone(),
             covered_by: check.covered_by.clone(),

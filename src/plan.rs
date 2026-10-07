@@ -228,6 +228,17 @@ fn select(
             });
             groups.retain(|group| homes.contains(group));
         }
+        // Checks that name a group in their paths run for its paths too.
+        for target in manifest.targets.values() {
+            if target
+                .via
+                .iter()
+                .any(|group| groups.contains(&group.as_str()))
+                && !owners.contains(&target.name.as_str())
+            {
+                owners.push(&target.name);
+            }
+        }
         touched.extend(owners.iter().map(|name| (*name).to_owned()));
         touched.extend(groups.iter().map(|name| (*name).to_owned()));
         for group in &groups {

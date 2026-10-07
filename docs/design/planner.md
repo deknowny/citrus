@@ -30,7 +30,11 @@ A path a check names in its own `paths` is that check's: groups elsewhere,
 and their checks, do not see it (the specific owner wins, as in
 CODEOWNERS). A tool's own test runs when the tool changes, not the broad
 contract of everything under `scripts/`. Inputs a check shares with others
-go to its `reads`, or stay with a group. A group without checks (documentation) claims its paths and runs
+go to its `reads`, or stay with a group.
+
+A check can name a group in its paths, `paths = [platform,
+"crates/proto/**"]`: it runs for the platform group's paths, which other
+checks share, and for its own files, which it owns alone. A group without checks (documentation) claims its paths and runs
 nothing.
 
 ## 2. Profiles

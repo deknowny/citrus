@@ -2409,3 +2409,55 @@ check tool = make("ok") {
         serde_json::json!(["infra.contract", "tool"])
     );
 }
+
+#[test]
+fn a_check_runs_for_a_group_it_names_and_its_own_paths() {
+    let project = Project::new(
+        r#"
+# Platform crates every product builds on.
+group platform {
+  paths = ["platform/**"]
+}
+
+group vpn {
+  paths = ["vpn/**"]
+  check backend = make("ok") {
+    paths = [platform, "vpn/backend/**"]
+  }
+}
+
+check docs = make("ok") {
+  paths = ["platform/README.md"]
+}
+"#,
+    );
+    let plan_for = |paths: &str| {
+        project.write("paths.txt", paths);
+        project.json(&["plan", "--paths-file", "paths.txt"]).0["plan"]["targets"].clone()
+    };
+    assert_eq!(
+        plan_for("platform/lib.rs\n"),
+        serde_json::json!(["vpn.backend"])
+    );
+    assert_eq!(
+        plan_for("vpn/backend/main.rs\n"),
+        serde_json::json!(["vpn.backend"])
+    );
+    assert_eq!(plan_for("vpn/web/page.tsx\n"), serde_json::json!([]));
+    // A path another check names is not the group's.
+    assert_eq!(
+        plan_for("platform/README.md\n"),
+        serde_json::json!(["docs"])
+    );
+    let unknown = Project::new(
+        "check x = make(\"ok\") {\n  paths = [platfrm]\n}\n\ngroup platform {\n  paths = [\"src/**\"]\n}\n",
+    );
+    let error = unknown.json(&["status"]).0["error"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        error.contains("no group `platfrm`") && error.contains("did you mean `platform`?"),
+        "{error}"
+    );
+}

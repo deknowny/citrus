@@ -250,6 +250,8 @@ pub struct Check {
     /// The group it is declared in; `narrows`: it has its own `paths`.
     pub group: Option<String>,
     pub narrows: bool,
+    /// Groups whose paths select it too (`paths = [platform, …]`).
+    pub via: Vec<String>,
     /// `match changed` arms: the first whose condition holds replaces `steps`.
     pub arms: Vec<(Cond, Vec<Step>)>,
     /// Profiles the check belongs to; empty: every profile.
@@ -627,6 +629,16 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
         }
     }
     for check in &project.checks {
+        for name in &check.via {
+            if !project.groups.iter().any(|group| group.name == *name) {
+                return Err(unknown(
+                    check.span,
+                    "group",
+                    name,
+                    project.groups.iter().map(|group| group.name.as_str()),
+                ));
+            }
+        }
         for name in &check.replaces {
             if !project.checks.iter().any(|other| other.name == *name) {
                 return Err(unknown(
@@ -810,18 +822,52 @@ fn compile_check(
         env.retain(|(known, _)| *known != name);
         env.push((name, value));
     }
-    let own_paths = unique(strings(decl, "paths")?);
-    let narrows = !own_paths.is_empty();
-    let owns = if own_paths.is_empty() {
-        group.map(|group| group.paths.to_vec()).unwrap_or_default()
-    } else {
+    // `paths = [platform, "x/**"]`: a group's paths (shared) and globs (its own).
+    let mut via = Vec::new();
+    let mut globs = Vec::new();
+    match decl.field("paths") {
+        None | Some(Value::None) => {}
+        Some(Value::List(items)) => {
+            for item in items {
+                match item {
+                    Value::Str(glob) => globs.push(glob.clone()),
+                    Value::Ref(name) => via.push(name.clone()),
+                    other => {
+                        return Err(Error::at(
+                            decl.field_span("paths"),
+                            format!(
+                                "`paths` takes globs and group names, not a {}",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Some(Value::Str(glob)) => globs.push(glob.clone()),
+        Some(Value::Ref(name)) => via.push(name.clone()),
+        Some(other) => {
+            return Err(Error::at(
+                decl.field_span("paths"),
+                format!(
+                    "`paths` takes globs and group names, not a {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    }
+    let own_paths = unique(globs);
+    let narrows = !own_paths.is_empty() || !via.is_empty();
+    let owns = if narrows {
         own_paths
+    } else {
+        group.map(|group| group.paths.to_vec()).unwrap_or_default()
     };
     let when = match decl.field("when") {
         None => None,
         Some(value) => Some(cond(value, decl.field_span("when"))?),
     };
-    if owns.is_empty() && when.is_none() {
+    if owns.is_empty() && via.is_empty() && when.is_none() {
         return Err(Error::at(decl.span, format!("check {title} has no paths"))
             .help("put it in a group, or give it `paths = [\"…\"]`"));
     }
@@ -918,6 +964,7 @@ fn compile_check(
         arms,
         group: group.map(|group| group.name.to_owned()),
         narrows,
+        via,
         span: decl.span,
     });
     if !covered.is_empty() {
