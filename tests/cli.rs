@@ -552,3 +552,218 @@ fn bundled_examples_are_valid_configurations() {
         );
     }
 }
+
+/// A bare "origin" next to the project, with the project's main pushed to it.
+fn with_origin(project: &Project) -> PathBuf {
+    let origin = project.root().with_extension("origin.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&origin)
+            .status()
+            .unwrap()
+            .success()
+    );
+    project.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+    project.git(&["push", "-q", "-u", "origin", "main"]);
+    origin
+}
+
+/// Commit `path` on origin/main from a separate clone.
+fn commit_upstream(origin: &Path, path: &str, content: &str) {
+    let clone = origin.with_extension(format!("clone-{}", path.replace('/', "-")));
+    let _ = fs::remove_dir_all(&clone);
+    assert!(
+        Command::new("git")
+            .args(["clone", "-q"])
+            .arg(origin)
+            .arg(&clone)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = clone.join(path);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, content).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&clone)
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=u",
+        "-c",
+        "user.email=u@u",
+        "commit",
+        "-qm",
+        "upstream",
+    ]);
+    git(&["push", "-q", "origin", "HEAD:main"]);
+}
+
+const PLANNER: &str =
+    "[plan]\ncommand = [\"sh\", \"plan.sh\"]\npaths_arg = \"{file}\"\nbase = \"origin/main\"\n";
+// Changes under web/ select `plain`; without a path list the plan is this task's own changes.
+const PLAN_SH: &str = "if [ -n \"$1\" ]; then grep -q '^web/' \"$1\" && printf 'TARGET\\tmake:plain\\n'; printf 'PLAN\\tstatus=complete\\n'; else printf 'TARGET\\tmake:plain\\n'; fi\n";
+
+#[test]
+fn integrate_keeps_checks_the_incoming_changes_do_not_touch() {
+    let project = Project::new(PLANNER);
+    project.write("plan.sh", PLAN_SH);
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "planner",
+    ]);
+    let origin = with_origin(&project);
+    project.git(&["checkout", "-q", "-b", "feature"]);
+    project.write("web/page.txt", "feature\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "feature",
+    ]);
+    assert_eq!(
+        target(&project.json(&["run"]).0, "plain")["result"],
+        "passed"
+    );
+
+    commit_upstream(&origin, "docs/readme.md", "unrelated\n");
+    let (merged, code) = project.json(&["integrate", "--no-run"]);
+    assert_eq!(code, 0, "{merged}");
+    assert_eq!(merged["integration"]["outcome"], "merged");
+    assert_eq!(
+        merged["integration"]["carried"],
+        serde_json::json!(["plain"]),
+        "{merged}"
+    );
+    let (status, _) = project.json(&["status"]);
+    assert_eq!(status["targets"][0]["reason"], "carried_over", "{status}");
+
+    commit_upstream(&origin, "web/other.txt", "touches web\n");
+    let (merged, _) = project.json(&["integrate", "--no-run"]);
+    assert_eq!(
+        merged["integration"]["reselected"],
+        serde_json::json!(["plain"]),
+        "{merged}"
+    );
+    assert_eq!(merged["integration"]["carried"], serde_json::json!([]));
+
+    let (pushed, code) = project.json(&["integrate", "--push"]);
+    assert_eq!(code, 0, "{pushed}");
+    assert_eq!(pushed["pushed"], true);
+    let remote_head = Command::new("git")
+        .args(["rev-parse", "main"])
+        .current_dir(&origin)
+        .output()
+        .unwrap()
+        .stdout;
+    let local_head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(project.root())
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(remote_head, local_head);
+}
+
+#[test]
+fn integrate_reports_conflicts_and_needs_a_clean_tree() {
+    let project = Project::new("");
+    let origin = with_origin(&project);
+    project.write("src/a.txt", "local\n");
+    assert!(
+        project.json(&["integrate"]).0["error"]
+            .as_str()
+            .unwrap()
+            .contains("commit or stash")
+    );
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "local",
+    ]);
+    commit_upstream(&origin, "src/a.txt", "upstream\n");
+    let (conflict, code) = project.json(&["integrate"]);
+    assert_eq!(code, 1);
+    assert_eq!(conflict["integration"]["outcome"], "conflict");
+    assert_eq!(
+        conflict["integration"]["conflicts"],
+        serde_json::json!(["src/a.txt"])
+    );
+}
+
+#[test]
+fn tasks_and_notes_show_other_worktrees() {
+    let project = Project::new("");
+    let other = project.root().with_extension("second");
+    project.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "second",
+        other.to_str().unwrap(),
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        .args(["note", "waiting for the schema change", "--json"])
+        .current_dir(&other)
+        .env("CITRUS_AGENT", "agent-b")
+        .env_remove("CLAUDECODE")
+        .env_remove("CODEX_THREAD_ID")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let (tasks, _) = project.json(&["tasks", "--all", "--base", "main"]);
+    let list = tasks["tasks"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{tasks}");
+    let second = list.iter().find(|task| task["branch"] == "second").unwrap();
+    assert_eq!(second["note"], "waiting for the schema change");
+    assert_eq!(second["note_agent"], "agent-b");
+    let (status, _) = project.json(&["status"]);
+    assert_eq!(
+        status["notes"][0]["note"], "waiting for the schema change",
+        "{status}"
+    );
+    project.json(&["note", "--clear"]);
+}
+
+#[test]
+fn overview_lists_commands_and_the_project_catalog() {
+    let config =
+        "[[catalog]]\ncommand = \"make deploy\"\ndescription = \"ship it\"\ngroup = \"release\"\n";
+    let project = Project::new(config);
+    let (overview, code) = project.json(&[]);
+    assert_eq!(code, 0, "{overview}");
+    assert!(
+        overview["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["command"] == "citrus integrate [--push]")
+    );
+    assert_eq!(overview["catalog"][0]["command"], "make deploy");
+    let (targets, _) = project.json(&["targets"]);
+    assert_eq!(targets["targets"].as_array().unwrap().len(), 2);
+}

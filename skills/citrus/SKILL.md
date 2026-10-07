@@ -29,7 +29,11 @@ commands in `next`.
 6. **New check** — create the command (for example a Make target), then
    `citrus add <target> --inputs <globs> [--extra <globs>] [--cache]`.
    No wrapper script for running or parsing results.
-7. **Is it helping** — `citrus stats`.
+7. **Bring in the base branch** — `citrus integrate` (merge, keep what is still
+   proven, re-check the rest); `citrus integrate --push` to publish when green.
+8. **Other tasks** — `citrus tasks` shows every worktree; `citrus note <text>`
+   tells the others what you are doing or waiting for (instead of a message).
+9. **Is it helping** — `citrus stats`. `citrus` alone lists what can be done here.
 
 Exit codes: 0 passed or still running (`--detach`), 1 a check failed,
 2 usage or environment error, 3 cancelled or unknown result.

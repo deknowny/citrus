@@ -125,7 +125,11 @@ impl Context {
                     && now() as i64 - evidence.created < self.snapshot_max_age() =>
             {
                 decision.result = "reused".into();
-                decision.reason = "same_snapshot".into();
+                decision.reason = if evidence.detail.starts_with("carried") {
+                    "carried_over".into()
+                } else {
+                    "same_snapshot".into()
+                };
                 decision.evidence_run = Some(evidence.run);
             }
             Some(_) => decision.reason = "evidence_expired".into(),
@@ -718,7 +722,7 @@ fn alive(pid: i64) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn agent() -> String {
+pub fn agent() -> String {
     if let Ok(thread) = std::env::var("CODEX_THREAD_ID") {
         return format!("codex:{}", thread.chars().take(8).collect::<String>());
     }

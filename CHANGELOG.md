@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `citrus integrate [--push]`: merge the base, carry passes of checks the
+  incoming changes do not select (`plan.paths_arg` for external planners),
+  re-check the rest, fast-forward the base when green.
+- `citrus tasks` and `citrus note`: every worktree with branch, unmerged
+  commits, last run and its owner's note; notes appear in `status`.
+- `citrus` without arguments: overview and the project's `[[catalog]]`.
+- `citrus targets`: declared checks with their last pass.
+- Progress notes are not repeated while a run waits.
+
 ## 0.2.1 — 2026-10-07
 
 - Failure excerpts: a suite's failure is explained by the innermost failed

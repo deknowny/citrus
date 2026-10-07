@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS evidence (
     detail TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (target, kind, key)
 );
+CREATE TABLE IF NOT EXISTS task_notes (
+    worktree TEXT PRIMARY KEY,
+    text TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    updated INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS facts (
     name TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -179,6 +185,45 @@ impl Store {
             params![run, state],
         )?;
         Ok(())
+    }
+
+    /// What a worktree's owner wants others to know (intent, blocker); empty clears it.
+    pub fn set_task_note(&self, worktree: &str, text: &str, agent: &str) -> Result<()> {
+        if text.trim().is_empty() {
+            self.conn.execute(
+                "DELETE FROM task_notes WHERE worktree = ?1",
+                params![worktree],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO task_notes (worktree, text, agent, updated) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (worktree) DO UPDATE SET text = ?2, agent = ?3, updated = ?4",
+                params![worktree, text.trim(), agent, now() as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// (worktree, text, agent, updated)
+    pub fn task_notes(&self) -> Result<Vec<(String, String, String, i64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT worktree, text, agent, updated FROM task_notes ORDER BY updated DESC",
+        )?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The latest run of every worktree (one row each).
+    pub fn latest_runs(&self) -> Result<Vec<Run>> {
+        let mut statement = self.conn.prepare(&format!(
+            "{RUN_SELECT} WHERE id IN (SELECT id FROM runs r WHERE started = (SELECT MAX(started) FROM runs WHERE worktree = r.worktree))"
+        ))?;
+        Ok(statement
+            .query_map([], run_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// A small named value with its update time (cached observations).

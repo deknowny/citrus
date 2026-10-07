@@ -52,6 +52,10 @@ their results shared, reusable and short.
 | `citrus wait <run>` / `show` | Follow a run after a lost terminal or a new agent session; a vanished process becomes `unknown`, not “running forever” |
 | `citrus log <run>` | First error of each failed target; `--target`, `--full` when needed |
 | `citrus why <target>` | Why it is needed, and which inputs changed since its last pass |
+| `citrus integrate [--push]` | Merge the base branch, keep checks the incoming changes do not touch, re-check the rest, and fast-forward the base when green |
+| `citrus tasks` / `citrus note <text>` | Every worktree as a task — branch, unmerged commits, runs — and what its owner wants others to know |
+| `citrus` | What can be done here: Citrus commands plus the project's own catalog from `citrus.toml` |
+| `citrus targets` | Declared checks and when they last passed |
 | `citrus add <target> --inputs …` | Declare a check after validating it — instead of writing another wrapper script |
 | `citrus stats` | Runs, reuse rate, time not spent thanks to reuse |
 | `citrus doctor` | Is this repository set up so the answers can be trusted |

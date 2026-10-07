@@ -28,6 +28,19 @@ pub struct Config {
     pub receipts: ReceiptsConfig,
     pub state: StateConfig,
     pub status: StatusConfig,
+    /// Commands people and agents use in this repository, shown by `citrus`.
+    pub catalog: Vec<CatalogEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogEntry {
+    /// What to type, e.g. `make release-prepare-web`.
+    pub command: String,
+    pub description: String,
+    /// Optional heading the entry is listed under.
+    #[serde(default)]
+    pub group: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -52,6 +65,10 @@ pub struct PlanConfig {
     pub command: Vec<String>,
     /// Extra argument for an explicit base; `{base}` is substituted.
     pub base_arg: String,
+    /// Extra argument handing the external planner a file of changed paths
+    /// (one per line); `{file}` is substituted. Lets `citrus integrate` ask
+    /// which checks the incoming changes select. Empty: not supported.
+    pub paths_arg: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +126,7 @@ impl Default for Config {
             receipts: ReceiptsConfig::default(),
             state: StateConfig::default(),
             status: StatusConfig::default(),
+            catalog: Vec::new(),
         }
     }
 }
@@ -119,6 +137,7 @@ impl Default for PlanConfig {
             base: "origin/main".into(),
             command: Vec::new(),
             base_arg: String::new(),
+            paths_arg: String::new(),
         }
     }
 }

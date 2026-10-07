@@ -10,12 +10,14 @@ mod add;
 mod config;
 mod doctor;
 mod exec;
+mod integrate;
 mod manifest;
 mod plan;
 mod repo;
 mod report;
 mod resources;
 mod state;
+mod tasks;
 
 use std::io::IsTerminal;
 use std::time::Duration;
@@ -44,8 +46,9 @@ struct Cli {
     /// Text output even when stdout is not a terminal.
     #[arg(long, global = true, conflicts_with = "json")]
     text: bool,
+    /// Without a command: what Citrus can do in this repository.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -120,6 +123,36 @@ enum Command {
         #[arg(long)]
         description: Option<String>,
     },
+    /// Merge the base branch, keep checks the incoming changes do not touch,
+    /// run what is needed again, and optionally push.
+    Integrate {
+        /// Base to merge (default: plan.base, e.g. origin/main).
+        #[arg(long)]
+        base: Option<String>,
+        /// Fast-forward the base branch to the result once checks pass.
+        #[arg(long)]
+        push: bool,
+        /// Only merge and carry results; do not run checks.
+        #[arg(long)]
+        no_run: bool,
+    },
+    /// Every worktree as a task: branch, unmerged commits, runs, notes.
+    Tasks {
+        /// Include idle and merged worktrees.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// Tell others what this worktree is doing or waiting for (shown in status and tasks).
+    Note {
+        #[arg(value_name = "TEXT")]
+        message: Vec<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Declared checks with their inputs and last result.
+    Targets,
     /// Check that this repository is set up so Citrus can be trusted.
     Doctor,
     /// How Citrus has been used: runs, reuse, time saved.
@@ -152,8 +185,11 @@ fn main() {
     }
 }
 
-fn execute(command: Command, json: bool) -> Result<i32> {
+fn execute(command: Option<Command>, json: bool) -> Result<i32> {
     let context = Context::open()?;
+    let Some(command) = command else {
+        return overview(&context, json);
+    };
     match command {
         Command::Status { base } => status(&context, base.as_deref(), json),
         Command::Plan { base } => plan_command(&context, base.as_deref(), json),
@@ -242,6 +278,35 @@ fn execute(command: Command, json: bool) -> Result<i32> {
             Ok(0)
         }
         Command::Stats { days } => stats(&context, days, json),
+        Command::Integrate { base, push, no_run } => {
+            integrate_command(&context, base, push, !no_run, json)
+        }
+        Command::Tasks { all, base } => tasks_command(&context, all, base, json),
+        Command::Note { message, clear } => {
+            let text = if clear {
+                String::new()
+            } else {
+                message.join(" ")
+            };
+            if text.is_empty() && !clear {
+                anyhow::bail!("write the note, or --clear");
+            }
+            context
+                .store
+                .set_task_note(&context.worktree(), &text, &exec::agent())?;
+            if json {
+                println!(
+                    "{}",
+                    json!({"schema": SCHEMA, "worktree": context.worktree(), "note": text})
+                );
+            } else if text.is_empty() {
+                println!("note cleared");
+            } else {
+                println!("note set; others see it in citrus status and citrus tasks");
+            }
+            Ok(0)
+        }
+        Command::Targets => targets_command(&context, json),
         Command::Doctor => {
             let findings = doctor::diagnose(&context);
             let failed = findings.iter().any(|finding| finding.status == "fail");
@@ -276,9 +341,9 @@ fn execute(command: Command, json: bool) -> Result<i32> {
 }
 
 /// Wait for the worker, reporting target results on stderr as they land.
-fn follow(context: &Context, id: &str, json: bool) -> Result<i32> {
+fn wait_for(context: &Context, id: &str, json: bool) -> Result<Run> {
     let mut seen: Vec<(String, String)> = Vec::new();
-    let mut note = String::new();
+    let mut shown_note = String::new();
     loop {
         let run = context.reconcile(context.store.run(id)?.context("unknown run")?)?;
         for target in context.store.targets(id)? {
@@ -295,15 +360,20 @@ fn follow(context: &Context, id: &str, json: bool) -> Result<i32> {
                 seen.push(key);
             }
         }
-        if run.note != note && !run.note.is_empty() {
+        if !run.note.is_empty() && run.note != shown_note {
             eprintln!("  … {}", run.note);
+            shown_note = run.note.clone();
         }
-        note = run.note.clone();
         if run.finished() {
-            return emit_run(context, &run, json);
+            return Ok(run);
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn follow(context: &Context, id: &str, json: bool) -> Result<i32> {
+    let run = wait_for(context, id, json)?;
+    emit_run(context, &run, json)
 }
 
 fn exit_code(run: &Run) -> i32 {
@@ -415,6 +485,15 @@ fn status(context: &Context, base: Option<&str>, json: bool) -> Result<i32> {
         .filter(|decision| decision.result != "reused")
         .count();
     let shared = resources::observe(context)?;
+    let notes: Vec<(String, String, String, i64)> = context
+        .store
+        .task_notes()?
+        .into_iter()
+        .filter(|(worktree, _, _, updated)| {
+            *worktree != context.worktree() && now() as i64 - updated < 86400
+        })
+        .take(5)
+        .collect();
     let mut warnings = Vec::new();
     let mut next = Vec::new();
     let mine = active.iter().find(|run| run.worktree == context.worktree());
@@ -442,6 +521,7 @@ fn status(context: &Context, base: Option<&str>, json: bool) -> Result<i32> {
             "active_runs": active.iter().map(run_brief).collect::<Vec<_>>(),
             "last_run": last.as_ref().map(run_brief),
             "resources": shared,
+            "notes": notes.iter().map(|(worktree, text, agent, updated)| json!({"worktree": worktree, "note": text, "agent": agent, "seconds_ago": now() as i64 - updated})).collect::<Vec<_>>(),
             "warnings": warnings,
             "next": next,
         });
@@ -508,6 +588,16 @@ fn status(context: &Context, base: Option<&str>, json: bool) -> Result<i32> {
                 run.agent,
                 age(now() as i64 - run.started),
                 note
+            );
+        }
+    }
+    if !notes.is_empty() {
+        println!("notes from other tasks:");
+        for (worktree, text, agent, updated) in &notes {
+            let name = worktree.rsplit('/').next().unwrap_or(worktree);
+            println!(
+                "  {name} · {agent} · {} ago: {text}",
+                age(now() as i64 - updated)
             );
         }
     }
@@ -810,6 +900,7 @@ fn describe(target: &RunTarget) -> String {
     let reason = match target.reason.as_str() {
         "inputs_unchanged" => "proven: declared inputs unchanged",
         "same_snapshot" => "proven: identical sources passed",
+        "carried_over" => "proven: passed before integration, incoming changes do not touch it",
         "no_evidence" => "needed: never passed",
         "input_changed" => "needed: inputs changed since the last pass",
         "evidence_expired" => "needed: last pass is too old",
@@ -850,4 +941,354 @@ fn print_next(next: &[String]) {
     if !next.is_empty() {
         println!("next: {}", next.join(" · "));
     }
+}
+
+/// `citrus` alone: where things stand and what can be done here.
+fn overview(context: &Context, json: bool) -> Result<i32> {
+    let plan = plan::compute(&context.repo, &context.manifest, None).ok();
+    let (mut needed, mut proven) = (0, 0);
+    if let Some(plan) = &plan {
+        let files = context.repo.files()?;
+        let snapshot = context.repo.snapshot()?;
+        for name in &plan.targets {
+            match context
+                .decide(&files, &snapshot, name, false)?
+                .result
+                .as_str()
+            {
+                "reused" => proven += 1,
+                _ => needed += 1,
+            }
+        }
+    }
+    let running = context.store.active()?.len();
+    let catalog = &context.repo.config.catalog;
+    let commands = [
+        (
+            "citrus status",
+            "what the current changes need, what is proven, who runs what",
+        ),
+        (
+            "citrus run",
+            "run what is not proven yet (citrus wait last after a lost session)",
+        ),
+        ("citrus log last", "first error of the last failed run"),
+        ("citrus why <check>", "why a check is needed or not reused"),
+        (
+            "citrus integrate [--push]",
+            "merge the base, keep what is still proven, recheck the rest",
+        ),
+        (
+            "citrus tasks",
+            "every worktree: branch, unmerged commits, runs, notes",
+        ),
+        (
+            "citrus note <text>",
+            "tell others what this worktree is doing or waiting for",
+        ),
+        ("citrus targets", "declared checks and their last result"),
+        (
+            "citrus add <check> --inputs …",
+            "declare a new check instead of a wrapper script",
+        ),
+        ("citrus doctor", "is this repository set up correctly"),
+    ];
+    if json {
+        let value = json!({
+            "schema": SCHEMA,
+            "branch": context.repo.branch(), "head": context.repo.head(),
+            "needed": needed, "proven": proven, "running": running,
+            "declared_checks": context.manifest.targets.keys().collect::<Vec<_>>(),
+            "commands": commands.iter().map(|(command, purpose)| json!({"command": command, "purpose": purpose})).collect::<Vec<_>>(),
+            "catalog": catalog,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(0);
+    }
+    println!(
+        "{} @ {} · {needed} checks needed, {proven} proven · {running} runs in progress",
+        context.repo.branch(),
+        context.repo.head()
+    );
+    println!("\nchecks:");
+    for (command, purpose) in commands {
+        println!("  {command:<32} {purpose}");
+    }
+    if !catalog.is_empty() {
+        let mut groups: Vec<&str> = catalog.iter().map(|entry| entry.group.as_str()).collect();
+        groups.dedup();
+        let mut seen = Vec::new();
+        for group in groups {
+            if seen.contains(&group) {
+                continue;
+            }
+            seen.push(group);
+            println!(
+                "\n{}:",
+                if group.is_empty() {
+                    "this repository"
+                } else {
+                    group
+                }
+            );
+            for entry in catalog.iter().filter(|entry| entry.group == group) {
+                println!("  {:<32} {}", entry.command, entry.description);
+            }
+        }
+    }
+    println!(
+        "\nnext: {}",
+        if needed > 0 {
+            "citrus run"
+        } else {
+            "citrus status"
+        }
+    );
+    Ok(0)
+}
+
+fn integrate_command(
+    context: &Context,
+    base: Option<String>,
+    push: bool,
+    run_checks: bool,
+    json: bool,
+) -> Result<i32> {
+    let base = base.unwrap_or_else(|| context.repo.config.plan.base.clone());
+    for attempt in 1..=3 {
+        let result = integrate::integrate(context, &base)?;
+        if !json {
+            match result.outcome.as_str() {
+                "up_to_date" => println!("{base}: nothing new to merge"),
+                "conflict" => {
+                    println!(
+                        "✗ merging {base} conflicts in {} files:",
+                        result.conflicts.len()
+                    );
+                    for path in &result.conflicts {
+                        println!("    {path}");
+                    }
+                    print_next(&[
+                        "resolve the files, git add, git commit".into(),
+                        "citrus integrate".into(),
+                    ]);
+                }
+                _ => {
+                    println!(
+                        "merged {base}: {} commits, {} changed paths",
+                        result.incoming_commits,
+                        result.incoming_paths.len()
+                    );
+                    if !result.carried.is_empty() {
+                        println!(
+                            "  ≡ still proven (incoming changes do not touch them): {}",
+                            preview(&result.carried)
+                        );
+                    }
+                    if !result.reselected.is_empty() {
+                        println!(
+                            "  ○ selected again by incoming changes: {}",
+                            preview(&result.reselected)
+                        );
+                    }
+                    if !result.carry_note.is_empty() {
+                        println!("  ! {}", result.carry_note);
+                    }
+                }
+            }
+        }
+        if result.outcome == "conflict" {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "integration": result, "next": ["resolve the files, git add, git commit", "citrus integrate"]})
+                    )?
+                );
+            }
+            return Ok(1);
+        }
+        let mut run_value = Value::Null;
+        if run_checks {
+            let run = context.start(&Request {
+                targets: Vec::new(),
+                base: None,
+                mode: Mode::Auto,
+                key: None,
+                force: false,
+            })?;
+            let run = if run.finished() {
+                run
+            } else {
+                wait_for(context, &run.id, json)?
+            };
+            if json {
+                run_value = json!({"id": run.id, "state": run.state, "targets": context.store.targets(&run.id)?});
+            } else {
+                emit_run(context, &run, false)?;
+            }
+            if run.state != "passed" {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &json!({"schema": SCHEMA, "integration": result, "run": run_value, "pushed": false})
+                        )?
+                    );
+                }
+                return Ok(exit_code(&run).max(1));
+            }
+        }
+        if !push {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "integration": result, "run": run_value, "pushed": false})
+                    )?
+                );
+            } else if result.outcome != "up_to_date" || run_checks {
+                print_next(&["citrus integrate --push".into()]);
+            }
+            return Ok(0);
+        }
+        let (remote, branch) = integrate::split_base(context, &base);
+        let Some(remote) = remote else {
+            anyhow::bail!("--push needs a remote base such as origin/main, not {base}");
+        };
+        let pushed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&context.repo.root)
+            .args(["push", "--quiet", &remote, &format!("HEAD:{branch}")])
+            .output()?;
+        if pushed.status.success() {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "integration": result, "run": run_value, "pushed": true})
+                    )?
+                );
+            } else {
+                println!("✓ pushed {} to {base}", context.repo.head());
+            }
+            return Ok(0);
+        }
+        let error = String::from_utf8_lossy(&pushed.stderr);
+        if !(error.contains("rejected")
+            || error.contains("non-fast-forward")
+            || error.contains("fetch first"))
+        {
+            anyhow::bail!("git push failed: {}", error.trim());
+        }
+        if !json {
+            println!("{base} moved while checking (attempt {attempt}); integrating again");
+        }
+    }
+    anyhow::bail!("{base} kept moving; run citrus integrate --push again")
+}
+
+fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool) -> Result<i32> {
+    let base = base.unwrap_or_else(|| context.repo.config.plan.base.clone());
+    let tasks = tasks::list(context, &base)?;
+    let shown: Vec<&tasks::Task> = tasks
+        .iter()
+        .filter(|task| all || tasks::active(task))
+        .collect();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({"schema": SCHEMA, "base": base, "total": tasks.len(), "tasks": shown})
+            )?
+        );
+        return Ok(0);
+    }
+    println!(
+        "{} of {} worktrees{} · base {base}",
+        shown.len(),
+        tasks.len(),
+        if all {
+            ""
+        } else {
+            " with activity (--all for every one)"
+        }
+    );
+    for task in shown {
+        let ahead = match (task.ahead, task.behind) {
+            (Some(ahead), Some(behind)) => format!("+{ahead}/-{behind}"),
+            _ => "?".into(),
+        };
+        let idle = task.idle.map(age).unwrap_or_default();
+        let run = match (&task.last_run_state, task.running) {
+            (_, true) => " · running".to_owned(),
+            (Some(state), _) => format!(" · last run {state}"),
+            _ => String::new(),
+        };
+        let marker = if task.current {
+            "▸"
+        } else if task.missing {
+            "✗"
+        } else {
+            " "
+        };
+        println!(
+            "{marker} {:<36} {:<34} {ahead:>9} · {idle}{run}",
+            task.name, task.branch
+        );
+        if let Some(note) = &task.note {
+            println!(
+                "      “{note}” — {}",
+                task.note_agent.as_deref().unwrap_or("?")
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn targets_command(context: &Context, json: bool) -> Result<i32> {
+    let mut rows = Vec::new();
+    for target in context.manifest.targets.values() {
+        let last = context
+            .store
+            .latest_evidence(&target.name, "inputs")?
+            .or(context.store.latest_evidence(&target.name, "snapshot")?);
+        rows.push((target, last));
+    }
+    if json {
+        let value: Vec<Value> = rows
+            .iter()
+            .map(|(target, last)| {
+                json!({
+                    "target": target.name, "description": target.description, "cache": target.cache,
+                    "inputs": target.inputs, "extra_inputs": target.extra_inputs, "resources": target.resources,
+                    "last_pass": last.as_ref().map(|evidence| json!({"run": evidence.run, "seconds_ago": now() as i64 - evidence.created})),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({"schema": SCHEMA, "manifest": context.repo.config.manifest, "targets": value})
+            )?
+        );
+        return Ok(0);
+    }
+    println!(
+        "{} declared checks in {}",
+        rows.len(),
+        context.repo.config.manifest
+    );
+    for (target, last) in rows {
+        let when = last
+            .map(|evidence| format!("passed {} ago", age(now() as i64 - evidence.created)))
+            .unwrap_or_else(|| "never passed here".into());
+        println!(
+            "  {:<36} {}{} · {when}",
+            target.name,
+            if target.cache { "cache · " } else { "" },
+            target.description.as_deref().unwrap_or("")
+        );
+    }
+    Ok(0)
 }

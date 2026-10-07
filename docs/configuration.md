@@ -14,6 +14,8 @@ target_definitions = ["Makefile", "*.mk", "make/*.mk"]  # where `citrus add` loo
 base = "origin/main"             # "changed" is measured from the fork point with this ref
 command = []                     # external planner; [] = built-in (declared owners of changed paths)
 base_arg = ""                    # argument for an explicit --base, e.g. "BASE_REF={base}"
+paths_arg = ""                   # argument with a file of changed paths, e.g. "PATHS_FILE={file}";
+                                 # lets `citrus integrate` carry passes the incoming changes do not affect
 
 [run]
 local = ["make", "{target}"]     # one target on this machine
@@ -37,6 +39,11 @@ resources_command = []           # slow command describing shared builders/runne
 resource_prefix = ""             # its lines that describe one resource each (key=value fields)
 refresh_seconds = 0              # snapshot age before a background refresh (min 10)
 
+[[catalog]]                      # repeatable: commands shown by `citrus` with no arguments
+command = "make deploy"
+description = "Roll out the verified release"
+group = "release"                # optional heading
+
 [state]
 backend = "sqlite"               # one file in the Git common directory
 path = "citrus"
@@ -53,3 +60,13 @@ remote runner is configured, or when every check still needed is a declared
 
 The agent of a run is taken from `CODEX_THREAD_ID`, `CLAUDECODE` or
 `CITRUS_AGENT`, and shown in `status` and `stats`.
+
+## Integration
+
+`citrus integrate` merges `plan.base` (fetching it first when it names a
+remote branch). A check that passed on the sources before the merge stays
+proven when the planner, given exactly the incoming paths, does not select it.
+With the built-in planner that is ownership in the manifest; an external
+planner needs `plan.paths_arg`. When any incoming path is claimed by no check,
+nothing is carried over. `--push` fast-forwards the base after the remaining
+checks pass, and integrates again if the base moved meanwhile.

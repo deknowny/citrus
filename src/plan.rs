@@ -28,10 +28,54 @@ pub fn compute(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<P
     if config.command.is_empty() {
         return builtin(repo, manifest, base.unwrap_or(&config.base));
     }
+    let extra = base
+        .filter(|_| !config.base_arg.is_empty())
+        .map(|base| config.base_arg.replace("{base}", base));
+    external(repo, extra)
+}
+
+/// The checks that changes to exactly `paths` would select; `before` is the
+/// revision those changes start from (for manifest edits).
+pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
+    let config = &repo.config.plan;
+    if config.command.is_empty() {
+        return Ok(select(repo, manifest, paths.to_vec(), before));
+    }
+    if config.paths_arg.is_empty() {
+        bail!("the planner takes no path list (plan.paths_arg in citrus.toml)");
+    }
+    let dir = repo.state_dir().join("tmp");
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join(format!(
+        "paths-{}-{}",
+        std::process::id(),
+        crate::manifest::now()
+    ));
+    std::fs::write(
+        &file,
+        paths
+            .iter()
+            .map(|path| format!("{path}\n"))
+            .collect::<String>(),
+    )?;
+    let result = external(
+        repo,
+        Some(
+            config
+                .paths_arg
+                .replace("{file}", &file.display().to_string()),
+        ),
+    );
+    let _ = std::fs::remove_file(&file);
+    result
+}
+
+fn external(repo: &Repo, extra: Option<String>) -> Result<Plan> {
+    let config = &repo.config.plan;
     let mut command = Command::new(&config.command[0]);
     command.args(&config.command[1..]).current_dir(&repo.root);
-    if let Some(base) = base.filter(|_| !config.base_arg.is_empty()) {
-        command.arg(config.base_arg.replace("{base}", base));
+    if let Some(extra) = extra {
+        command.arg(extra);
     }
     let output = command.output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -68,6 +112,11 @@ fn builtin(repo: &Repo, manifest: &Manifest, base: &str) -> Result<Plan> {
     );
     paths.sort();
     paths.dedup();
+    Ok(select(repo, manifest, paths, &fork))
+}
+
+/// Declared targets owning `paths`; new or edited declarations since `before` too.
+fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> Plan {
     let mut plan = Plan {
         files: paths.len(),
         ..Plan::default()
@@ -136,7 +185,7 @@ fn builtin(repo: &Repo, manifest: &Manifest, base: &str) -> Result<Plan> {
     } else {
         "partial".into()
     };
-    Ok(plan)
+    plan
 }
 
 pub fn parse(output: &str) -> Plan {
