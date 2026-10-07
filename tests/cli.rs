@@ -2597,3 +2597,23 @@ fn an_edited_check_still_needs_its_condition() {
         "{plan}"
     );
 }
+
+#[test]
+fn check_warns_about_missing_inputs_of_reused_checks_only() {
+    let project = Project::new(
+        "# Removed code: only its removal appears in a diff.\ngroup retired {\n  paths = [\"gone/**\"]\n}\n\ncheck reused = make(\"ok\") {\n  paths = [\"src/*.txt\"]\n  reads = [\"missing/**\"]\n}\n",
+    );
+    let (checked, code) = project.json(&["check"]);
+    assert_eq!(code, 0, "{checked}");
+    let messages: Vec<&str> = checked["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|warning| warning["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        messages,
+        ["check reused reuses passes, but its input `missing/**` matches no file"],
+        "{checked}"
+    );
+}

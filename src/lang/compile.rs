@@ -691,46 +691,37 @@ pub fn compile(graph: &Graph) -> Result<Project, Error> {
     Ok(project)
 }
 
-/// Globs that match no file: almost always typos. Each is reported once,
-/// where it is written (a group's paths, a check's own paths and reads).
+/// Inputs of reused checks that match no file. Such a typo silently makes a
+/// reused pass wrong; a selection typo shows itself as an unclaimed path.
 /// Slow on large repositories, so only `citrus check` asks.
 pub fn dead_globs(project: &Project, root: &Path) -> Vec<Error> {
-    let mut dead_globs = Vec::new();
     let files = crate::repo::Repo::discover_at(root)
         .and_then(|repo| repo.paths())
         .unwrap_or_default();
-    if !files.is_empty() {
-        let dead = |pattern: &String| {
-            !pattern.starts_with('!')
-                && !crate::manifest::pattern_matches_any(pattern, &files).unwrap_or(true)
-        };
-        for group in &project.groups {
-            for pattern in group.owns.iter().filter(|pattern| dead(pattern)) {
-                dead_globs.push(Error::at(
-                    group.span,
-                    format!("group {}: `{pattern}` matches no file", group.name),
-                ));
-            }
-        }
-        for check in &project.checks {
-            let own = if check.narrows || check.group.is_none() {
-                check.owns.as_slice()
-            } else {
-                &[]
-            };
-            for pattern in own
-                .iter()
-                .chain(&check.reads)
-                .filter(|pattern| dead(pattern))
+    let mut dead = Vec::new();
+    if files.is_empty() {
+        return dead;
+    }
+    for check in project.checks.iter().filter(|check| check.cache) {
+        let mut reported: Vec<&String> = Vec::new();
+        for pattern in check.owns.iter().chain(&check.reads) {
+            if pattern.starts_with('!')
+                || reported.contains(&pattern)
+                || crate::manifest::pattern_matches_any(pattern, &files).unwrap_or(true)
             {
-                dead_globs.push(Error::at(
-                    check.span,
-                    format!("check {}: `{pattern}` matches no file", check.name),
-                ));
+                continue;
             }
+            reported.push(pattern);
+            dead.push(Error::at(
+                check.span,
+                format!(
+                    "check {} reuses passes, but its input `{pattern}` matches no file",
+                    check.name
+                ),
+            ));
         }
     }
-    dead_globs
+    dead
 }
 
 /// First occurrence of each entry, in order (input lists are often joined).

@@ -38,6 +38,8 @@ Every element does something, names are bare, data is quoted:
 - Paths say what they are: `crate("pkg")` (was `rust`/`cargo.closure`),
   `next("@scope/app")` for a Next.js app and `package("@scope/lib")` for any
   pnpm workspace package.
+- `citrus check` warns about inputs of reused checks that match no file;
+  paths of a group may name removed or future files.
 - `dir/**` also matches `dir` itself (a gitlink or a removed directory).
 - `.citrus/*.ci`: one file per product, `.citrus/project.ci` shared.
 - A check is always called by its name in the configuration, also when it
