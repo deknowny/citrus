@@ -132,16 +132,18 @@ pub struct Manifest {
     pub signals: Vec<String>,
 }
 
+/// A named path set; declaring a group again adds paths (each declaration's
+/// globs are matched on their own).
 #[derive(Debug)]
 pub struct PathGroup {
     pub name: String,
     pub note: Option<String>,
-    globs: GlobList,
+    globs: Vec<GlobList>,
 }
 
 impl PathGroup {
     pub fn owns(&self, path: &str) -> bool {
-        self.globs.matches(path)
+        self.globs.iter().any(|globs| globs.matches(path))
     }
 }
 
@@ -158,17 +160,23 @@ impl Manifest {
             target.position = position;
             targets.insert(check.name.clone(), target);
         }
-        let groups = project
-            .groups
-            .iter()
-            .map(|group| {
-                Ok(PathGroup {
+        let mut groups: Vec<PathGroup> = Vec::new();
+        for group in &project.groups {
+            let globs = GlobList::new(&group.owns)?;
+            match groups.iter_mut().find(|known| known.name == group.name) {
+                Some(known) => {
+                    known.globs.push(globs);
+                    if known.note.is_none() {
+                        known.note = group.note.clone();
+                    }
+                }
+                None => groups.push(PathGroup {
                     name: group.name.clone(),
                     note: group.note.clone(),
-                    globs: GlobList::new(&group.owns)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                    globs: vec![globs],
+                }),
+            }
+        }
         Ok(Manifest {
             targets,
             files: project.files.clone(),

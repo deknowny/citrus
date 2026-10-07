@@ -2221,6 +2221,7 @@ fn a_signal_command_can_claim_paths_for_groups_and_the_builtin_planner_can_be_fo
 project { signals = run("sh", "classify.sh") }
 planner { run = run("sh", "-c", "printf 'TARGET\\tmake:fail\\n'") }
 group "removed" { owns = [] }
+group "removed" { owns = ["old/**", "!old/keep/**"] }
 check "contracts" { when = touched("removed"), run = make("ok") }
 "#,
     );
@@ -2244,4 +2245,17 @@ check "contracts" { when = touched("removed"), run = make("ok") }
         "{plan}"
     );
     assert_eq!(plan["plan"]["mapped"][0][1], "group:removed", "{plan}");
+    project.write("paths.txt", "old/x\nold/keep/y\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        .args(["plan", "--paths-file", "paths.txt", "--json"])
+        .current_dir(project.root())
+        .env("CITRUS_PLANNER", "builtin")
+        .output()
+        .unwrap();
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        plan["plan"]["unmapped"],
+        serde_json::json!(["old/keep/y"]),
+        "{plan}"
+    );
 }

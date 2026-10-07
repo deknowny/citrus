@@ -90,6 +90,8 @@ check "test-clyer-pipeline-contract" {
 - `and`, `or`, `not` combine them. A check with `owns` and `when` needs
   both; a check with only `when` is chosen by the condition.
 - A touched group's `note` is listed with the plan's targets.
+- Declaring a group again adds paths: a path belongs to the group when any
+  declaration matches it (each with its own `!` exclusions).
 
 `citrus plan --paths-file FILE` plans an explicit list of paths; the plan
 lists the touched groups and signals for tools that adapt it.
