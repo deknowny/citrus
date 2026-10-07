@@ -62,10 +62,14 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
     match context.repo.paths() {
         Ok(files) => {
             for target in context.manifest.targets.values() {
+                // A reused pass must cover what the check reads; selection
+                // paths may name removed or future files.
                 let unmatched: Vec<&String> = target
                     .inputs
                     .iter()
                     .chain(&target.extra_inputs)
+                    .filter(|_| target.cache)
+                    .filter(|pattern| !pattern.starts_with('!'))
                     .filter(|pattern| !pattern_matches_any(pattern, &files).unwrap_or(false))
                     .collect();
                 if !unmatched.is_empty() {
