@@ -20,6 +20,8 @@ Every element does something, names are bare, data is quoted:
   once; `note`, `claims` and `exclusive` are gone (write `!glob`).
 - `match changed { only(g) => …, without(g) => …, _ => … }`: the plan picks
   the arm the check runs, and its fingerprint follows it.
+- Conditions take a group, a check or a list of globs (`touched(main)` with
+  `let main = ["**", "!clyer/**"]`); `paths - other` excludes `other`.
 - `replaces = [parts]`: one check instead of several parts when the change
   goes beyond one of them.
 - Profiles are declarations with their own `env { }`; `profiles` and

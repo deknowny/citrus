@@ -2338,3 +2338,43 @@ group db {
         "started\n"
     );
 }
+
+#[test]
+fn conditions_and_paths_take_lists_of_globs() {
+    let project = Project::new(
+        r#"
+let tools = ["scripts/tool.py", "scripts/test_tool.py"]
+let clyer = ["clyer/**"]
+
+# The tool's own tests.
+check tool = make("ok") {
+  paths = tools
+}
+
+# Everything else under scripts/; the tool is not part of it.
+group infra {
+  paths = ["scripts/**"] - tools
+  check contract = match changed {
+    without(clyer) => make("ok")
+    _ => make("plain")
+  }
+}
+
+check clyer-only = make("ok") {
+  when = only(clyer + ["scripts/**"]) and touched(clyer)
+}
+"#,
+    );
+    let plan_for = |paths: &str| {
+        project.write("paths.txt", paths);
+        let plan = project.json(&["plan", "--paths-file", "paths.txt"]).0["plan"].clone();
+        (plan["targets"].clone(), plan["arms"].clone())
+    };
+    assert_eq!(plan_for("scripts/tool.py\n").0, serde_json::json!(["tool"]));
+    let (targets, arms) = plan_for("scripts/run.sh\n");
+    assert_eq!(targets, serde_json::json!(["infra.contract"]));
+    assert_eq!(arms["infra.contract"], 0);
+    let (targets, arms) = plan_for("scripts/run.sh\nclyer/bot.rs\n");
+    assert_eq!(targets, serde_json::json!(["infra.contract", "clyer-only"]));
+    assert_eq!(arms, serde_json::json!({}));
+}

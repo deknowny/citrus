@@ -238,7 +238,7 @@ fn select(
         touched: &touched,
         signals: &signals,
         group_paths: &group_paths,
-        changed: paths.len(),
+        paths: &paths,
         profile: repo.config.plan.profile.as_deref(),
     };
     // Owners whose condition holds, and checks selected by condition alone;
@@ -397,22 +397,37 @@ struct Facts<'a> {
     touched: &'a std::collections::BTreeSet<String>,
     signals: &'a [String],
     group_paths: &'a BTreeMap<String, usize>,
-    changed: usize,
+    paths: &'a [String],
     profile: Option<&'a str>,
 }
 
 impl Facts<'_> {
+    /// Changed paths matching a glob list.
+    fn count(&self, globs: &[String]) -> usize {
+        crate::manifest::GlobList::new(globs)
+            .map(|list| self.paths.iter().filter(|path| list.matches(path)).count())
+            .unwrap_or(0)
+    }
+
+    /// Changed paths in a group or glob list.
+    fn within(&self, set: &crate::lang::compile::Paths) -> usize {
+        use crate::lang::compile::Paths;
+        match set {
+            Paths::Name(name) => self.group_paths.get(name).copied().unwrap_or(0),
+            Paths::Globs(globs) => self.count(globs),
+        }
+    }
+
     fn holds(&self, when: &crate::lang::compile::Cond, selected: &[String]) -> bool {
-        use crate::lang::compile::Cond;
+        use crate::lang::compile::{Cond, Paths};
         when.eval(&|fact| match fact {
-            Cond::Touched(name) => self.touched.contains(name),
+            Cond::Touched(Paths::Name(name)) => self.touched.contains(name),
+            Cond::Touched(set) => self.within(set) > 0,
             Cond::Selected(name) => selected.contains(name),
             Cond::Signal(name) => self.signals.contains(name),
             Cond::Profile(name) => self.profile == Some(name.as_str()),
-            Cond::Only(name) => {
-                self.changed > 0 && self.group_paths.get(name).copied() == Some(self.changed)
-            }
-            Cond::Without(name) => !self.group_paths.contains_key(name),
+            Cond::Only(set) => !self.paths.is_empty() && self.within(set) == self.paths.len(),
+            Cond::Without(set) => self.within(set) == 0,
             _ => false,
         })
     }

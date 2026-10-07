@@ -126,23 +126,32 @@ impl Work {
     }
 }
 
+/// What `touched`, `only` and `without` look at: a group or check by name,
+/// or a list of path globs.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Paths {
+    Name(String),
+    Globs(Vec<String>),
+}
+
 /// A plan-time condition (`when`), evaluated once the changed paths are known.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cond {
     Always(bool),
-    /// A changed path is owned by this group or check.
-    Touched(String),
+    /// A changed path is in this group, check or glob list.
+    Touched(Paths),
     /// This check is in the plan.
     Selected(String),
     /// The project's signal command printed this signal.
     Signal(String),
     /// The plan is for this profile.
     Profile(String),
-    /// Every changed path is in this group.
-    Only(String),
-    /// No changed path is in this group.
-    Without(String),
+    /// Every changed path is in it.
+    Only(Paths),
+    /// No changed path is in it.
+    Without(Paths),
     And(Box<Cond>, Box<Cond>),
     Or(Box<Cond>, Box<Cond>),
     Not(Box<Cond>),
@@ -165,15 +174,30 @@ fn cond(value: &Value, span: Span) -> Result<Cond, Error> {
         Some(Value::Ref(name)) => Ok(name.clone()),
         _ => text(action, 0),
     };
+    let paths = |action: &Action| match action.args.first() {
+        Some(Value::List(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_owned).ok_or_else(|| {
+                    Error::at(
+                        action.span,
+                        format!("`{}` takes a name or a list of paths", action.kind),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Paths::Globs),
+        _ => name(action).map(Paths::Name),
+    };
     Ok(match value {
         Value::Bool(value) => Cond::Always(*value),
         Value::Action(action) => match action.kind.as_str() {
-            "touched" => Cond::Touched(name(action)?),
+            "touched" => Cond::Touched(paths(action)?),
             "selected" => Cond::Selected(name(action)?),
             "signal" => Cond::Signal(name(action)?),
             "profile" => Cond::Profile(name(action)?),
-            "only" => Cond::Only(name(action)?),
-            "without" => Cond::Without(name(action)?),
+            "only" => Cond::Only(paths(action)?),
+            "without" => Cond::Without(paths(action)?),
             "and" | "or" => {
                 let left = Box::new(cond(&action.args[0], span)?);
                 let right = Box::new(cond(&action.args[1], span)?);

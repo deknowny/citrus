@@ -115,10 +115,15 @@ The action is one step or a list of steps, or `match changed { … }`: the
 first arm whose condition holds is what the check runs for this plan, `_`
 otherwise.
 
-Conditions: `touched(name)` (a changed path is in that group or check),
-`selected(check)`, `signal("name")`, `profile(name)`, `only(group)` (every
-changed path is in the group), `without(group)` (none is), combined with
-`and`, `or`, `not`.
+Conditions: `touched(x)` (a changed path is in group or check `x`, or in a
+list of globs), `only(x)` (every changed path is), `without(x)` (none is),
+`selected(check)`, `signal("name")`, `profile(name)`, combined with `and`,
+`or`, `not`. A list of globs serves conditions without claiming paths:
+`let main = ["**", "!clyer/**"]` then `when = touched(main)`.
+
+`paths - other` is `paths` with every glob of `other` excluded: a group can
+leave the files a narrower check owns to that check
+(`paths = ["scripts/**"] - tools`).
 
 ## Values Citrus fills in
 

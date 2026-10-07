@@ -62,6 +62,7 @@ true, false, none
 ["a", "b"]                   # list
 { key: "value" }             # map
 crate("clyer") + ["x/**"]    # lists join with +
+["scripts/**"] - tools       # paths minus paths: the right ones excluded
 ```
 
 Operators: `+ - * / %`, `== != < <= > >=`, `and or not`, `in`, `??`.

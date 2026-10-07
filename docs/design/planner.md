@@ -77,8 +77,9 @@ The arm chosen by the plan is what the check runs, and what its fingerprint
 covers. Conditions are also available as `when = …` on a check and on a
 `label`:
 
-- `touched(x)`: a changed path is in group or check `x`.
-- `only(g)`: every changed path is in group `g`; `without(g)`: none is.
+- `touched(x)`: a changed path is in group or check `x`, or in a list of
+  globs (a path set that feeds conditions without claiming paths).
+- `only(x)`: every changed path is in it; `without(x)`: none is.
 - `selected(x)`: check `x` is in the plan (conditions are applied until the
   plan stops changing).
 - `profile(e2e)`: the plan is for that profile.

@@ -1156,6 +1156,23 @@ fn binary(op: &str, left: Value, right: Value, span: Span) -> Result<Value, Erro
         ("*", Duration(a), Int(b)) => Duration(a * (*b).max(0) as u64),
         ("+", Str(a), Str(b)) => Str(format!("{a}{b}")),
         ("+", List(a), List(b)) => List(a.iter().chain(b).cloned().collect()),
+        // Paths minus paths: the left globs with the right ones excluded.
+        ("-", List(a), List(b)) => {
+            let mut out = a.clone();
+            for item in b {
+                match item {
+                    Str(glob) if glob.starts_with('!') => {}
+                    Str(glob) => out.push(Str(format!("!{glob}"))),
+                    other => {
+                        return Err(Error::at(
+                            span,
+                            format!("`-` takes lists of paths, not a {}", other.type_name()),
+                        ));
+                    }
+                }
+            }
+            List(out)
+        }
         ("+", Map(a), Map(b)) => {
             let mut merged = a.clone();
             for (key, value) in b {
