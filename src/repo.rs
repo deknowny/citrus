@@ -55,7 +55,10 @@ impl Repo {
     }
 
     pub fn log_dir(&self) -> PathBuf {
-        self.root.join(&self.config.log_dir)
+        match &self.config.log_dir {
+            Some(dir) => self.root.join(dir),
+            None => self.common.join("citrus/logs"),
+        }
     }
 
     pub fn branch(&self) -> String {

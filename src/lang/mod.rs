@@ -9,6 +9,7 @@ pub mod eval;
 pub mod layout;
 pub mod lexer;
 pub mod parser;
+pub mod web;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,12 @@ impl Error {
 
     pub fn help(mut self, help: impl Into<String>) -> Error {
         self.help = Some(help.into());
+        self
+    }
+
+    /// Help unless there is one already (a closer suggestion).
+    pub fn or_help(mut self, help: impl Into<String>) -> Error {
+        self.help.get_or_insert_with(|| help.into());
         self
     }
 }

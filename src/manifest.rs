@@ -14,7 +14,10 @@ use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct Target {
+    /// Its qualified name in the configuration (`clyer.bot`).
     pub name: String,
+    /// Checks it runs instead of when the change goes beyond one of them.
+    pub replaces: Vec<String>,
     pub description: Option<String>,
     pub inputs: Vec<String>,
     pub extra_inputs: Vec<String>,
@@ -27,6 +30,11 @@ pub struct Target {
     pub env: BTreeMap<String, String>,
     /// Steps declared in `citrus.ci`; empty means `run.local` (`make <target>`).
     pub steps: Vec<crate::lang::compile::Step>,
+    /// The group it is declared in, and whether it narrows the group's paths.
+    pub group: Option<String>,
+    pub narrows: bool,
+    /// `match changed` arms; a plan picks one (or none: `steps`).
+    pub arms: Vec<(crate::lang::compile::Cond, Vec<crate::lang::compile::Step>)>,
     /// `file:line` of the declaration in `citrus.ci`.
     pub source: Option<String>,
     /// Profiles it belongs to; empty: all.
@@ -74,6 +82,7 @@ impl Target {
         let extra = GlobList::new(&check.reads)?;
         Ok(Target {
             name: check.name.clone(),
+            replaces: check.replaces.clone(),
             description: check.description.clone(),
             inputs: check.owns.clone(),
             extra_inputs: check.reads.clone(),
@@ -82,6 +91,9 @@ impl Target {
             extensions: check.meta.clone(),
             env: check.env.iter().cloned().collect(),
             steps: check.steps.clone(),
+            arms: check.arms.clone(),
+            group: check.group.clone(),
+            narrows: check.narrows,
             source: Some(source),
             profiles: check.profiles.clone(),
             covered_by: check.covered_by.clone(),
@@ -94,7 +106,20 @@ impl Target {
 
     /// Same inputs, cache and resources: a reformatted entry is not a new check.
     pub fn same_declaration(&self, other: &Target) -> bool {
+        let arms = |target: &Target| -> Vec<Vec<Vec<String>>> {
+            target
+                .arms
+                .iter()
+                .map(|(_, steps)| steps.iter().map(|step| step.work.canonical()).collect())
+                .collect()
+        };
         self.declaration() == other.declaration()
+            && arms(self) == arms(other)
+            && self
+                .arms
+                .iter()
+                .map(|(when, _)| when)
+                .eq(other.arms.iter().map(|(when, _)| when))
             && self.cache == other.cache
             && self.resources == other.resources
             && self.extensions == other.extensions
@@ -121,7 +146,7 @@ impl Target {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Manifest {
     pub targets: BTreeMap<String, Target>,
     /// The `.ci` files the checks were declared in.
@@ -134,32 +159,32 @@ pub struct Manifest {
     pub labels: Vec<(String, crate::lang::compile::Cond)>,
 }
 
-/// A named path set; declaring a group again adds paths (each declaration's
-/// globs are matched on their own).
-#[derive(Debug)]
+/// A group: a named path set and the checks inside it.
+#[derive(Debug, Clone)]
 pub struct PathGroup {
     pub name: String,
-    pub note: Option<String>,
-    /// False: only for conditions; a path in it alone stays unmapped.
-    pub claims: bool,
-    /// Each declaration's globs, and whether its paths touch no other
-    /// claiming group (`exclusive = true`).
-    globs: Vec<(GlobList, bool)>,
+    globs: GlobList,
 }
 
 impl PathGroup {
     pub fn owns(&self, path: &str) -> bool {
-        self.globs.iter().any(|(globs, _)| globs.matches(path))
-    }
-
-    pub fn owns_exclusively(&self, path: &str) -> bool {
-        self.globs
-            .iter()
-            .any(|(globs, exclusive)| *exclusive && globs.matches(path))
+        self.globs.matches(path)
     }
 }
 
 impl Manifest {
+    /// Each listed check runs its chosen `match changed` arm; the others keep `_`.
+    pub fn choose_arms(&mut self, arms: &BTreeMap<String, usize>) {
+        for (name, index) in arms {
+            if let Some(target) = self.targets.get_mut(name)
+                && let Some((_, steps)) = target.arms.get(*index)
+            {
+                target.steps = steps.clone();
+                target.arms.clear();
+            }
+        }
+    }
+
     /// The checks of a compiled `citrus.ci`.
     pub fn from_project(
         project: &crate::lang::compile::Project,
@@ -172,24 +197,16 @@ impl Manifest {
             target.position = position;
             targets.insert(check.name.clone(), target);
         }
-        let mut groups: Vec<PathGroup> = Vec::new();
-        for group in &project.groups {
-            let globs = GlobList::new(&group.owns)?;
-            match groups.iter_mut().find(|known| known.name == group.name) {
-                Some(known) => {
-                    known.globs.push((globs, group.exclusive));
-                    if known.note.is_none() {
-                        known.note = group.note.clone();
-                    }
-                }
-                None => groups.push(PathGroup {
+        let groups = project
+            .groups
+            .iter()
+            .map(|group| {
+                Ok(PathGroup {
                     name: group.name.clone(),
-                    note: group.note.clone(),
-                    claims: group.claims,
-                    globs: vec![(globs, group.exclusive)],
-                }),
-            }
-        }
+                    globs: GlobList::new(&group.owns)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Manifest {
             targets,
             files: project.files.clone(),

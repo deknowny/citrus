@@ -3,73 +3,56 @@ citrus 1
 # Citrus checks itself with Citrus: `citrus run` picks what a change needs.
 
 project {
-  base = "origin/main"
   toolchain = ["Cargo.lock"]
 }
 
-let rust = ["src/**", "tests/**"]
-let cargo_files = ["Cargo.toml", "Cargo.lock", "build.rs"]
+let rust = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "build.rs"]
 
-check "test" {
-  about = "Unit and integration tests on throwaway Git repositories"
-  owns = rust + ["examples/**"]
-  reads = cargo_files
-  run = cargo.test()
-  cache = true
+# Unit and integration tests on throwaway Git repositories.
+check test = cargo.test() {
+  paths = rust + ["examples/**"]
 }
 
-check "lint" {
-  about = "rustfmt and clippy with warnings as errors"
-  owns = rust + ["rustfmt.toml"]
-  reads = cargo_files
-  run = [cargo.fmt(check: true), cargo.clippy(deny: "warnings")]
-  cache = true
+# rustfmt and clippy with warnings as errors.
+check lint = [cargo.fmt(check: true), cargo.clippy(deny: "warnings")] {
+  paths = rust + ["rustfmt.toml"]
 }
 
-check "docs" {
-  about = "Relative links in Markdown point at existing files"
-  owns = ["*.md", "docs/**", "skills/**", "examples/**"]
-  run = links.check("**/*.md")
-  cache = true
+# Relative links in Markdown point at existing files.
+check docs = links.check("**/*.md") {
+  paths = ["*.md", "docs/**", "skills/**", "examples/**"]
 }
 
-check "doctor" {
-  about = "This repository's own Citrus configuration is valid and formatted"
-  owns = ["citrus.ci"]
-  reads = rust + cargo_files
-  run = [cargo.run("doctor", "--text"), cargo.run("fmt", "--check", "--text")]
-  cache = true
+# This repository's own configuration is valid and formatted.
+check doctor = [cargo.run("doctor", "--text"), cargo.run("fmt", "--check", "--text")] {
+  paths = ["citrus.ci"]
+  reads = rust
 }
 
-task "fmt" {
-  about = "Format the code"
-  steps = [cargo.fmt()]
-}
+# Format the code.
+task fmt = cargo.fmt()
 
 # `citrus release start github --version X.Y.Z --approve`: tag a proven main
 # commit; the release workflow publishes the binaries and SHA256SUMS.
-release "github" {
-  about = "Tag a version and wait for its binaries"
-  environment = "github"
-  step "main" {
-    # Only a commit that is on origin/main, with its version and notes.
-    run = [
-      run("git", "fetch", "--quiet", "origin", "main"),
-      run("git", "merge-base", "--is-ancestor", "HEAD", "origin/main"),
-      run("grep", "-q", "^version = \"{version}\"", "Cargo.toml"),
-      run("grep", "-q", "^## {version} ", "CHANGELOG.md"),
-    ]
-  }
-  step "tag" {
+release github {
+  environment = github
+
+  # Only a commit that is on origin/main, with its version and notes.
+  step main = [
+    run("git", "fetch", "--quiet", "origin", "main"),
+    run("git", "merge-base", "--is-ancestor", "HEAD", "origin/main"),
+    run("grep", "-q", "^version = \"{version}\"", "Cargo.toml"),
+    run("grep", "-q", "^## {version} ", "CHANGELOG.md"),
+  ]
+
+  step tag = [
+    run("git", "tag", "-a", "v{version}", "-m", "Citrus v{version}"),
+    run("git", "push", "--quiet", "origin", "v{version}"),
+  ] {
     production = true
-    run = [
-      run("git", "tag", "-a", "v{version}", "-m", "Citrus v{version}"),
-      run("git", "push", "--quiet", "origin", "v{version}"),
-    ]
     # The tag may exist already: only push it.
     recover = run("git", "push", "--quiet", "origin", "v{version}")
   }
-  step "binaries" {
-    run = wait.http("https://github.com/deknowny/citrus/releases/download/v{version}/SHA256SUMS", timeout: 30m)
-  }
+
+  step binaries = wait.http("https://github.com/deknowny/citrus/releases/download/v{version}/SHA256SUMS", timeout: 30m)
 }

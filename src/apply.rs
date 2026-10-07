@@ -56,12 +56,12 @@ pub struct Request {
 }
 
 /// Plan and gates; returns None when the environment already runs HEAD's build.
-pub fn start(context: &Context, request: &Request) -> Result<Option<Release>> {
+pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>> {
     let environments = deploy::environments(context)?;
     let environment = environments
         .get(&request.environment)
         .with_context(|| format!("no environment {}", request.environment))?;
-    let repo = &context.repo;
+    let repo = &context.repo.clone();
     if !repo
         .git(&["status", "--porcelain", "--untracked-files=no"])?
         .is_empty()
@@ -88,7 +88,7 @@ pub fn start(context: &Context, request: &Request) -> Result<Option<Release>> {
         return Ok(None);
     }
     if environment.checks == "proven" && !request.unchecked {
-        let needed = crate::release::unproven_checks(context)?;
+        let needed = crate::release::unproven_checks(&mut *context)?;
         if !needed.is_empty() {
             bail!(
                 "checks not proven for this commit: {} — run `citrus run` first (or --unchecked)",

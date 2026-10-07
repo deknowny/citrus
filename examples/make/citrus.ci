@@ -1,21 +1,16 @@
 citrus 1
 
 # The smallest setup: checks are Make targets.
-# `owns` are the files a check owns: changing one selects it.
-# `reads` are files it only reads: they invalidate reuse but do not select it.
-# `cache = true` reuses a PASS while all of them are unchanged, so list everything it reads.
+# `paths` select a check when they change; `reads` only invalidate its
+# earlier pass. A pass is reused while both are unchanged.
 
-check "test-api" {
-  about = "API unit tests"
-  owns = ["api/**"]
+# API unit tests.
+check test-api = make("test-api") {
+  paths = ["api/**"]
   reads = ["Cargo.lock"]
-  run = make("test-api")
-  cache = true
 }
 
-check "lint-docs" {
-  about = "Markdown links and spelling"
-  owns = ["docs/**", "*.md"]
-  run = make("lint-docs")
-  cache = true
+# Markdown links and spelling.
+check lint-docs = make("lint-docs") {
+  paths = ["docs/**", "*.md"]
 }

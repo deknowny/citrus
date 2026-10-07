@@ -3,15 +3,15 @@
 //! Without them the built-in planner selects declared checks owning the
 //! changed paths, and state is a local SQLite file shared by all worktrees.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Files every declared target's fingerprint depends on (toolchain pins).
     pub toolchain_files: Vec<String>,
-    /// Where run logs go, repository-relative; should be ignored by Git.
-    pub log_dir: String,
+    /// Where run logs go: repository-relative when the project says so
+    /// (`project { logs = … }`), otherwise `citrus/logs` in the Git directory.
+    pub log_dir: Option<String>,
     /// Files that define the targets `citrus add` may declare (globs). Empty: no check.
     pub target_definitions: Vec<String>,
     pub plan: PlanConfig,
@@ -56,30 +56,15 @@ pub struct StatusConfig {
 pub struct PlanConfig {
     /// Default base for "what changed" when `--base` is not given.
     pub base: String,
-    /// External planner printing `TARGET\tmake:<name>` lines (plus optional
-    /// PLAN/MAPPED/UNMAPPED). Empty: built-in planner over the manifest.
-    pub command: Vec<String>,
-    /// Extra argument for an explicit base; `{base}` is substituted.
-    pub base_arg: String,
-    /// Extra argument handing the external planner a file of changed paths
-    /// (one per line); `{file}` is substituted. Lets `citrus integrate` ask
-    /// which checks the incoming changes select. Empty: not supported.
-    pub paths_arg: String,
     /// The profile checks are planned for (`--profile`, `CITRUS_PROFILE`, or
     /// the project's first); None when the project declares no profiles.
     pub profile: Option<String>,
-    /// Extra argument naming the profile for the external planner; `{profile}` substituted.
-    pub profile_arg: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    /// Command for one target on this machine; `{target}` is substituted.
-    pub local: Vec<String>,
     /// Command that runs the whole planned set elsewhere (builder, CI). Empty: no remote mode.
     pub remote: Vec<String>,
-    /// Extra environment per target.
-    pub env: BTreeMap<String, BTreeMap<String, String>>,
     /// Line prefixes, besides `CITRUS_TARGET `, that report
     /// `target=<name> status=START|PASS|FAIL [exit=] [seconds=]`.
     pub progress_prefixes: Vec<String>,
@@ -114,7 +99,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             toolchain_files: Vec::new(),
-            log_dir: ".citrus/logs".into(),
+            log_dir: None,
             target_definitions: vec!["Makefile".into(), "*.mk".into(), "make/*.mk".into()],
             plan: PlanConfig::default(),
             run: RunConfig::default(),
@@ -131,11 +116,7 @@ impl Default for PlanConfig {
     fn default() -> Self {
         PlanConfig {
             base: "origin/main".into(),
-            command: Vec::new(),
-            base_arg: String::new(),
             profile: None,
-            profile_arg: String::new(),
-            paths_arg: String::new(),
         }
     }
 }
@@ -143,18 +124,13 @@ impl Default for PlanConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         RunConfig {
-            local: vec![
-                "make".into(),
-                "--no-print-directory".into(),
-                "{target}".into(),
-            ],
             remote: Vec::new(),
-            env: BTreeMap::new(),
+            // The runner protocol (docs/protocol.md); CITRUS_TARGET is always read.
             progress_prefixes: Vec::new(),
-            waiting_prefix: String::new(),
-            acquired_prefixes: Vec::new(),
-            stage_prefix: String::new(),
-            linked_log_markers: Vec::new(),
+            waiting_prefix: "CITRUS_WAIT ".into(),
+            acquired_prefixes: vec!["CITRUS_RUNNING".into()],
+            stage_prefix: "CITRUS_STAGE ".into(),
+            linked_log_markers: vec!["CITRUS_LOG ".into()],
         }
     }
 }

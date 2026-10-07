@@ -1,23 +1,16 @@
 citrus 1
 
-# A JavaScript project without Make: each check is an npm script.
-project {
-  toolchain = [".nvmrc", "package-lock.json"]
+# A pnpm workspace with a Next.js app and a shared component library.
+
+# The shop: the Next.js app and every workspace package it uses.
+group shop {
+  paths = next("@acme/shop")
+  check unit = pnpm.test("@acme/shop")
+  check build = pnpm.build("@acme/shop")
 }
 
-fn npm(script) { run("npm", "run", "--silent", script) }
-
-check "test" {
-  about = "Vitest unit tests"
-  owns = ["src/**", "test/**"]
-  reads = ["vitest.config.ts", "tsconfig.json"]
-  run = npm("test")
-  cache = true
-}
-
-check "typecheck" {
-  owns = ["src/**/*.ts"]
-  reads = ["tsconfig.json"]
-  run = npm("typecheck")
-  cache = true
+# Components shared by the apps.
+group ui {
+  paths = package("@acme/ui")
+  check unit = pnpm.test("@acme/ui")
 }

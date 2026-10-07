@@ -43,7 +43,7 @@ fn proven() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Version {
-    /// Reserves and prints the version; `{next}` is the version after the latest.
+    /// Reserves and prints the version; `{version}` is the version after the latest.
     pub reserve: Vec<String>,
     /// Regex-free capture: the text after this prefix on a line of the output.
     #[serde(default = "release_prefix")]
@@ -175,7 +175,7 @@ pub struct Start {
 
 /// What `start` would do, without doing it: gates, version and exact commands.
 pub fn dry_run(
-    context: &Context,
+    context: &mut Context,
     unit_name: &str,
     given: Option<&str>,
 ) -> Result<serde_json::Value> {
@@ -196,7 +196,7 @@ pub fn dry_run(
         (None, Some(_)) => bump(&previous).unwrap_or_default(),
         (None, None) => String::new(),
     };
-    let plan = crate::plan::compute(repo, &context.manifest, None)?;
+    let plan = crate::plan::compute(repo, &mut context.manifest, None)?;
     let files = repo.files()?;
     let snapshot = repo.snapshot()?;
     let mut needed = Vec::new();
@@ -217,7 +217,6 @@ pub fn dry_run(
         ("previous", previous.clone()),
         ("commit", repo.git(&["rev-parse", "HEAD"])?),
         ("unit", unit_name.to_owned()),
-        ("next", next.clone()),
     ]);
     let mut commands = Vec::new();
     if let (None, Some(spec)) = (given, &unit.version) {
@@ -239,10 +238,10 @@ pub fn dry_run(
 }
 
 /// Validate the gates, reserve the version and start the release worker.
-pub fn start(context: &Context, request: &Start) -> Result<Release> {
+pub fn start(context: &mut Context, request: &Start) -> Result<Release> {
     let releases = Releases::load(context)?;
     let unit = releases.unit(&request.unit)?;
-    let repo = &context.repo;
+    let repo = &context.repo.clone();
     if !repo
         .git(&["status", "--porcelain", "--untracked-files=no"])?
         .is_empty()
@@ -284,7 +283,7 @@ pub fn start(context: &Context, request: &Start) -> Result<Release> {
         );
     }
     if kind == "release" && unit.checks == "proven" && !request.unchecked {
-        let needed = unproven_checks(context)?;
+        let needed = unproven_checks(&mut *context)?;
         if !needed.is_empty() {
             bail!(
                 "checks not proven for this commit: {} — run `citrus run` first (or --unchecked to release anyway)",
@@ -375,9 +374,9 @@ pub fn start(context: &Context, request: &Start) -> Result<Release> {
 }
 
 /// Checks the plan selects for HEAD that are not proven yet.
-pub fn unproven_checks(context: &Context) -> Result<Vec<String>> {
+pub fn unproven_checks(context: &mut Context) -> Result<Vec<String>> {
     let repo = &context.repo;
-    let plan = crate::plan::compute(repo, &context.manifest, None)?;
+    let plan = crate::plan::compute(repo, &mut context.manifest, None)?;
     let files = repo.files()?;
     let snapshot = repo.snapshot()?;
     Ok(plan
@@ -534,7 +533,7 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
                     .with_context(|| format!("cannot bump version {}", release.previous))?
             };
             let mut values = values(&version);
-            values.insert("next", next);
+            values.insert("version", next);
             let argv = substitute(&spec.reserve, &values);
             (
                 vec![Work::Process {

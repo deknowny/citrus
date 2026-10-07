@@ -1,4 +1,4 @@
-//! `cargo.closure("package")`: the files a Cargo package is built from inside
+//! `crate("package")`: the files a Cargo package is built from inside
 //! the repository — its crate and every workspace crate it reaches through
 //! path dependencies (normal, dev and build, any target), files outside those
 //! crates pulled in by `include_str!`, `include_bytes!` and `sqlx::migrate!`,
@@ -12,6 +12,54 @@ use std::collections::{BTreeMap, BTreeSet};
 pub trait Files {
     fn read(&self, path: &str) -> Option<String>;
     fn list(&self) -> &[String];
+}
+
+/// `crate("a", "platform-*", …)`: the union of the closures of these
+/// packages; `*` in a name matches several packages.
+pub fn crates(files: &dyn Files, names: &[String]) -> Result<Vec<String>, String> {
+    let known = packages(files);
+    let mut globs: Vec<String> = Vec::new();
+    for name in names {
+        let matched: Vec<&String> = if name.contains('*') {
+            let pattern = crate::manifest::GlobList::new(std::slice::from_ref(name))
+                .map_err(|error| error.to_string())?;
+            known
+                .iter()
+                .filter(|package| pattern.matches(package))
+                .collect()
+        } else {
+            known.iter().filter(|package| *package == name).collect()
+        };
+        if matched.is_empty() {
+            return Err(format!("no Cargo package `{name}` in this repository"));
+        }
+        for package in matched {
+            for glob in closure(files, package)? {
+                if !globs.contains(&glob) {
+                    globs.push(glob);
+                }
+            }
+        }
+    }
+    Ok(globs)
+}
+
+/// Names of the Cargo packages in the repository.
+fn packages(files: &dyn Files) -> Vec<String> {
+    files
+        .list()
+        .iter()
+        .filter(|path| path.ends_with("Cargo.toml"))
+        .filter_map(|path| files.read(path))
+        .filter_map(|text| text.parse::<toml::Table>().ok())
+        .filter_map(|manifest| {
+            manifest
+                .get("package")?
+                .get("name")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// Repository-relative globs; an error names what could not be resolved.

@@ -1,53 +1,46 @@
-# Declared checks
+# Checks, fingerprints and receipts
 
-```
-check "test-api" {
-  about = "API unit tests"          # optional, shown by `citrus why`
-  owns = ["api/**"]                 # files this check owns: changing one selects it
-  reads = ["Cargo.lock"]            # files it only reads: invalidate reuse, do not select
-  run = make("test-api")            # one action or a list of them
-  cache = true                      # reuse a PASS while all of the above is unchanged
-  resources = ["contracts"]         # resource classes for the project's scheduler
-  env = { SQLX_OFFLINE: "true" }    # extra environment of its steps
-  meta = { linux: true }            # data for the project's own tools, kept as written
-  profiles = ["fast"]               # only in these profiles (docs/design/planner.md)
-  covered_by = ["test-all"]         # dropped when one of these is in the plan
-  when = signal("product:api")      # plan-time condition (docs/design/planner.md)
-}
-```
+How checks are declared is in [configuration.md](configuration.md). This
+page is the contract other tools rely on: paths, the `CITRUS_CHECKS` file,
+the input fingerprint and receipts.
 
-- Names: `[a-z0-9][a-z0-9._-]*`.
+## Paths
+
+- Check names: `[a-z0-9][a-z0-9._-]*`; a check in a group is `group.name`.
 - Globs are repository-relative: `*` and `?` stay inside one path segment,
   `**` matches anything, `**/` matches zero or more whole directories.
   Absolute paths and `..` are rejected; a glob matching no file is reported.
-- `!glob` excludes: in each of `owns` and `reads`, the last glob that
+- `!glob` excludes: in each of `paths` and `reads`, the last glob that
   matches a path decides, as in `.gitignore`
   (`["crates/backend/**", "!crates/backend/src/bots/clyer/**"]`). Tools
   computing the fingerprint apply the same rule when they select files.
-- `owns` must be non-empty and `run` must name something to run.
-- Set `cache = true` only when `owns` + `reads` list **everything** the check
-  reads. An undeclared input makes a reused PASS false. For a Rust check,
-  `reads = cargo.closure("package")` lists what the package is built from.
+- A pass is reused while `paths` + `reads` are unchanged, so they must list
+  **everything** the check reads; `crate("pkg")`, `next("@app")` and
+  `package("@lib")` derive that from the workspace. A check that depends on
+  the outside world says `cache = false`.
 - Editing a check's declaration selects it on the next plan.
 
 ## For the project's own tools: `CITRUS_CHECKS`
 
-A planner or pool declared in `citrus.ci` runs with `CITRUS_CHECKS` set to a
-JSON file; `citrus targets --json` prints the same fields:
+The runner runs with `CITRUS_CHECKS` set to a JSON file; `citrus targets --json` prints the same fields:
 
 ```json
 {"toolchain": ["rust-toolchain.toml"], "files": ["citrus.ci"],
- "checks": [{"target": "test-api", "description": "API unit tests", "cache": true,
-             "inputs": ["api/**"], "extra_inputs": ["Cargo.lock"], "resources": ["contracts"],
-             "meta": {"linux": true}, "source": "citrus.ci:3",
+ "checks": [{"target": "api.unit", "description": "API unit tests", "cache": true,
+             "inputs": ["api/**"], "extra_inputs": ["Cargo.lock"], "resources": ["database"],
+             "meta": {"linux": true}, "source": ".citrus/api.ci:3",
              "declaration": {"env": {"SQLX_OFFLINE": "true"}, "extra_inputs": ["Cargo.lock"],
                              "inputs": ["api/**"], "run": [["run", "make", "--no-print-directory", "test-api"]],
-                             "target": "test-api"}}]}
+                             "target": "api.unit"}}]}
 ```
+
+`inputs` are `paths`, `extra_inputs` are `reads`, `resources` are the
+services in `needs`. `run` is what the check runs: for a `match changed`
+check, the arm the plan chose (`CITRUS_CHECKS` of a run), otherwise `_`.
 
 ## Input fingerprint
 
-The receipt key of a declared check is SHA-256 over:
+The receipt key of a check is SHA-256 over:
 
 1. its `declaration` as JSON text with keys sorted, `", "` and `": "`
    separators and non-ASCII escaped as `\uXXXX` (Python's
@@ -66,7 +59,7 @@ The hex digest is the fingerprint.
 
 ## Receipts
 
-A PASS of a declared check is a file `<receipts>/<target>-<fingerprint>.pass`:
+A PASS of a check is a file `<receipts>/<target>-<fingerprint>.pass`:
 
 ```
 target=<name>

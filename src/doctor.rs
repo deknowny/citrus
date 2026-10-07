@@ -16,7 +16,7 @@ pub struct Finding {
     pub detail: String,
 }
 
-pub fn diagnose(context: &Context) -> Vec<Finding> {
+pub fn diagnose(context: &mut Context) -> Vec<Finding> {
     let mut findings = Vec::new();
     let mut note = |check: &str, status: &'static str, detail: String| {
         findings.push(Finding {
@@ -75,32 +75,44 @@ pub fn diagnose(context: &Context) -> Vec<Finding> {
                         .collect::<Vec<_>>()
                         .join(", ");
                     note(
-                        &format!("target {}", target.name),
+                        &format!("check {}", target.name),
                         "fail",
                         format!("globs match no file: {list}"),
                     );
                 }
-                let defined = if target.steps.is_empty() {
-                    crate::add::defined(context, &target.name)
-                } else {
-                    Ok(true)
-                };
-                match defined {
-                    Ok(false) => note(
-                        &format!("target {}", target.name),
-                        "fail",
-                        format!(
-                            "no `{}:` rule in {}",
-                            target.name,
-                            config.target_definitions.join(", ")
+                // `make("x")` steps need an `x:` rule.
+                let rules = target
+                    .steps
+                    .iter()
+                    .chain(target.arms.iter().flat_map(|(_, steps)| steps))
+                    .filter_map(|step| match &step.work {
+                        crate::lang::compile::Work::Process { argv, .. }
+                            if argv.first().map(String::as_str) == Some("make") =>
+                        {
+                            argv.iter()
+                                .skip(1)
+                                .find(|part| !part.starts_with('-') && !part.contains('='))
+                                .cloned()
+                        }
+                        _ => None,
+                    });
+                for rule in rules {
+                    match defined(context, &rule) {
+                        Ok(false) => note(
+                            &format!("check {}", target.name),
+                            "fail",
+                            format!(
+                                "no `{rule}:` rule in {}",
+                                config.target_definitions.join(", ")
+                            ),
                         ),
-                    ),
-                    Err(error) => note(
-                        &format!("target {}", target.name),
-                        "warn",
-                        format!("{error:#}"),
-                    ),
-                    Ok(true) => {}
+                        Err(error) => note(
+                            &format!("check {}", target.name),
+                            "warn",
+                            format!("{error:#}"),
+                        ),
+                        Ok(true) => {}
+                    }
                 }
             }
         }
@@ -108,31 +120,28 @@ pub fn diagnose(context: &Context) -> Vec<Finding> {
     }
 
     // Logs inside the tree change the source snapshot unless Git ignores them.
-    let probe = format!("{}/probe.log", config.log_dir.trim_end_matches('/'));
-    let ignored = Command::new("git")
-        .arg("-C")
-        .arg(&context.repo.root)
-        .args(["check-ignore", "-q", "--no-index", &probe])
-        .status()
-        .is_ok_and(|status| status.success());
-    if ignored {
-        note(
-            "logs",
-            "ok",
-            format!("{} is ignored by Git", config.log_dir),
-        );
-    } else {
-        note(
-            "logs",
-            "fail",
-            format!(
-                "{} is not ignored by Git: every run would change the snapshot; add it to .gitignore",
-                config.log_dir
-            ),
-        );
+    if let Some(dir) = &config.log_dir {
+        let probe = format!("{}/probe.log", dir.trim_end_matches('/'));
+        let ignored = Command::new("git")
+            .arg("-C")
+            .arg(&context.repo.root)
+            .args(["check-ignore", "-q", "--no-index", &probe])
+            .status()
+            .is_ok_and(|status| status.success());
+        if ignored {
+            note("logs", "ok", format!("{dir} is ignored by Git"));
+        } else {
+            note(
+                "logs",
+                "fail",
+                format!(
+                    "{dir} is not ignored by Git: every run would change the snapshot; add it to .gitignore"
+                ),
+            );
+        }
     }
 
-    match plan::compute(&context.repo, &context.manifest, None) {
+    match plan::compute(&context.repo, &mut context.manifest, None) {
         Ok(plan) => note(
             "planner",
             if plan.unmapped.is_empty() {
@@ -174,4 +183,30 @@ pub fn diagnose(context: &Context) -> Vec<Finding> {
         );
     }
     findings
+}
+
+/// Whether a rule for `name` exists in the configured target definition files.
+fn defined(context: &Context, name: &str) -> anyhow::Result<bool> {
+    let patterns = &context.repo.config.target_definitions;
+    if patterns.is_empty() {
+        return Ok(true);
+    }
+    let files = context.repo.files()?;
+    for path in &files {
+        if !patterns.iter().any(|pattern| {
+            pattern_matches_any(pattern, std::slice::from_ref(path)).unwrap_or(false)
+        }) {
+            continue;
+        }
+        let text = std::fs::read_to_string(context.repo.root.join(path)).unwrap_or_default();
+        let found = text.lines().any(|line| {
+            line.strip_prefix(name)
+                .map(str::trim_start)
+                .is_some_and(|rest| rest.starts_with(':') && !rest.starts_with(":="))
+        });
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

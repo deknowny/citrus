@@ -1,8 +1,7 @@
-//! Which checks the current changes need. A project with its own `planner`
-//! keeps owning path → check routing (it reads the declared checks from
-//! `CITRUS_CHECKS`); otherwise the declared checks owning the changed paths
-//! are selected.
+//! Which checks the current changes need: the declared checks owning the
+//! changed paths, with their conditions (docs/design/planner.md).
 
+use std::collections::BTreeMap;
 use std::process::Command;
 
 use anyhow::{Result, bail};
@@ -15,7 +14,7 @@ use crate::repo::Repo;
 pub struct Plan {
     pub status: String,
     pub files: usize,
-    /// Make targets to run, in planner order.
+    /// Checks to run, in declaration order.
     pub targets: Vec<String>,
     /// Non-runnable plan entries such as `no-heavy:docs`.
     pub notes: Vec<String>,
@@ -28,11 +27,16 @@ pub struct Plan {
     pub signals: Vec<String>,
     /// Labels whose condition holds.
     pub labels: Vec<String>,
+    /// `match changed` arm chosen for a check (its index); absent: `_`.
+    pub arms: BTreeMap<String, usize>,
 }
 
-pub fn compute(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<Plan> {
+/// The plan for the changes since `base`; `manifest` takes the `match
+/// changed` arms it chose, so fingerprints and runs follow them.
+pub fn compute(repo: &Repo, manifest: &mut Manifest, base: Option<&str>) -> Result<Plan> {
     let mut plan = compute_all(repo, manifest, base)?;
     narrow(&mut plan, repo, manifest);
+    manifest.choose_arms(&plan.arms);
     Ok(plan)
 }
 
@@ -61,36 +65,9 @@ fn narrow(plan: &mut Plan, repo: &Repo, manifest: &Manifest) {
 }
 
 fn compute_all(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<Plan> {
-    let config = &repo.config.plan;
-    if config.command.is_empty() {
-        return builtin(repo, manifest, base.unwrap_or(&config.base));
-    }
-    let extra = base
-        .filter(|_| !config.base_arg.is_empty())
-        .map(|base| config.base_arg.replace("{base}", base));
-    let mut plan = external(repo, manifest, extra)?;
-    let fork = fork_point(repo, base.unwrap_or(&config.base));
-    add_edited(
-        &mut plan,
-        repo,
-        manifest,
-        &changed_paths(repo, &fork)?,
-        &fork,
-    );
-    Ok(plan)
-}
-
-/// Checks whose declaration in `citrus.ci` changed join any plan, also one
-/// made by the project's own planner, which does not read declarations.
-fn add_edited(plan: &mut Plan, repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) {
-    if !paths.iter().any(|path| manifest.files.contains(path)) {
-        return;
-    }
-    for name in edited_checks(repo, manifest, before) {
-        if !plan.targets.contains(&name) {
-            plan.targets.push(name);
-        }
-    }
+    let fork = fork_point(repo, base.unwrap_or(&repo.config.plan.base));
+    let paths = changed_paths(repo, &fork)?;
+    select(repo, manifest, paths, &fork, false)
 }
 
 fn fork_point(repo: &Repo, base: &str) -> String {
@@ -144,86 +121,20 @@ fn edited_checks(repo: &Repo, manifest: &Manifest, before: &str) -> Vec<String> 
 
 /// The checks that changes to exactly `paths` would select; `before` is the
 /// revision those changes start from (for manifest edits).
-pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
+pub fn for_paths(
+    repo: &Repo,
+    manifest: &mut Manifest,
+    paths: &[String],
+    before: &str,
+) -> Result<Plan> {
     let mut plan = for_paths_all(repo, manifest, paths, before)?;
     narrow(&mut plan, repo, manifest);
+    manifest.choose_arms(&plan.arms);
     Ok(plan)
 }
 
 fn for_paths_all(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
-    let config = &repo.config.plan;
-    if config.command.is_empty() {
-        return select(repo, manifest, paths.to_vec(), before, true);
-    }
-    if config.paths_arg.is_empty() {
-        bail!("the planner takes no path list (`paths_var` of `planner` in citrus.ci)");
-    }
-    let dir = repo.state_dir().join("tmp");
-    crate::repo::private_dir(&dir)?;
-    let file = dir.join(format!(
-        "paths-{}-{}",
-        std::process::id(),
-        crate::manifest::now()
-    ));
-    std::fs::write(
-        &file,
-        paths
-            .iter()
-            .map(|path| format!("{path}\n"))
-            .collect::<String>(),
-    )?;
-    let result = external(
-        repo,
-        manifest,
-        Some(
-            config
-                .paths_arg
-                .replace("{file}", &file.display().to_string()),
-        ),
-    );
-    let _ = std::fs::remove_file(&file);
-    let mut plan = result?;
-    add_edited(&mut plan, repo, manifest, paths, before);
-    Ok(plan)
-}
-
-fn external(repo: &Repo, manifest: &Manifest, extra: Option<String>) -> Result<Plan> {
-    let config = &repo.config.plan;
-    let mut command = Command::new(&config.command[0]);
-    command
-        .args(&config.command[1..])
-        .current_dir(&repo.root)
-        .env("CITRUS_CHECKS", manifest.export_file(repo)?)
-        .env("CITRUS_PROFILE", config.profile.clone().unwrap_or_default());
-    if let Some(profile) = config
-        .profile
-        .as_deref()
-        .filter(|_| !config.profile_arg.is_empty())
-    {
-        command.arg(config.profile_arg.replace("{profile}", profile));
-    }
-    if let Some(extra) = extra {
-        command.arg(extra);
-    }
-    let output = command.output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() && !stdout.contains("TARGET\t") {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: Vec<&str> = stderr.lines().rev().take(5).collect();
-        bail!(
-            "planner {} failed: {}",
-            config.command.join(" "),
-            tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
-        );
-    }
-    Ok(parse(&stdout))
-}
-
-/// Declared targets that own a path changed since the fork point with `base`.
-fn builtin(repo: &Repo, manifest: &Manifest, base: &str) -> Result<Plan> {
-    let fork = fork_point(repo, base);
-    let paths = changed_paths(repo, &fork)?;
-    select(repo, manifest, paths, &fork, false)
+    select(repo, manifest, paths.to_vec(), before, true)
 }
 
 /// Declared targets owning `paths`; new or edited declarations since `before` too.
@@ -263,48 +174,47 @@ fn select(
     let found = signals(repo, manifest, &paths, fork, explicit)?;
     // Which groups and checks the changed paths touch.
     let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // How many changed paths each group contains, for only() and without().
+    let mut group_paths: BTreeMap<String, usize> = BTreeMap::new();
+    // Changed paths of each check, for `replaces`.
+    let mut owned_paths: Vec<(String, Vec<String>)> = Vec::new();
     for path in &paths {
-        let owners = manifest.owners(path);
-        // A path a check owns is that check's: it touches only the groups
-        // that feed conditions (claims = false), not the claiming ones.
-        let in_group = |group: &&crate::manifest::PathGroup| {
-            group.owns(path)
-                || found
-                    .claims
-                    .iter()
-                    .any(|(claimed, name)| claimed == path && *name == group.name)
-        };
-        // An exclusive group's path, like a check's, touches no other
-        // claiming group.
-        let exclusive: Vec<&str> = manifest
-            .groups
-            .iter()
-            .filter(|group| group.owns_exclusively(path))
-            .map(|group| group.name.as_str())
-            .collect();
+        // A path a signal claims for a group belongs to it like its own paths.
         let groups: Vec<&str> = manifest
             .groups
             .iter()
             .filter(|group| {
-                !group.claims
-                    || (owners.is_empty()
-                        && (exclusive.is_empty() || exclusive.contains(&group.name.as_str())))
+                group.owns(path)
+                    || found
+                        .claims
+                        .iter()
+                        .any(|(claimed, name)| claimed == path && *name == group.name)
             })
-            .filter(in_group)
             .map(|group| group.name.as_str())
             .collect();
+        // Its checks: those owning it, and the checks of a group that claimed
+        // it which do not narrow the group's paths.
+        let mut owners: Vec<&str> = manifest.owners(path);
+        for target in manifest.targets.values() {
+            let claimed = !target.narrows
+                && target
+                    .group
+                    .as_deref()
+                    .is_some_and(|group| groups.contains(&group));
+            if claimed && !owners.contains(&target.name.as_str()) {
+                owners.push(&target.name);
+            }
+        }
         touched.extend(owners.iter().map(|name| (*name).to_owned()));
         touched.extend(groups.iter().map(|name| (*name).to_owned()));
-        let claiming: Vec<&&str> = groups
-            .iter()
-            .filter(|name| {
-                manifest
-                    .groups
-                    .iter()
-                    .any(|group| group.name == ***name && group.claims)
-            })
-            .collect();
-        if owners.is_empty() && claiming.is_empty() {
+        for group in &groups {
+            *group_paths.entry((*group).to_owned()).or_insert(0) += 1;
+        }
+        owned_paths.push((
+            path.clone(),
+            owners.iter().map(|name| (*name).to_owned()).collect(),
+        ));
+        if owners.is_empty() && groups.is_empty() {
             // An edited .ci file nobody owns maps to the checks it changed.
             if edited.contains(path) {
                 plan.mapped.push((path.clone(), edited_surfaces.clone()));
@@ -318,44 +228,76 @@ fn select(
             owners
                 .iter()
                 .map(|owner| format!("target:{owner}"))
-                .chain(claiming.iter().map(|group| format!("group:{group}")))
+                .chain(groups.iter().map(|group| format!("group:{group}")))
                 .collect::<Vec<_>>()
                 .join(","),
         ));
     }
     let signals = found.names;
+    let facts = Facts {
+        touched: &touched,
+        signals: &signals,
+        group_paths: &group_paths,
+        changed: paths.len(),
+        profile: repo.config.plan.profile.as_deref(),
+    };
     // Owners whose condition holds, and checks selected by condition alone;
     // repeated until stable because conditions may name selected checks.
     let mut selected: Vec<String> = plan.targets.clone();
+    let mut ordered: Vec<&crate::manifest::Target> = manifest.targets.values().collect();
+    ordered.sort_by_key(|target| target.position);
     for _ in 0..manifest.targets.len() + 1 {
         let mut added = false;
-        let mut ordered: Vec<&crate::manifest::Target> = manifest.targets.values().collect();
-        ordered.sort_by_key(|target| target.position);
-        for target in ordered {
-            if selected.contains(&target.name) {
+        for target in &ordered {
+            if selected.contains(&target.name)
+                || (!target.inputs.is_empty() && !touched.contains(&target.name))
+            {
                 continue;
             }
-            if !target.inputs.is_empty() && !touched.contains(&target.name) {
-                continue;
-            }
-            let holds = target.when.as_ref().is_none_or(|when| {
-                when.eval(&|fact| match fact {
-                    crate::lang::compile::Cond::Touched(name) => touched.contains(name),
-                    crate::lang::compile::Cond::Selected(name) => selected.contains(name),
-                    crate::lang::compile::Cond::Signal(name) => signals.contains(name),
-                    crate::lang::compile::Cond::Profile(name) => {
-                        repo.config.plan.profile.as_deref() == Some(name.as_str())
-                    }
-                    _ => false,
-                })
-            });
-            if holds {
+            if target
+                .when
+                .as_ref()
+                .is_none_or(|when| facts.holds(when, &selected))
+            {
                 selected.push(target.name.clone());
                 added = true;
             }
         }
         if !added {
             break;
+        }
+    }
+    // A check that `replaces` others runs instead of them when the change
+    // goes beyond what one of them owns; otherwise they run and it does not.
+    for target in ordered.iter().filter(|target| !target.replaces.is_empty()) {
+        if !selected.contains(&target.name) {
+            continue;
+        }
+        let parts: Vec<&String> = target
+            .replaces
+            .iter()
+            .filter(|part| selected.contains(part))
+            .collect();
+        let beyond = owned_paths.iter().any(|(_, owners)| {
+            owners.contains(&target.name)
+                && !owners.iter().any(|owner| target.replaces.contains(owner))
+        });
+        if beyond || parts.len() > 1 {
+            selected.retain(|name| !target.replaces.contains(name));
+        } else {
+            selected.retain(|name| *name != target.name);
+        }
+    }
+    for name in &selected {
+        let Some(target) = manifest.targets.get(name) else {
+            continue;
+        };
+        if let Some(index) = target
+            .arms
+            .iter()
+            .position(|(when, _)| facts.holds(when, &selected))
+        {
+            plan.arms.insert(name.clone(), index);
         }
     }
     plan.targets = selected;
@@ -368,30 +310,10 @@ fn select(
     plan.labels = manifest
         .labels
         .iter()
-        .filter(|(_, when)| {
-            when.eval(&|fact| match fact {
-                crate::lang::compile::Cond::Touched(name) => touched.contains(name),
-                crate::lang::compile::Cond::Selected(name) => plan.targets.contains(name),
-                crate::lang::compile::Cond::Signal(name) => signals.contains(name),
-                crate::lang::compile::Cond::Profile(name) => {
-                    repo.config.plan.profile.as_deref() == Some(name.as_str())
-                }
-                _ => false,
-            })
-        })
+        .filter(|(_, when)| facts.holds(when, &plan.targets))
         .map(|(name, _)| name.clone())
         .collect();
     plan.signals = signals.clone();
-    for group in &manifest.groups {
-        if let Some(note) = group
-            .note
-            .as_ref()
-            .filter(|_| touched.contains(&group.name))
-            && !plan.notes.contains(note)
-        {
-            plan.notes.push(note.clone());
-        }
-    }
     plan.status = if plan.unmapped.is_empty() {
         "complete".into()
     } else {
@@ -470,53 +392,28 @@ fn signals(
     })
 }
 
-pub fn parse(output: &str) -> Plan {
-    let mut plan = Plan::default();
-    for line in output.lines() {
-        let fields: Vec<&str> = line.split('\t').collect();
-        match fields.as_slice() {
-            ["PLAN", rest @ ..] => {
-                for field in rest {
-                    if let Some(value) = field.strip_prefix("status=") {
-                        plan.status = value.to_owned();
-                    } else if let Some(value) = field.strip_prefix("files=") {
-                        plan.files = value.parse().unwrap_or_default();
-                    }
-                }
-            }
-            ["TARGET", entry] => match entry.split_once(':') {
-                Some(("make", name)) if !plan.targets.iter().any(|known| known == name) => {
-                    plan.targets.push(name.to_owned())
-                }
-                Some(("make", _)) => {}
-                _ => plan.notes.push((*entry).to_owned()),
-            },
-            ["MAPPED", path, surfaces] => plan
-                .mapped
-                .push(((*path).to_owned(), (*surfaces).to_owned())),
-            ["UNMAPPED", path] => plan.unmapped.push((*path).to_owned()),
-            _ => {}
-        }
-    }
-    plan
+/// What a plan's conditions are evaluated against.
+struct Facts<'a> {
+    touched: &'a std::collections::BTreeSet<String>,
+    signals: &'a [String],
+    group_paths: &'a BTreeMap<String, usize>,
+    changed: usize,
+    profile: Option<&'a str>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_planner_output() {
-        let plan = parse(
-            "PLAN\tversion=40\tmode=fast\tstatus=complete\tfiles=2\n\
-             MAPPED\tscripts/a.py\tpipeline\nMAPPED\tci/x\ttarget:test-x\nUNMAPPED\tweird\n\
-             TARGET\tmake:test-pipeline-contract\nTARGET\tno-heavy:docs\nTARGET\tmake:test-pipeline-contract\n",
-        );
-        assert_eq!(plan.status, "complete");
-        assert_eq!(plan.files, 2);
-        assert_eq!(plan.targets, vec!["test-pipeline-contract"]);
-        assert_eq!(plan.notes, vec!["no-heavy:docs"]);
-        assert_eq!(plan.mapped.len(), 2);
-        assert_eq!(plan.unmapped, vec!["weird"]);
+impl Facts<'_> {
+    fn holds(&self, when: &crate::lang::compile::Cond, selected: &[String]) -> bool {
+        use crate::lang::compile::Cond;
+        when.eval(&|fact| match fact {
+            Cond::Touched(name) => self.touched.contains(name),
+            Cond::Selected(name) => selected.contains(name),
+            Cond::Signal(name) => self.signals.contains(name),
+            Cond::Profile(name) => self.profile == Some(name.as_str()),
+            Cond::Only(name) => {
+                self.changed > 0 && self.group_paths.get(name).copied() == Some(self.changed)
+            }
+            Cond::Without(name) => !self.group_paths.contains_key(name),
+            _ => false,
+        })
     }
 }

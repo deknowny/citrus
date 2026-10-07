@@ -1,73 +1,141 @@
-# `citrus.ci`
+# Configuration
 
-A project describes itself in `citrus.ci` at the repository root (it may
-`use` other `.ci` files). The language is described in
-[design/language.md](design/language.md); this page lists the blocks Citrus
-reads and their fields. Unknown blocks and fields are errors with a
-suggestion, so typos are caught. `citrus check` validates the file;
+A project describes itself in `citrus.ci` at the repository root, or, when
+it grows, in `.citrus/*.ci`: `.citrus/project.ci` for shared settings and one
+file per product. The language is described in
+[design/language.md](design/language.md); this page lists the declarations
+Citrus reads and their fields. Unknown declarations, fields and names are
+errors with a suggestion. `citrus check` validates the configuration;
 `citrus doctor` checks it against the repository.
 
-Without `citrus.ci` Citrus still works: nothing is declared, and a target
-passed by name runs as `make <target>` and is reused only for an identical
-source snapshot.
+A comment directly above a declaration is its description: `citrus`,
+`citrus targets` and `why` show it.
 
 ```
 citrus 1
 
 project {
-  base = "origin/main"        # "changed" is measured from the fork point with this ref
-  logs = ".citrus/logs"       # run logs; must be ignored by Git
-  toolchain = ["rust-toolchain.toml"]   # files every declared fingerprint depends on
-  receipts = "citrus/receipts"          # PASS receipts, relative to the Git common directory
-  check_env = { "test-api": { SQLX_OFFLINE: "true" } }   # extra environment per check
-  profiles = ["fast", "e2e"]  # check profiles (`--profile`); the first is the default
-  signals = run("scripts/classify")  # prints SIGNAL lines for CITRUS_PATHS (docs/design/planner.md)
-  after_merge = run("scripts/after-merge", before)       # after `citrus integrate` merged
+  main = "origin/main"                 # "changed" is measured from the fork point with this ref
+  runner = builders                    # with several runners: the one checks run on
+  toolchain = ["rust-toolchain.toml"]  # files every check's fingerprint depends on
+  signals = run("scripts/classify")    # prints SIGNAL and CLAIM lines (docs/design/planner.md)
+  after_merge = run("scripts/after-merge", before)   # after `citrus integrate` merged
+  logs = ".validation/logs"            # run logs in the tree (default: .git/citrus/logs)
+  receipts = "citrus/receipts"         # PASS receipts, relative to the Git directory
 }
 
-check "test-api" { … }        # docs/manifest.md
-task "seed-db" { … }          # `citrus do seed-db`
-release "api" { … }           # docs/releases.md
-artifact "api" { … }          # docs/design/declarative.md
-environment "production" { … }
-
-planner {                     # the project's own planner (optional)
-  run = make("ci-plan")       # prints TARGET\tmake:<name> lines (docs/protocol.md)
-  base_var = "BASE_REF"       # passed as BASE_REF=<base> for an explicit --base
-  paths_var = "PATHS_FILE"    # passed as PATHS_FILE=<file of changed paths>
-  profile_var = "MODE"        # passed as MODE=<profile>
+# Fast checks read committed SQLx metadata.
+profile fast {
+  env {
+    SQLX_OFFLINE = "true"
+  }
 }
 
-pool "builders" {             # runs the whole planned set elsewhere (optional)
-  run = make("remote-check")
-  progress = ["LANE"]         # markers besides CITRUS_TARGET (docs/protocol.md)
-  waiting = "QUEUED resource="
-  acquired = ["ACQUIRED resource="]
-  stage = "STAGE "            # human-readable stage shown in status
-  log_after = ["full log: "]  # text before the path of a fuller log the runner keeps
-  status = make("builders-status")   # slow command describing the pool
-  status_prefix = "BUILDER "  # its lines describing one resource each (key=value fields)
-  refresh = 1m                # snapshot age before a background refresh
+profile e2e
+
+# PostgreSQL for the e2e checks.
+service database = compose.up("postgres") {
+  ready = wait.tcp("localhost:5432", timeout: 60s)
 }
 
-group "docs" { owns = ["**/*.md"], note = "no-heavy:docs" }   # path set for `when`, notes
+# Headless browsers; at most two at a time.
+service browser {
+  limit = 2
+}
 
-command "make deploy" { about = "Roll out the verified release", group = "release" }
+# The shared builders.
+runner builders = make("remote-check") {
+  status = make("builders-status")
+}
+
+# The API.
+group api {
+  paths = crate("api") + ["migrations/**"]
+  env {
+    RUST_LOG = "warn"
+  }
+  check unit = cargo.test("api")
+  check database = make("test-api-db") {
+    profile = e2e
+    needs = [database]
+  }
+}
+
+check links = links.check("**/*.md") {
+  paths = ["**/*.md"]
+}
+
+label scope-api {
+  when = only(api)
+}
+
+# Start the database and apply migrations.
+task seed-db = [compose.up("db"), wait.tcp("localhost:5432"), make("migrate")]
+
+commands release {
+  "make deploy" = "Roll out the verified release"
+}
+
+release api { … }                      # docs/releases.md
+artifact api { … }                     # docs/design/declarative.md
+environment production = kubernetes(context: "prod", namespace: "api") { … }
 ```
 
-`before` (and `version`, `next`, `previous`, `release`, `artifact`, `key`,
-`tag`, `short`, `commit` in releases and environments) are values Citrus
-fills in while running; inside strings they are written `{before}`.
+## Declarations
 
-The planner and the pool get `CITRUS_CHECKS`: the path of a JSON file with
-the declared checks (docs/manifest.md), so they never parse `citrus.ci`.
+| Declaration | |
+|---|---|
+| `project { … }` | settings above |
+| `profile name` | a set of checks run together (`--profile`); the first one is the default; `env { }` applies to its checks |
+| `service name [= action] { ready, limit }` | something checks `need`: started by Citrus when it has an action, otherwise a resource the runner provides, `limit` at a time |
+| `runner name = action { status }` | runs the planned checks elsewhere (docs/protocol.md) |
+| `group name { paths, env, check … }` | a set of paths and the checks that protect it |
+| `check name = action { … }` | a check; inside a group it is called `group.name` |
+| `label name { when }` | a named condition reported with the plan |
+| `task name = actions` | `citrus do name` |
+| `commands [heading] { "command" = "what it does" }` | the project's own commands, listed by `citrus` |
+| `release`, `artifact`, `environment` | releases and deployments |
+
+## Checks
+
+| Field | |
+|---|---|
+| `paths` | changed paths that select the check; inside a group they narrow the group's paths |
+| `reads` | more inputs: they invalidate a pass but do not select the check |
+| `profile` | the profile it belongs to (without one: every profile) |
+| `needs = [service, …]` | services it needs |
+| `env { NAME = "value" }` | environment of its steps, after the group's and the profile's |
+| `covers = [check, …]` | it runs them itself: with it in the plan they are dropped |
+| `replaces = [check, …]` | when the change goes beyond one of them, it runs instead of them |
+| `when = condition` | selected only when this holds |
+| `cache = false` | never reuse a pass |
+| `meta = { … }` | data for the project's own tools, passed through `CITRUS_CHECKS` |
+
+The action is one step or a list of steps, or `match changed { … }`: the
+first arm whose condition holds is what the check runs for this plan, `_`
+otherwise.
+
+Conditions: `touched(name)` (a changed path is in that group or check),
+`selected(check)`, `signal("name")`, `profile(name)`, `only(group)` (every
+changed path is in the group), `without(group)` (none is), combined with
+`and`, `or`, `not`.
+
+## Values Citrus fills in
+
+`before` (the commit before a merge), and in releases and environments
+`version`, `previous`, `release`, `artifact`, `key`, `tag`, `short`,
+`commit`: values Citrus knows while running; inside strings they are written
+`{before}`.
+
+The runner gets `CITRUS_CHECKS`, the path of a JSON file with the declared
+checks (docs/manifest.md), so it never parses the configuration.
 
 ## Choosing local or remote
 
-`citrus run` without flags runs locally when it was given target names, when
-no pool is declared, or when every check still needed passed within a minute
+`citrus run` without flags runs locally when it was given check names, when
+there is no runner, or when every check still needed passed within a minute
 in its last five passes here. A check that never passed is assumed heavy and
-goes to the pool. `--local` and `--remote` override this.
+goes to the runner. `--local` and `--remote` override this.
 
 ## Agents
 
@@ -76,10 +144,9 @@ The agent of a run is taken from `CODEX_THREAD_ID`, `CLAUDECODE` or
 
 ## Integration
 
-`citrus integrate` merges `base` (fetching it first when it names a remote
+`citrus integrate` merges `main` (fetching it first when it names a remote
 branch). A check that passed on the sources before the merge stays proven
-when the planner, given exactly the incoming paths, does not select it. With
-the built-in planner that is ownership in `citrus.ci`; an external planner
-needs `paths_var`. When any incoming path is claimed by no check, nothing is
-carried over. `--push` fast-forwards the base after the remaining checks
-pass, and integrates again if the base moved meanwhile.
+when the incoming paths do not select it. When any incoming path is claimed
+by no group or check, nothing is carried over. `--push` fast-forwards the
+base after the remaining checks pass, and integrates again if the base moved
+meanwhile.

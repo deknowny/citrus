@@ -1,6 +1,6 @@
 # The `.ci` language
 
-Status: `citrus 1`, being reshaped to this document (issue #11). It is
+Status: `citrus 1`, implemented as described here (issue #11). It is
 Citrus's only configuration; before 1.0 it changes without compatibility
 shims.
 
@@ -20,13 +20,14 @@ knows the line it came from.
    show it. There is no `about` field and no special doc-comment syntax.
 3. **Symbols carry meaning.** Declared names and references to them are
    bare (`check bot`, `profile = e2e`, `needs = [database]`). Data is quoted:
-   paths, package names, values (`"crates/**"`, `rust("clyer")`). `=` gives a
+   paths, package names, values (`"crates/**"`, `crate("clyer")`). `=` gives a
    field its value, `{ }` is a block, `( )` is a call.
 4. **A bare name always refers to a declaration.** `citrus check` rejects
    an unknown one and suggests the closest.
-5. **Paths are derived, not listed.** `rust("clyer")` is the crate and every
-   workspace crate it depends on; `web("clyer")` is the app and its workspace
-   packages. A change in a shared library reaches every product built from
+5. **Paths are derived, not listed.** `crate("clyer")` is the Rust crate
+   and every workspace crate it depends on; `next("@acme/clyer")` is the
+   Next.js app and the workspace packages it uses. The function says what
+   the thing is. A change in a shared library reaches every product built from
    it without anyone listing it.
 6. **Mechanics stay in Citrus.** A file holds what is particular to the
    project, never how Citrus talks to its tools.
@@ -60,7 +61,7 @@ knows the line it came from.
 true, false, none
 ["a", "b"]                   # list
 { key: "value" }             # map
-rust("clyer") + ["x/**"]     # lists join with +
+crate("clyer") + ["x/**"]    # lists join with +
 ```
 
 Operators: `+ - * / %`, `== != < <= > >=`, `and or not`, `in`, `??`.
@@ -103,10 +104,10 @@ A check without `profile` belongs to every profile.
 ```
 # Clyer bot, its Mini App and TON contracts.
 group clyer {
-  paths = rust("clyer") + web("clyer") + ["migrations/clyer/**"]
+  paths = crate("clyer") + next("@garvis/clyer") + ["migrations/clyer/**"]
 
   check bot = cargo.test("clyer")
-  check web = pnpm.test("clyer")
+  check web = pnpm.test("@garvis/clyer")
 
   # Runs against a real database, so only in the slow profile.
   check database = make("test-clyerbot-db-e2e") {
@@ -178,9 +179,10 @@ service browser {
 }
 ```
 
-With an action, Citrus starts the service before the first check that needs
-it, waits for `ready` and stops it after the run. Without one, it is a
-resource the runner provides, and `limit` caps how many checks hold it.
+With an action, a local run starts the service once, before the first check
+that needs it, and waits for `ready`; the service keeps running after the
+run. Without one, it is a resource the runner provides, and `limit` caps how
+many checks hold it.
 
 ### `runner`
 
@@ -195,18 +197,34 @@ A runner executes the planned checks elsewhere. It is given the checks to
 run (`CITRUS_TARGETS`) and their declarations (`CITRUS_CHECKS`) and reports
 each one in the Citrus protocol (docs/protocol.md).
 
-### `release`
-
-In a group, `release` says how the product reaches an environment:
+### `release`, `artifact`, `environment`
 
 ```
-release = kubernetes("clyer") {
-  migrate = job("deploy/k3s/clyer/migrate.yaml")
-  # One userbot at a time: the old pod holds this lease until it stops.
-  fence userbot = lease("userbot-session")
-  quiesce = [backuper]
+# Clyer bot backend and migrations to k3s.
+release clyer {
+  environment = clyer-production
+  # Reserves and prints RELEASE=<version>.
+  version = make("release-version-reserve", RELEASE: version) {
+    initial = "0.1.0-clyer"
+  }
+  step prepare = make("release-prepare-clyer", RELEASE: version)
+  step deploy = make("clyer-k3s-release-deploy", RELEASE: version) {
+    production = true
+    # An interrupted rollout is reconciled, never blindly repeated.
+    recover = make("clyer-k3s-release-recover", RELEASE: version)
+  }
+  rollback = make("clyer-k3s-release-rollback", RELEASE: previous) {
+    production = true
+  }
+}
+
+# Clyer in the production cluster.
+environment clyer-production = kubernetes(context: "prod", namespace: "clyer") {
+  deploy clyerbot-backend = clyer-backend
 }
 ```
+
+docs/releases.md and docs/design/declarative.md describe them.
 
 ### `task` and `commands`
 
@@ -214,13 +232,13 @@ release = kubernetes("clyer") {
 # Start the database and apply migrations.
 task seed-db = [compose.up("db"), wait.tcp("localhost:5432", timeout: 60s), make("migrate-dev")]
 
-commands {
+commands release {
   "make verify" = "Validate a release candidate"
 }
 ```
 
 `citrus do seed-db` runs a task. `commands` lists the project's own commands
-for people (`citrus` shows them).
+for people (`citrus` shows them), under a heading when it has a name.
 
 ## Actions
 
@@ -242,8 +260,9 @@ Values describing work; Citrus executes them, each with its source line.
 
 | Function | Paths |
 |---|---|
-| `rust("pkg", …)` | the crates and every workspace crate they reach through path dependencies, files they include (`include_str!`, `sqlx::migrate!`), `Cargo.toml`, `Cargo.lock` and workspace settings; `"platform-*"` names several |
-| `web("app", …)` | the app's directory, the workspace packages it depends on, the lockfile and workspace manifests |
+| `crate("pkg", …)` | Rust crates and every workspace crate they reach through path dependencies, files they include (`include_str!`, `sqlx::migrate!`), `Cargo.toml`, `Cargo.lock` and workspace settings; `"platform-*"` names several |
+| `next("@scope/app", …)` | a Next.js app of the pnpm workspace (an error if it does not depend on `next`): its directory, the workspace packages it uses, the lockfile and workspace manifests |
+| `package("@scope/lib", …)` | any pnpm workspace package, the same way |
 | `glob("pattern")` | the matching files, for comprehensions |
 
 ## Evaluation and execution

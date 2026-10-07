@@ -1,59 +1,63 @@
-# Protocols Citrus reads
+# Protocols
 
-Citrus does not replace your tools; it reads what they print.
+Citrus runs your tools and reads what they print, line by line.
 
-## Planner (`plan.command`)
+## Runner
 
-Prints, one per line (tab-separated):
+A `runner` runs the planned checks elsewhere (shared builders, CI). It runs
+with:
 
-```
-PLAN	status=complete	files=12
-MAPPED	src/api/user.rs	backend
-UNMAPPED	tools/new-script.sh
-TARGET	make:test-backend
-TARGET	no-heavy:docs
-```
+- `CITRUS_TARGETS`: a file naming the checks this run needs, one per line;
+- `CITRUS_CHECKS`: their declarations, including what each one runs
+  (docs/manifest.md);
+- `CITRUS_BASE` and `CITRUS_PROFILE`: what the plan was made against.
 
-Only `TARGET	make:<name>` lines select checks; other `TARGET` entries are shown as
-notes. `PLAN`, `MAPPED` and `UNMAPPED` are optional and only improve the
-explanation. A non-zero exit without any `TARGET` line is a planner failure.
-
-## Runner progress (a `pool`, and any local target)
+It reports in these lines:
 
 ```
-CITRUS_TARGET target=<name> status=START
-CITRUS_TARGET target=<name> status=PASS exit=0 seconds=41
-CITRUS_TARGET target=<name> status=FAIL exit=2 seconds=12
+CITRUS_WAIT builder                                    queued for a resource
+CITRUS_RUNNING                                         the resource was granted
+CITRUS_STAGE [2/5] preparing runner                    a stage shown in `status`
+CITRUS_TARGET target=api.unit status=START
+CITRUS_TARGET target=api.unit status=PASS exit=0 seconds=41
+CITRUS_TARGET target=api.unit status=FAIL exit=2 seconds=12
+CITRUS_LOG logs/run-42.log                             a fuller log, read after the run
 ```
 
-Your runner can use its own prefix with the same fields; list it in
-the `progress` markers of the pool. Output between a target's START and its result is
-that target's log; Citrus takes the first error from it. If the runner exits
-non-zero without failing any target, the run shows a `suite` row with the
-first error of the whole output.
+Output between a check's START and its result is that check's log; Citrus
+takes the first error from it. A runner that reports checks one by one must
+report each of them: a check it stays silent about is `not_run` and the run
+fails, even when the runner exits 0. A runner that reports no checks at all
+passes or fails them together with its exit code; if it exits non-zero
+without failing any check, the run shows a `suite` row with the first error
+of the whole output.
 
-Optional markers, all configured by prefix:
+## Runner status
 
-| `pool` field | Meaning | Example line |
-|---|---|---|
-| `waiting` | queued for a resource (first word after the prefix) | `QUEUED resource=builder` |
-| `acquired` | the resource was granted | `ACQUIRED resource=builder` |
-| `stage` | a stage name shown in `status` | `STAGE [2/5] preparing runner` |
-| `log_after` | the path of a fuller log, read after the run | `… full log: logs/run-42.log` |
-
-The pool command runs with `CITRUS_CHECKS` (docs/manifest.md), so it can
-send the declared checks wherever it runs them, and `CITRUS_TARGETS`: a file
-naming the checks this run needs, one per line. A pool that reports checks
-one by one must report each of them: a check it stays silent about is
-`not_run` and the run fails, even when the pool exits 0. A pool that reports
-no checks at all passes or fails them together with its exit code.
-
-## Resources (`status` of a pool)
-
-Lines starting with `status_prefix` describe one resource as `key=value`
-fields. `host`/`name`, `state`, `operation`, `owner` and `elapsed_seconds` are
-shown; anything else is kept in JSON output.
+The runner's `status` command describes its machines, one per line:
 
 ```
-BUILDER host=builder-1 state=busy operation=remote-test owner=agent-b elapsed_seconds=94
+CITRUS_RESOURCE host=builder-1 state=busy operation=remote-test owner=agent-b elapsed_seconds=94
 ```
+
+`host`/`name`, `state`, `operation`, `owner` and `elapsed_seconds` are
+shown; anything else is kept in JSON output. `citrus status` shows the last
+snapshot at once and refreshes it in the background when it is older than a
+minute.
+
+## Signals
+
+The project's `signals` command tells the planner what path globs cannot
+(docs/design/planner.md). It runs with `CITRUS_PATHS` (a file of the changed
+paths), `CITRUS_BASE`, `CITRUS_PATHS_EXPLICIT` (`1` when the paths were
+given rather than diffed) and `CITRUS_PROFILE`, and prints:
+
+```
+SIGNAL product:api            a fact conditions can test: signal("product:api")
+CLAIM scripts/old.sh pipeline a changed path that belongs to group `pipeline`
+```
+
+## Local checks
+
+A check run on this machine prints the same `CITRUS_TARGET` lines into its
+run log.

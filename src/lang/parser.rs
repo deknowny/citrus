@@ -4,8 +4,8 @@ use super::ast::{Body, Expr, Item, StrPart};
 use super::lexer::{Part, Tok, Token, lex};
 use super::{Error, Span};
 
-const KEYWORDS: [&str; 12] = [
-    "let", "fn", "for", "in", "if", "else", "use", "true", "false", "none", "and", "or",
+const KEYWORDS: [&str; 13] = [
+    "let", "fn", "for", "in", "if", "else", "use", "true", "false", "none", "and", "or", "match",
 ];
 
 #[derive(Debug)]
@@ -18,6 +18,7 @@ pub fn parse_file(file: usize, source: &str) -> Result<File, Error> {
         tokens: lex(file, source, 0)?,
         index: 0,
         file,
+        source: source.to_owned(),
     };
     parser.header()?;
     let items = parser.items(true)?;
@@ -29,6 +30,8 @@ struct Parser {
     tokens: Vec<Token>,
     index: usize,
     file: usize,
+    /// The file's text, for comments right above declarations.
+    source: String,
 }
 
 impl Parser {
@@ -239,40 +242,113 @@ impl Parser {
                 span: join(start, end),
             });
         }
+        // `"make verify" = "…"`: a field whose name is data (commands).
+        if let Tok::Str(parts) = self.peek().clone()
+            && matches!(self.peek_at(1), Tok::Sym("="))
+        {
+            let span = self.bump().span;
+            let name = literal(&parts)
+                .ok_or_else(|| Error::at(span, "a field name cannot contain `{…}`"))?;
+            self.bump();
+            let value = self.expr()?;
+            return Ok(Item::Field {
+                span: join(span, value.span()),
+                name,
+                value,
+            });
+        }
+        let doc = self.doc_above(start.start);
         let (name, name_span) = self.name()?;
         if self.eat_sym("=") {
             let value = self.expr()?;
+            // `release = kubernetes("x") { … }`: a value with settings.
+            if self.is_sym("{") {
+                self.bump();
+                let items = self.items(false)?;
+                let end = self.expect_sym("}")?;
+                return Ok(Item::Block {
+                    kind: name,
+                    label: None,
+                    value: Some(value),
+                    items,
+                    doc,
+                    span: join(name_span, end),
+                });
+            }
             return Ok(Item::Field {
                 span: join(name_span, value.span()),
                 name,
                 value,
             });
         }
-        let label = match self.peek() {
+        // `kind [label] [= value] [{ items }]`
+        let label = match self.peek().clone() {
             Tok::Str(_) => Some(self.primary()?),
-            Tok::Sym("{") => None,
-            other => {
-                return Err(Error::at(
-                    self.span(),
-                    format!(
-                        "expected `=` or a block after `{name}`, found {}",
-                        describe(other)
-                    ),
-                )
-                .help(format!(
-                    "a field is `{name} = value`; a block is `{name} \"label\" {{ … }}`"
-                )));
+            Tok::Ident(word) if !KEYWORDS.contains(&word.as_str()) => {
+                let span = self.bump().span;
+                Some(Expr::Str(vec![StrPart::Lit(word)], span))
             }
+            _ => None,
         };
-        self.expect_sym("{")?;
-        let items = self.items(false)?;
-        let end = self.expect_sym("}")?;
+        let value = if self.eat_sym("=") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        let mut end = value
+            .as_ref()
+            .map(Expr::span)
+            .or(label.as_ref().map(Expr::span))
+            .unwrap_or(name_span);
+        let mut items = Vec::new();
+        if self.eat_sym("{") {
+            items = self.items(false)?;
+            end = self.expect_sym("}")?;
+        } else if label.is_none() && value.is_none() {
+            return Err(Error::at(
+                self.span(),
+                format!(
+                    "expected `=`, a name or a block after `{name}`, found {}",
+                    describe(self.peek())
+                ),
+            )
+            .help(format!(
+                "a field is `{name} = value`; a declaration is `{name} label {{ … }}` or `{name} label = value`"
+            )));
+        }
         Ok(Item::Block {
             kind: name,
             label,
+            value,
             items,
+            doc,
             span: join(name_span, end),
         })
+    }
+
+    /// The `#` comment lines directly above `offset` (no blank line between).
+    fn doc_above(&self, offset: usize) -> Option<String> {
+        if self.source.is_empty() {
+            return None;
+        }
+        let before = &self.source[..offset.min(self.source.len())];
+        let mut lines: Vec<&str> = before.split('\n').collect();
+        // The declaration's own line up to the declaration: only indentation.
+        if !lines.pop().unwrap_or_default().trim().is_empty() {
+            return None;
+        }
+        let mut doc: Vec<&str> = Vec::new();
+        while let Some(line) = lines.pop() {
+            match line.trim().strip_prefix('#') {
+                Some(text) => doc.push(text.strip_prefix(' ').unwrap_or(text)),
+                None => break,
+            }
+        }
+        if doc.is_empty() {
+            return None;
+        }
+        doc.reverse();
+        Some(doc.join("\n"))
     }
 
     fn body(&mut self) -> Result<Body, Error> {
@@ -417,6 +493,7 @@ impl Parser {
                                 tokens: lex(self.file, &source, offset).map_err(hint)?,
                                 index: 0,
                                 file: self.file,
+                                source: String::new(),
                             };
                             let expr = inner.expr().map_err(hint)?;
                             inner.expect_eof().map_err(hint)?;
@@ -450,6 +527,32 @@ impl Parser {
                         cond: Box::new(cond),
                         then,
                         otherwise,
+                        span: join(span, end),
+                    }
+                }
+                "match" => {
+                    let (subject, subject_span) = self.name()?;
+                    if subject != "changed" {
+                        return Err(Error::at(subject_span, "`match` takes `changed`")
+                            .help("match changed { only(group) => …, _ => … }"));
+                    }
+                    self.expect_sym("{")?;
+                    let mut arms = Vec::new();
+                    while !self.is_sym("}") {
+                        let pattern = if self.is_word("_") {
+                            self.bump();
+                            None
+                        } else {
+                            Some(self.expr()?)
+                        };
+                        self.expect_sym("=>")?;
+                        let value = self.expr()?;
+                        arms.push((pattern, value));
+                        while self.eat_sym(",") {}
+                    }
+                    let end = self.expect_sym("}")?;
+                    Expr::Match {
+                        arms,
                         span: join(span, end),
                     }
                 }
@@ -604,12 +707,8 @@ mod tests {
 
     #[test]
     fn errors_name_what_was_expected() {
-        let error = parse_file(0, "citrus 1\ncheck \"a\" { owns [\"x\"] }").unwrap_err();
-        assert!(
-            error.message.contains("expected `=` or a block"),
-            "{}",
-            error.message
-        );
+        let error = parse_file(0, "citrus 1\ncheck a { paths [\"x\"] }").unwrap_err();
+        assert!(error.message.contains("expected `=`"), "{}", error.message);
         let error = parse_file(0, "citrus 1\nlet x = if true { 1 }").unwrap_err();
         assert!(error.help.unwrap().contains("else"));
     }

@@ -29,12 +29,12 @@ Those invariants turn out to be generic options with parameters (below).
 
 ## Model
 
-Artifacts and environments, next to the checks in `citrus.ci`
+Artifacts and environments, next to the checks in the configuration
 (fields as implemented; `strategy` and verify-by-check are still planned):
 
 ```
 # What is built, from what. Key = hash of the inputs + this declaration.
-artifact "api" {
+artifact api {
   inputs = ["crates/api/**", "Cargo.lock", "Dockerfile"]
   # A shared Dockerfile counts only with the stages `runtime` is built from.
   dockerfile = { file: "Dockerfile", target: "runtime" }
@@ -42,26 +42,30 @@ artifact "api" {
   publish = { registry: "registry.example.com/shop/api" }    # identity = pushed digest
 }
 
-artifact "api-migrations" {
+artifact api-migrations {
   inputs = ["migrations/api/**", "Dockerfile.migrations"]
   build = { provider: "docker", dockerfile: "Dockerfile.migrations" }
   publish = { registry: "registry.example.com/shop/api-migrations" }
 }
 
 # What runs where. Credentials are referenced, never stored.
-environment "shop-production" {
-  on = kubernetes(context: "prod", namespace: "shop")
+environment shop-production = kubernetes(context: "prod", namespace: "shop") {
   approval = required             # apply needs --approve
   checks = proven                 # planned checks must be proven for the commit
   # Runs to completion before workloads change.
   migrations = { artifact: "api-migrations", job: "deploy/migrate.yaml", timeout: 5m }
   record = { annotation: "example.com/release" }
 
-  deploy "api" { artifact = "api" }
+  deploy api = api
   # Never two at once: wait until the old one released its lease.
-  deploy "bot" { artifact = "bot", fence = "bot-session" }
+  deploy bot = bot {
+    fence = "bot-session"
+  }
   # Suspended while the environment changes, restored after.
-  deploy "backup" { artifact = "backup", kind = cronjob, quiesce = true }
+  deploy backup = backup {
+    kind = cronjob
+    quiesce = true
+  }
 
   verify = { http: ["https://shop.example.com/health"] }
 }

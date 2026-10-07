@@ -23,6 +23,10 @@ pub enum Value {
     Func(Rc<Closure>),
     Builtin(&'static str),
     Action(Rc<Action>),
+    /// A bare name that is not a value in scope: a reference to a
+    /// declaration (`profile = e2e`, `covers = [garvis.backend]`), checked
+    /// against the declarations when the project is compiled.
+    Ref(String),
 }
 
 /// Work for Citrus to do: a builtin name, its arguments and where it was written.
@@ -56,6 +60,7 @@ impl fmt::Debug for Value {
             Value::Func(_) => write!(f, "<function>"),
             Value::Builtin(name) => write!(f, "<builtin {name}>"),
             Value::Action(action) => write!(f, "{}({:?})", action.kind, action.args),
+            Value::Ref(name) => write!(f, "{name}"),
         }
     }
 }
@@ -92,6 +97,7 @@ impl Value {
             Value::Map(_) => "map",
             Value::Func(_) | Value::Builtin(_) => "function",
             Value::Action(_) => "action",
+            Value::Ref(_) => "name",
         }
     }
 
@@ -109,7 +115,7 @@ impl Value {
 
     fn display(&self) -> String {
         match self {
-            Value::Str(value) => value.clone(),
+            Value::Str(value) | Value::Ref(value) => value.clone(),
             Value::Int(value) => value.to_string(),
             Value::Bool(value) => value.to_string(),
             Value::Duration(value) => format!("{value}s"),
@@ -135,6 +141,7 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Duration(a), Value::Duration(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Ref(a), Value::Ref(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => {
                 a.len() == b.len()
@@ -152,6 +159,10 @@ impl PartialEq for Value {
 pub struct Decl {
     pub kind: String,
     pub name: Option<String>,
+    /// `kind name = value`
+    pub value: Option<Value>,
+    /// The comment right above the declaration.
+    pub doc: Option<String>,
     pub fields: Vec<(String, Value, Span)>,
     pub children: Vec<Decl>,
     pub span: Span,
@@ -236,6 +247,8 @@ pub const ACTIONS: &[&str] = &[
     "cargo.fmt",
     "cargo.clippy",
     "cargo.run",
+    "pnpm.test",
+    "pnpm.build",
     "compose.up",
     "compose.down",
     "wait.tcp",
@@ -255,12 +268,14 @@ pub const ACTIONS: &[&str] = &[
     "selected",
     "signal",
     "profile",
+    "only",
+    "without",
 ];
 
 /// Plan-time conditions (`when = touched("x") and not selected("y")`):
 /// evaluated when the changed paths are known, not when the file is read.
 const CONDITIONS: &[&str] = &[
-    "touched", "selected", "signal", "profile", "and", "or", "not",
+    "touched", "selected", "signal", "profile", "only", "without", "and", "or", "not",
 ];
 
 fn condition(value: &Value) -> bool {
@@ -277,20 +292,12 @@ fn combine(kind: &str, args: Vec<Value>, span: Span) -> Value {
 }
 /// Pure helpers evaluated immediately.
 const FUNCTIONS: &[&str] = &[
-    "len",
-    "str",
-    "keys",
-    "values",
-    "range",
-    "glob",
-    "flatten",
-    "cargo.closure",
+    "len", "str", "keys", "values", "range", "glob", "flatten", "crate", "next", "package",
 ];
 /// Values Citrus fills in while running: `before` (the commit before a merge),
 /// `version`, `next`, `previous` (releases), `release`, `short`, `commit`.
 pub const PLACEHOLDERS: &[&str] = &[
-    "before", "version", "next", "previous", "unit", "release", "short", "commit", "artifact",
-    "key", "tag",
+    "before", "version", "previous", "unit", "release", "short", "commit", "artifact", "key", "tag",
 ];
 /// Named constants.
 const CONSTANTS: &[&str] = &[
@@ -367,8 +374,12 @@ pub struct Evaluator<'a> {
     files: Option<Vec<String>>,
     /// Read files as committed at this revision instead of the working tree.
     revision: Option<&'a str>,
+    /// Evaluating what is called: a built-in's name means the built-in.
+    callee: bool,
 }
 
+/// `citrus.ci`, or every `.citrus/*.ci` with `.citrus/project.ci` first:
+/// its `let` and `fn` are seen by every file, other files' only by their own.
 pub fn evaluate_project(
     root: &Path,
     entry: &str,
@@ -381,10 +392,32 @@ pub fn evaluate_project(
         loaded: Vec::new(),
         files: None,
         revision,
+        callee: false,
     };
     let mut graph = Graph::default();
-    let scope = globals();
-    evaluator.file(entry, &scope, &mut graph.decls, Span::default())?;
+    let prelude = globals();
+    if entry != ".citrus" {
+        evaluator.file(entry, &prelude, &mut graph.decls, Span::default())?;
+        return Ok(graph);
+    }
+    let mut entries: Vec<String> = evaluator
+        .repository_files()
+        .iter()
+        .filter(|path| {
+            path.strip_prefix(".citrus/")
+                .is_some_and(|name| name.ends_with(".ci") && !name.contains('/'))
+        })
+        .cloned()
+        .collect();
+    entries.sort_by_key(|path| (path != ".citrus/project.ci", path.clone()));
+    for path in entries {
+        let scope = if path == ".citrus/project.ci" {
+            prelude.clone()
+        } else {
+            prelude.child()
+        };
+        evaluator.file(&path, &scope, &mut graph.decls, Span::default())?;
+    }
     Ok(graph)
 }
 
@@ -461,10 +494,18 @@ impl Evaluator<'_> {
                 Item::Block {
                     kind,
                     label,
+                    value,
                     items: body,
+                    doc,
                     span,
                 } => {
-                    let decl = self.block(kind, label.as_ref(), body, scope, instance, *span)?;
+                    let mut decl =
+                        self.block(kind, label.as_ref(), body, scope, instance, *span)?;
+                    decl.value = match value {
+                        Some(value) => Some(self.expr(value, scope)?),
+                        None => None,
+                    };
+                    decl.doc = doc.clone();
                     out.push(decl);
                 }
                 Item::For {
@@ -515,11 +556,11 @@ impl Evaluator<'_> {
     ) -> Result<Decl, Error> {
         let name = match label {
             Some(expr) => match self.expr(expr, scope)? {
-                Value::Str(name) => Some(name),
+                Value::Str(name) | Value::Ref(name) => Some(name),
                 other => {
                     return Err(Error::at(
                         expr.span(),
-                        format!("a block label must be a string, not {}", other.type_name()),
+                        format!("a block label must be a name, not {}", other.type_name()),
                     ));
                 }
             },
@@ -529,6 +570,8 @@ impl Evaluator<'_> {
         let mut decl = Decl {
             kind: kind.to_owned(),
             name,
+            value: None,
+            doc: None,
             fields: Vec::new(),
             children: Vec::new(),
             span,
@@ -644,14 +687,22 @@ impl Evaluator<'_> {
                 }
                 Value::Str(text)
             }
-            Expr::Name(name, span) => scope.get(name).ok_or_else(|| {
-                let names = scope.names();
-                let error = Error::at(*span, format!("unknown name `{name}`"));
-                match suggest(name, names.iter().map(String::as_str)) {
-                    Some(close) => error.help(format!("did you mean `{close}`?")),
-                    None => error,
+            Expr::Name(name, _) => match scope.get(name) {
+                // Outside a call, a built-in's name is a declaration's
+                // (`environment = github`), not the built-in itself.
+                Some(Value::Builtin(_)) if !self.callee => Value::Ref(name.clone()),
+                Some(Value::Map(entries))
+                    if !self.callee
+                        && !entries.is_empty()
+                        && entries
+                            .iter()
+                            .all(|(_, value)| matches!(value, Value::Builtin(_))) =>
+                {
+                    Value::Ref(name.clone())
                 }
-            })?,
+                Some(value) => value,
+                None => Value::Ref(name.clone()),
+            },
             Expr::List(items, _) => Value::List(
                 items
                     .iter()
@@ -690,6 +741,8 @@ impl Evaluator<'_> {
             Expr::Field(base, field, span) => {
                 let base_value = self.expr(base, scope)?;
                 match &base_value {
+                    // `garvis.backend`: the check `backend` of group `garvis`.
+                    Value::Ref(base) => Value::Ref(format!("{base}.{field}")),
                     Value::Map(entries) => match entries.iter().find(|(key, _)| key == field) {
                         Some((_, value)) => value.clone(),
                         None => {
@@ -743,7 +796,18 @@ impl Evaluator<'_> {
                 }
             }
             Expr::Call { callee, args, span } => {
-                let function = self.expr(callee, scope)?;
+                let outer = std::mem::replace(&mut self.callee, true);
+                let function = self.expr(callee, scope);
+                self.callee = outer;
+                let function = function?;
+                if let Value::Ref(name) = &function {
+                    let names = scope.names();
+                    let error = Error::at(callee.span(), format!("unknown name `{name}`"));
+                    return Err(match suggest(name, names.iter().map(String::as_str)) {
+                        Some(close) => error.help(format!("did you mean `{close}`?")),
+                        None => error,
+                    });
+                }
                 let mut positional = Vec::new();
                 let mut named = Vec::new();
                 for (name, value) in args {
@@ -800,6 +864,18 @@ impl Evaluator<'_> {
                     return Ok(right_value);
                 }
                 binary(op, left_value, right_value, *span)?
+            }
+            Expr::Match { arms, span } => {
+                // Arms become [condition, value, …]; `_` is the condition `true`.
+                let mut args = Vec::new();
+                for (pattern, value) in arms {
+                    args.push(match pattern {
+                        Some(pattern) => self.expr(pattern, scope)?,
+                        None => Value::Bool(true),
+                    });
+                    args.push(self.expr(value, scope)?);
+                }
+                combine("match", args, *span)
             }
             Expr::If {
                 cond,
@@ -858,12 +934,28 @@ impl Evaluator<'_> {
                 self.body(&closure.body, &inner)
             }
             Value::Builtin(name) if FUNCTIONS.contains(&name) => self.function(name, args, span),
-            Value::Builtin(name) => Ok(Value::Action(Rc::new(Action {
-                kind: name.to_owned(),
-                args,
-                named,
-                span,
-            }))),
+            Value::Builtin(name) => {
+                let mut named = named;
+                // pnpm runs from the workspace directory, found once here.
+                if name.starts_with("pnpm.") && !named.iter().any(|(key, _)| key == "dir") {
+                    let files = RepositoryFiles {
+                        root: self.root,
+                        revision: self.revision,
+                        list: self.repository_files().clone(),
+                    };
+                    let dir = super::web::root(&files).map_err(|error| Error::at(span, error))?;
+                    named.push((
+                        "dir".into(),
+                        Value::Str(if dir.is_empty() { ".".into() } else { dir }),
+                    ));
+                }
+                Ok(Value::Action(Rc::new(Action {
+                    kind: name.to_owned(),
+                    args,
+                    named,
+                    span,
+                })))
+            }
             Value::Map(entries) if entries.iter().any(|(key, _)| key == "__method") => {
                 let method = entries
                     .iter()
@@ -966,17 +1058,37 @@ impl Evaluator<'_> {
                 matched.sort_by_key(|value| value.display());
                 Value::List(matched)
             }
-            "cargo.closure" => {
-                let Value::Str(package) = one()? else {
-                    return Err(Error::at(span, "`cargo.closure` needs a package name"));
-                };
+            "crate" | "next" | "package" => {
+                let names = args
+                    .iter()
+                    .map(|arg| match arg {
+                        Value::Str(name) => Ok(name.clone()),
+                        other => Err(Error::at(
+                            span,
+                            format!(
+                                "`{name}` takes package names in quotes, not a {}",
+                                other.type_name()
+                            ),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if names.is_empty() {
+                    return Err(Error::at(
+                        span,
+                        format!("`{name}` needs at least one package"),
+                    ));
+                }
                 let files = RepositoryFiles {
                     root: self.root,
                     revision: self.revision,
                     list: self.repository_files().clone(),
                 };
-                let globs = super::cargo::closure(&files, &package)
-                    .map_err(|error| Error::at(span, error))?;
+                let globs = match name {
+                    "crate" => super::cargo::crates(&files, &names),
+                    "next" => super::web::closure(&files, &names, super::web::Kind::Next),
+                    _ => super::web::closure(&files, &names, super::web::Kind::Package),
+                }
+                .map_err(|error| Error::at(span, error))?;
                 Value::List(globs.into_iter().map(Value::Str).collect())
             }
             _ => return Err(Error::at(span, format!("unknown function `{name}`"))),

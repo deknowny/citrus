@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+Breaking: the configuration language is reshaped (docs/design/language.md).
+Every element does something, names are bare, data is quoted:
+
+- Declarations are `kind name [= value] [{ fields }]`: `check unit =
+  cargo.test("api") { paths = [...] }`, `task seed = [...]`,
+  `runner builders = make("remote-check")`, `service database =
+  compose.up("db") { ready = ... }`, `profile e2e`, `release api { step
+  build = ... }`, `environment prod = kubernetes(...) { deploy api = api }`,
+  `commands release { "make verify" = "..." }`.
+- A comment directly above a declaration is its description; `about`,
+  `command` and `pool` are gone.
+- Bare names refer to declarations (`profile = e2e`, `needs = [database]`,
+  `covers = [bot]`); an unknown one is an error with the closest name.
+- `group name { paths, env { }, check … }`: checks inside are `group.name`
+  and protect the group's paths unless they narrow them. Groups are declared
+  once; `note`, `claims` and `exclusive` are gone (write `!glob`).
+- `match changed { only(g) => …, without(g) => …, _ => … }`: the plan picks
+  the arm the check runs, and its fingerprint follows it.
+- `replaces = [parts]`: one check instead of several parts when the change
+  goes beyond one of them.
+- Profiles are declarations with their own `env { }`; `profiles` and
+  `check_env` are gone.
+- Services: started once before the first local check that needs them, or
+  a resource the runner provides with a `limit`.
+- Paths say what they are: `crate("pkg")` (was `rust`/`cargo.closure`),
+  `next("@scope/app")` for a Next.js app and `package("@scope/lib")` for any
+  pnpm workspace package.
+- `.citrus/*.ci`: one file per product, `.citrus/project.ci` shared.
+- A check is always called by its name in the configuration, also when it
+  runs a Make target.
+- Citrus is the only planner: `planner`, `CITRUS_PLANNER` and the `TARGET`
+  protocol are gone, and so are undeclared checks run as `make <name>` and
+  `citrus add`.
+- Runners speak a fixed protocol (`CITRUS_TARGET`, `CITRUS_WAIT`,
+  `CITRUS_RUNNING`, `CITRUS_STAGE`, `CITRUS_LOG`, `CITRUS_RESOURCE`) and get
+  `CITRUS_BASE`; their prefix settings are gone (docs/protocol.md).
+- Run logs live in `.git/citrus/logs`, not the work tree.
+- The release placeholder `next` is `version` in the version command.
+
 Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
 `citrus.toml`, `ci/targets.toml`, `ci/releases.toml`, `ci/artifacts.toml` or
 `ci/environments.toml`; `doctor` warns when a `citrus.toml` is left over.

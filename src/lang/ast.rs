@@ -26,10 +26,13 @@ pub enum Item {
         value: Expr,
         span: Span,
     },
+    /// `kind [label] [= value] [{ items }]`, with the comment right above it.
     Block {
         kind: String,
         label: Option<Expr>,
+        value: Option<Expr>,
         items: Vec<Item>,
+        doc: Option<String>,
         span: Span,
     },
     For {
@@ -91,6 +94,11 @@ pub enum Expr {
         otherwise: Body,
         span: Span,
     },
+    /// `match changed { condition => value, …, _ => value }`
+    Match {
+        arms: Vec<(Option<Expr>, Expr)>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -110,7 +118,8 @@ impl Expr {
             | Expr::Call { span, .. }
             | Expr::Unary(_, _, span)
             | Expr::Binary(_, _, _, span)
-            | Expr::If { span, .. } => *span,
+            | Expr::If { span, .. }
+            | Expr::Match { span, .. } => *span,
         }
     }
 }

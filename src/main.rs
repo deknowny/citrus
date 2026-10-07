@@ -6,7 +6,6 @@
 //! so closing the terminal does not lose them.
 #![allow(clippy::print_stdout, clippy::print_stderr)] // A CLI: stdout is the interface.
 
-mod add;
 mod apply;
 mod config;
 mod deploy;
@@ -116,25 +115,6 @@ enum Command {
     },
     /// Stop a run and everything it started.
     Cancel { run: String },
-    /// Declare a check in the manifest instead of writing a wrapper script.
-    Add {
-        /// The command that runs the check (a Make target by default).
-        target: String,
-        /// Files the check owns: changing them selects it (globs, repeatable).
-        #[arg(long = "inputs", num_args = 1.., required = true)]
-        inputs: Vec<String>,
-        /// Files it only reads; they invalidate reuse but do not select it.
-        #[arg(long = "extra", num_args = 1..)]
-        extra: Vec<String>,
-        /// Reuse a PASS while these inputs are unchanged (list everything it reads).
-        #[arg(long)]
-        cache: bool,
-        /// Resource classes for the project's scheduler.
-        #[arg(long, num_args = 1..)]
-        resources: Vec<String>,
-        #[arg(long)]
-        description: Option<String>,
-    },
     /// Merge the base branch, keep checks the incoming changes do not touch,
     /// run what is needed again, and optionally push.
     Integrate {
@@ -303,14 +283,14 @@ fn main() {
 }
 
 fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Result<i32> {
-    let context = Context::open(profile)?;
+    let mut context = Context::open(profile)?;
     let Some(command) = command else {
-        return overview(&context, json);
+        return overview(&mut context, json);
     };
     match command {
-        Command::Status { base } => status(&context, base.as_deref(), json),
+        Command::Status { base } => status(&mut context, base.as_deref(), json),
         Command::Plan { base, paths_file } => {
-            plan_command(&context, base.as_deref(), paths_file.as_deref(), json)
+            plan_command(&mut context, base.as_deref(), paths_file.as_deref(), json)
         }
         Command::Run {
             targets,
@@ -353,7 +333,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             emit_run(&context, &run, json)
         }
         Command::Log { run, target, full } => log(&context, &run, target.as_deref(), full),
-        Command::Why { target, base } => why(&context, &target, base.as_deref(), json),
+        Command::Why { target, base } => why(&mut context, &target, base.as_deref(), json),
         Command::Cancel { run } => {
             let run = context.reconcile(context.store.resolve(&run, &context.worktree())?)?;
             if !run.finished() {
@@ -362,46 +342,12 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             let run = context.store.run(&run.id)?.context("run disappeared")?;
             emit_run(&context, &run, json)
         }
-        Command::Add {
-            target,
-            inputs,
-            extra,
-            cache,
-            resources,
-            description,
-        } => {
-            let declaration = add::Declaration {
-                target,
-                description,
-                inputs,
-                extra_inputs: extra,
-                cache,
-                resources,
-            };
-            let block = add::add(&context, &declaration)?;
-            let next = vec![
-                format!("citrus run {}", declaration.target),
-                "citrus plan".to_owned(),
-            ];
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &json!({"schema": SCHEMA, "file": "citrus.ci", "added": block, "next": next})
-                    )?
-                );
-            } else {
-                println!("added to citrus.ci:\n\n{block}");
-                print_next(&next);
-            }
-            Ok(0)
-        }
         Command::Stats { days } => stats(&context, days, json),
         Command::Check => check_command(&context, json),
         Command::Fmt { check } => fmt_command(&context, check, json),
         Command::Do { task } => do_command(&context, task, json),
         Command::Integrate { base, push, no_run } => {
-            integrate_command(&context, base, push, !no_run, json)
+            integrate_command(&mut context, base, push, !no_run, json)
         }
         Command::Tasks { all, base } => tasks_command(&context, all, base, json),
         Command::Note { message, clear } => {
@@ -516,7 +462,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             Ok(0)
         }
         Command::Release { action } => {
-            release_command(&context, action.unwrap_or(ReleaseAction::List), json)
+            release_command(&mut context, action.unwrap_or(ReleaseAction::List), json)
         }
         Command::Apply {
             environment,
@@ -526,7 +472,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             detach,
         } => {
             let started = apply::start(
-                &context,
+                &mut context,
                 &apply::Request {
                     environment: environment.clone(),
                     approve,
@@ -566,7 +512,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             Ok(0)
         }
         Command::Doctor => {
-            let findings = doctor::diagnose(&context);
+            let findings = doctor::diagnose(&mut context);
             let failed = findings.iter().any(|finding| finding.status == "fail");
             if json {
                 println!(
@@ -715,8 +661,8 @@ fn emit_run(context: &Context, run: &Run, json: bool) -> Result<i32> {
     Ok(exit_code(run))
 }
 
-fn status(context: &Context, base: Option<&str>, json: bool) -> Result<i32> {
-    let plan = plan::compute(&context.repo, &context.manifest, base)?;
+fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> {
+    let plan = plan::compute(&context.repo, &mut context.manifest, base)?;
     let files = context.repo.files()?;
     let snapshot = context.repo.snapshot()?;
     let decisions = plan
@@ -935,13 +881,13 @@ fn stats(context: &Context, days: u64, json: bool) -> Result<i32> {
 }
 
 fn plan_command(
-    context: &Context,
+    context: &mut Context,
     base: Option<&str>,
     paths_file: Option<&str>,
     json: bool,
 ) -> Result<i32> {
     let plan = match paths_file {
-        None => plan::compute(&context.repo, &context.manifest, base)?,
+        None => plan::compute(&context.repo, &mut context.manifest, base)?,
         Some(file) => {
             let text = if file == "-" {
                 std::io::read_to_string(std::io::stdin())?
@@ -961,7 +907,7 @@ fn plan_command(
                 .repo
                 .git(&["merge-base", &base, "HEAD"])
                 .unwrap_or_default();
-            plan::for_paths(&context.repo, &context.manifest, &paths, &before)?
+            plan::for_paths(&context.repo, &mut context.manifest, &paths, &before)?
         }
     };
     let files = context.repo.files()?;
@@ -1060,8 +1006,8 @@ fn log(context: &Context, reference: &str, target: Option<&str>, full: bool) -> 
     Ok(exit_code(&run))
 }
 
-fn why(context: &Context, target: &str, base: Option<&str>, json: bool) -> Result<i32> {
-    let plan = plan::compute(&context.repo, &context.manifest, base)?;
+fn why(context: &mut Context, target: &str, base: Option<&str>, json: bool) -> Result<i32> {
+    let plan = plan::compute(&context.repo, &mut context.manifest, base)?;
     let files = context.repo.files()?;
     let snapshot = context.repo.snapshot()?;
     let decision = context.decide(&files, &snapshot, target, false)?;
@@ -1229,8 +1175,8 @@ fn print_next(next: &[String]) {
 }
 
 /// `citrus` alone: where things stand and what can be done here.
-fn overview(context: &Context, json: bool) -> Result<i32> {
-    let plan = plan::compute(&context.repo, &context.manifest, None).ok();
+fn overview(context: &mut Context, json: bool) -> Result<i32> {
+    let plan = plan::compute(&context.repo, &mut context.manifest, None).ok();
     let (mut needed, mut proven) = (0, 0);
     if let Some(plan) = &plan {
         let files = context.repo.files()?;
@@ -1396,7 +1342,7 @@ fn push_with_retries(
 }
 
 fn integrate_command(
-    context: &Context,
+    context: &mut Context,
     base: Option<String>,
     push: bool,
     run_checks: bool,
@@ -1634,7 +1580,7 @@ fn targets_command(context: &Context, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-fn release_command(context: &Context, action: ReleaseAction, json: bool) -> Result<i32> {
+fn release_command(context: &mut Context, action: ReleaseAction, json: bool) -> Result<i32> {
     let here = context.worktree();
     match action {
         ReleaseAction::List => {
@@ -1708,7 +1654,7 @@ fn release_command(context: &Context, action: ReleaseAction, json: bool) -> Resu
             version,
         } => {
             if dry_run {
-                let plan = release::dry_run(context, &unit, version.as_deref())?;
+                let plan = release::dry_run(&mut *context, &unit, version.as_deref())?;
                 if json {
                     println!(
                         "{}",

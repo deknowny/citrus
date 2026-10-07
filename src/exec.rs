@@ -8,7 +8,6 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::config::substitute;
 use crate::manifest::{Manifest, fingerprint, now};
 use crate::plan;
 use crate::repo::Repo;
@@ -57,7 +56,7 @@ impl Context {
                     repo.config.plan.base = base.clone();
                 }
                 if let Some(logs) = &project.logs {
-                    repo.config.log_dir = logs.clone();
+                    repo.config.log_dir = Some(logs.clone());
                 }
                 if !project.toolchain.is_empty() {
                     repo.config.toolchain_files = project.toolchain.clone();
@@ -65,35 +64,6 @@ impl Context {
                 let config = &mut repo.config;
                 if let Some(receipts) = &project.receipts {
                     config.receipts.dir = receipts.clone();
-                }
-                for (name, vars) in &project.check_env {
-                    config
-                        .run
-                        .env
-                        .insert(name.clone(), vars.iter().cloned().collect());
-                }
-                if let Some(planner) = &project.planner {
-                    config.plan.command = planner.argv.clone();
-                    config.plan.base_arg = planner
-                        .base_var
-                        .as_ref()
-                        .map(|var| format!("{var}={{base}}"))
-                        .unwrap_or_default();
-                    config.plan.paths_arg = planner
-                        .paths_var
-                        .as_ref()
-                        .map(|var| format!("{var}={{file}}"))
-                        .unwrap_or_default();
-                    config.plan.profile_arg = planner
-                        .profile_var
-                        .as_ref()
-                        .map(|var| format!("{var}={{profile}}"))
-                        .unwrap_or_default();
-                }
-                // CITRUS_PLANNER=builtin plans from citrus.ci alone, for comparing
-                // a project's planner with the declared checks before switching.
-                if std::env::var("CITRUS_PLANNER").as_deref() == Ok("builtin") {
-                    config.plan.command.clear();
                 }
                 let requested = profile.or_else(|| {
                     std::env::var("CITRUS_PROFILE")
@@ -114,14 +84,9 @@ impl Context {
                 };
                 if let Some(pool) = &project.pool {
                     config.run.remote = pool.argv.clone();
-                    config.run.progress_prefixes = pool.progress.clone();
-                    config.run.waiting_prefix = pool.waiting.clone().unwrap_or_default();
-                    config.run.acquired_prefixes = pool.acquired.clone();
-                    config.run.stage_prefix = pool.stage.clone().unwrap_or_default();
-                    config.run.linked_log_markers = pool.log_after.clone();
                     config.status.resources_command = pool.status.clone();
-                    config.status.resource_prefix = pool.status_prefix.clone().unwrap_or_default();
-                    config.status.refresh_seconds = pool.refresh;
+                    config.status.resource_prefix = "CITRUS_RESOURCE ".into();
+                    config.status.refresh_seconds = 60;
                 }
                 if !project.after_merge.is_empty() {
                     config.integrate.after_merge = project.after_merge.clone();
@@ -133,7 +98,43 @@ impl Context {
                         group: group.clone(),
                     });
                 }
-                (Manifest::from_project(&project, &sources)?, Some(project))
+                let mut manifest = Manifest::from_project(&project, &sources)?;
+                // The active profile's environment reaches its checks' steps.
+                let profile_env: Vec<(String, String)> = repo
+                    .config
+                    .plan
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| {
+                        project.profile_env.iter().find(|(name, _)| name == profile)
+                    })
+                    .map(|(_, env)| env.clone())
+                    .unwrap_or_default();
+                if !profile_env.is_empty() {
+                    let active = repo.config.plan.profile.clone().unwrap_or_default();
+                    for target in manifest.targets.values_mut() {
+                        if !target.profiles.is_empty() && !target.profiles.contains(&active) {
+                            continue;
+                        }
+                        for (name, value) in &profile_env {
+                            target
+                                .env
+                                .entry(name.clone())
+                                .or_insert_with(|| value.clone());
+                        }
+                        for step in &mut target.steps {
+                            if let crate::lang::compile::Work::Process { env, .. } = &mut step.work
+                            {
+                                for (name, value) in &profile_env {
+                                    if !env.iter().any(|(known, _)| known == name) {
+                                        env.insert(0, (name.clone(), value.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                (manifest, Some(project))
             }
             None => (Manifest::default(), None),
         };
@@ -242,7 +243,7 @@ impl Context {
         Ok(decision)
     }
 
-    pub fn start(&self, request: &Request) -> Result<Run> {
+    pub fn start(&mut self, request: &Request) -> Result<Run> {
         if let Some(key) = &request.key
             && let Some(existing) = self.store.run_by_key(key)?
         {
@@ -251,21 +252,16 @@ impl Context {
         let explicit = !request.targets.is_empty();
         let remote_available = !self.repo.config.run.remote.is_empty();
         if request.mode == Mode::Remote && !remote_available {
-            bail!("no remote runner: declare a `pool` in citrus.ci");
+            bail!("no remote runner: declare a `runner` in the configuration");
         }
         if explicit && request.mode == Mode::Remote {
             bail!("--remote runs the planned set; drop the target names or use --local");
         }
+        let mut arms = std::collections::BTreeMap::new();
         let names = if explicit {
             request.targets.clone()
         } else {
-            let plan = plan::compute(&self.repo, &self.manifest, request.base.as_deref())?;
-            if plan.targets.is_empty()
-                && plan.files == 0
-                && !self.repo.config.plan.command.is_empty()
-            {
-                self.refuse_empty_plan(request.base.as_deref())?;
-            }
+            let plan = plan::compute(&self.repo, &mut self.manifest, request.base.as_deref())?;
             // The planner itself says it cannot tell what these changes need.
             if plan.status == "incomplete" && !plan.unmapped.is_empty() {
                 let shown: Vec<&str> = plan.unmapped.iter().take(5).map(String::as_str).collect();
@@ -280,6 +276,7 @@ impl Context {
                     }
                 );
             }
+            arms = plan.arms.clone();
             plan.targets
         };
         let files = self.repo.files()?;
@@ -344,6 +341,11 @@ impl Context {
         if pending.is_empty() {
             return Ok(run);
         }
+        // The worker runs the `match changed` arms this plan chose.
+        if !arms.is_empty() {
+            self.store
+                .set_fact(&format!("arms:{id}"), &serde_json::to_string(&arms)?)?;
+        }
         let output = OpenOptions::new().create(true).append(true).open(&log)?;
         let pid = self
             .spawn_detached(&["worker", &id], output)
@@ -379,23 +381,6 @@ impl Context {
     /// "Nothing to check" is only true if HEAD has nothing the base lacks. A
     /// planner comparing against another base (or HEAD itself) must not turn
     /// unmerged work into a green result.
-    fn refuse_empty_plan(&self, base: Option<&str>) -> Result<()> {
-        let base = base.unwrap_or(&self.repo.config.plan.base);
-        let Ok(ahead) = self
-            .repo
-            .git(&["rev-list", "--count", &format!("{base}..HEAD")])
-        else {
-            return Ok(());
-        };
-        let ahead: u64 = ahead.parse().unwrap_or(0);
-        if ahead > 0 {
-            bail!(
-                "the planner saw no changed files, but HEAD has {ahead} commits that {base} lacks — it compared against another base; run with --base {base}"
-            );
-        }
-        Ok(())
-    }
-
     /// An unfinished run over the same sources that already covers `names`:
     /// asking again joins it instead of starting a duplicate.
     fn running_for(&self, snapshot: &str, names: &[String]) -> Result<Option<Run>> {
@@ -471,8 +456,11 @@ impl Context {
     }
 
     /// Runs inside the detached worker process; stdout and stderr are the run log.
-    pub fn work(&self, id: &str) -> Result<()> {
+    pub fn work(&mut self, id: &str) -> Result<()> {
         let run = self.store.run(id)?.context("unknown run")?;
+        if let Some((arms, _)) = self.store.fact(&format!("arms:{id}"))? {
+            self.manifest.choose_arms(&serde_json::from_str(&arms)?);
+        }
         self.store.set_state(id, "running")?;
         let targets = self.store.targets(id)?;
         let passed = if run.mode == "remote" {
@@ -513,20 +501,39 @@ impl Context {
 
     fn work_local(&self, run: &Run, targets: &[RunTarget]) -> Result<Vec<String>> {
         let mut passed = Vec::new();
+        // Services a check needs start once, before the first check needing them.
+        let mut started_services: Vec<String> = Vec::new();
         for target in targets.iter().filter(|target| target.result == "pending") {
             let mut current = target.clone();
             current.result = "running".into();
             self.store.update_target(&run.id, &current)?;
             println!("CITRUS_TARGET target={} status=START", target.target);
             let started = now();
-            let declared = self
-                .manifest
-                .targets
-                .get(&target.target)
-                .filter(|entry| !entry.steps.is_empty());
+            let declared = self.manifest.targets.get(&target.target);
             if let Some(entry) = declared {
                 let mut code = 0;
-                for step in &entry.steps {
+                let services = self.project.iter().flat_map(|project| &project.services);
+                for service in services.filter(|service| entry.resources.contains(&service.name)) {
+                    if code != 0 || started_services.contains(&service.name) {
+                        continue;
+                    }
+                    started_services.push(service.name.clone());
+                    for step in service.start.iter().chain(&service.ready) {
+                        println!("── {}  (service {})", step.label, service.name);
+                        code =
+                            i64::from(crate::lang::compile::execute(step, &self.repo.root, false)?);
+                        if code != 0 {
+                            println!("service {} did not start", service.name);
+                            break;
+                        }
+                    }
+                }
+                let steps = if code == 0 {
+                    entry.steps.as_slice()
+                } else {
+                    &[]
+                };
+                for step in steps {
                     println!(
                         "── {}  ({})",
                         step.label,
@@ -559,36 +566,14 @@ impl Context {
                 self.store.update_target(&run.id, &current)?;
                 continue;
             }
-            let argv = substitute(&self.repo.config.run.local, "{target}", &target.target);
-            let mut command = Command::new(&argv[0]);
-            command
-                .args(&argv[1..])
-                .current_dir(&self.repo.root)
-                .stdin(Stdio::null());
-            if let Some(env) = self.repo.config.run.env.get(&target.target) {
-                command.envs(env);
-            }
-            let status = command.status()?;
-            let code = i64::from(status.code().unwrap_or(-1));
-            current.seconds = Some((now() - started) as i64);
-            current.exit = Some(code);
             println!(
-                "CITRUS_TARGET target={} status={} exit={code} seconds={}",
-                target.target,
-                if code == 0 { "PASS" } else { "FAIL" },
-                current.seconds.unwrap_or_default()
+                "CITRUS_TARGET target={} status=FAIL exit=127",
+                target.target
             );
-            if code == 0 {
-                current.result = "passed".into();
-                current.reason = "ran".into();
-                self.record_inputs(run, &target.target)?;
-                passed.push(target.target.clone());
-            } else {
-                current.result = "failed".into();
-                current.reason = "ran".into();
-                current.first_error =
-                    report::first_error(&segment(&read_log(&run.log), &target.target, &[]));
-            }
+            current.result = "failed".into();
+            current.reason = "not declared".into();
+            current.first_error =
+                Some(format!("no check `{}` in the configuration", target.target));
             self.store.update_target(&run.id, &current)?;
         }
         Ok(passed)
@@ -629,14 +614,7 @@ impl Context {
 
     fn work_remote(&self, run: &Run, targets: &[RunTarget]) -> Result<Vec<String>> {
         let config = &self.repo.config;
-        let mut argv = config.run.remote.clone();
-        if let Some(base) = run
-            .base
-            .as_deref()
-            .filter(|_| !config.plan.base_arg.is_empty())
-        {
-            argv.push(config.plan.base_arg.replace("{base}", base));
-        }
+        let argv = config.run.remote.clone();
         // The checks this run needs, one per line: the pool runs these.
         let wanted = self
             .repo
@@ -662,6 +640,10 @@ impl Context {
             .current_dir(&self.repo.root)
             .env("CITRUS_CHECKS", self.manifest.export_file(&self.repo)?)
             .env("CITRUS_TARGETS", &wanted)
+            .env(
+                "CITRUS_BASE",
+                run.base.as_deref().unwrap_or(&config.plan.base),
+            )
             .env(
                 "CITRUS_PROFILE",
                 self.repo.config.plan.profile.clone().unwrap_or_default(),

@@ -6,31 +6,35 @@ environment for one release at a time, and knows what to do after an
 interruption.
 
 ```
-release "web" {
-  about = "Web app to production"
-  environment = "web-production"   # one release at a time here, across worktrees
+# The web app to production.
+release web {
+  environment = web-production     # one release at a time here, across worktrees
   checks = proven                  # default; `none`: no check gate
-  # Reserves and prints RELEASE=<version>; `initial` is the first `next`.
-  version = { reserve: make("version-reserve", START: next), initial: "1.4.0" }
 
-  step "build" { run = make("image", VERSION: version) }
-  step "deploy" {
-    production = true              # needs --approve
-    run = make("deploy", VERSION: version)
-    recover = make("deploy-reconcile", VERSION: version)   # when the outcome is unknown
+  # Reserves and prints RELEASE=<version>; `version` is the one after the latest.
+  version = make("version-reserve", START: version) {
+    initial = "1.4.0"
   }
-  step "postcheck" { run = make("smoke", VERSION: version) }
+
+  step build = make("image", VERSION: version)
+  step deploy = make("deploy", VERSION: version) {
+    production = true              # needs --approve
+    # When the outcome is unknown: reconcile, never blindly repeat.
+    recover = make("deploy-reconcile", VERSION: version)
+  }
+  step postcheck = make("smoke", VERSION: version)
 
   # `version` is the release before the last passed one.
-  rollback = { production: true, run: make("deploy", VERSION: version) }
+  rollback = make("deploy", VERSION: version) {
+    production = true
+  }
 }
 ```
 
-Values Citrus fills in: `version` (reserved, or the rollback target),
-`previous` (last passed release), `next` (after `previous`, or `initial`),
-`commit`, `unit`; inside strings write `{version}`. `version` also takes
-`prefix` (default `"RELEASE="`), the text before the version in the output
-of `reserve`.
+Values Citrus fills in: `version` (being reserved, released, or the
+rollback target), `previous` (last passed release), `commit`, `unit`; inside
+strings write `{version}`. `version` also takes `prefix` (default
+`"RELEASE="`), the text before the version in the output of its command.
 
 ## Commands
 

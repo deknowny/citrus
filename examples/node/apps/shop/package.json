@@ -1,0 +1,1 @@
+{ "name": "@acme/shop", "private": true, "dependencies": { "next": "16", "@acme/ui": "workspace:*" } }

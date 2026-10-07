@@ -38,7 +38,7 @@ pub fn split_base(context: &Context, base: &str) -> (Option<String>, String) {
     (None, base.to_owned())
 }
 
-pub fn integrate(context: &Context, base: &str) -> Result<Integration> {
+pub fn integrate(context: &mut Context, base: &str) -> Result<Integration> {
     let repo = &context.repo;
     if !repo
         .git(&["status", "--porcelain", "--untracked-files=no"])?
@@ -108,20 +108,20 @@ pub fn integrate(context: &Context, base: &str) -> Result<Integration> {
         .lines()
         .map(str::to_owned)
         .collect();
-    carry(context, &mut result, &snapshot_before, &before)?;
+    carry(&mut *context, &mut result, &snapshot_before, &before)?;
     Ok(result)
 }
 
 /// Carry earlier passes of checks the incoming changes do not select.
 pub fn carry(
-    context: &Context,
+    context: &mut Context,
     result: &mut Integration,
     snapshot_before: &str,
     before: &str,
 ) -> Result<()> {
     let selected = match plan::for_paths(
         &context.repo,
-        &context.manifest,
+        &mut context.manifest,
         &result.incoming_paths,
         before,
     ) {
@@ -145,7 +145,7 @@ pub fn carry(
         }
     };
     let snapshot_after = context.repo.snapshot()?;
-    let current = plan::compute(&context.repo, &context.manifest, None)?;
+    let current = plan::compute(&context.repo, &mut context.manifest, None)?;
     for target in &current.targets {
         // Declared cached checks follow their input fingerprint; nothing to carry.
         if context
