@@ -448,6 +448,16 @@ impl Context {
             self.work_local(&run, &targets)?
         };
         let finished = self.store.targets(id)?;
+        if run.mode == "remote" {
+            // A check the pool reported passing proves its inputs here too,
+            // as long as they are what they were when the run started.
+            for row in finished
+                .iter()
+                .filter(|row| row.result == "passed" && row.reason == "ran")
+            {
+                self.record_inputs(&run, &row.target)?;
+            }
+        }
         let ok = finished
             .iter()
             .all(|target| matches!(target.result.as_str(), "passed" | "reused"));

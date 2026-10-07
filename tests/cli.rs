@@ -2019,3 +2019,24 @@ fn fmt_removes_aligned_columns_and_keeps_meaning() {
     assert_eq!(project.json(&["fmt", "--check"]).1, 0);
     assert_eq!(project.json(&["check"]).0["tasks"], 1);
 }
+
+#[test]
+fn a_check_the_pool_passed_is_reused_by_its_inputs() {
+    let config = r#"
+planner { run = run("sh", "plan.sh") }
+pool "builders" { run = run("sh", "remote.sh"), progress = ["LANE"] }
+"#;
+    let project = Project::new(config);
+    project.write("plan.sh", "printf 'TARGET\\tmake:ok\\n'\n");
+    project.write(
+        "remote.sh",
+        "echo 'LANE target=ok status=START'\necho 'LANE target=ok status=PASS exit=0 seconds=40'\n",
+    );
+    project.commit("pool");
+    let (first, code) = project.json(&["run", "--remote"]);
+    assert_eq!(code, 0, "{first}");
+    // An unrelated file changes the snapshot but not the inputs of `ok`.
+    project.write("other/x", "changed\n");
+    let (again, _) = project.json(&["run", "--remote"]);
+    assert_eq!(target(&again, "ok")["result"], "reused", "{again}");
+}

@@ -35,6 +35,9 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
 - `cargo.closure("package")`: the files a Cargo package is built from
   (path-dependency closure, included files, manifests and workspace
   settings), so Rust checks can be cached without listing crates by hand.
+- A declared cached check that a pool reported passing now counts locally
+  too (evidence and receipt by inputs), so a remote PASS is reused after
+  unrelated edits — before, only local passes were, and most runs are remote.
 - `citrus fmt [--check]`: the canonical `.ci` layout — two-space nesting,
   one space around `=` and after `,`/`:`, no aligned columns; comments,
   line breaks and strings stay as written.
