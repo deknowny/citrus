@@ -138,6 +138,10 @@ pub struct Check {
     pub meta: BTreeMap<String, serde_json::Value>,
     pub env: Vec<(String, String)>,
     pub steps: Vec<Step>,
+    /// Profiles the check belongs to; empty: every profile.
+    pub profiles: Vec<String>,
+    /// Checks that already run this one: with one of them in a plan, this one is dropped.
+    pub covered_by: Vec<String>,
     pub span: Span,
 }
 
@@ -154,6 +158,8 @@ pub struct Planner {
     pub argv: Vec<String>,
     pub base_var: Option<String>,
     pub paths_var: Option<String>,
+    /// Passed as VAR=<profile>.
+    pub profile_var: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -172,6 +178,8 @@ pub struct Pool {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Project {
     pub base: Option<String>,
+    /// Profiles checks may belong to; the first one is the default.
+    pub profiles: Vec<String>,
     pub logs: Option<String>,
     pub toolchain: Vec<String>,
     pub checks: Vec<Check>,
@@ -222,9 +230,11 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                         "receipts",
                         "check_env",
                         "after_merge",
+                        "profiles",
                     ],
                 )?;
                 project.base = optional_string(decl, "base")?;
+                project.profiles = strings(decl, "profiles")?;
                 project.logs = optional_string(decl, "logs")?;
                 project.toolchain = strings(decl, "toolchain")?;
                 project.receipts = optional_string(decl, "receipts")?;
@@ -255,7 +265,7 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                 }
             }
             "planner" => {
-                known_fields(decl, &["run", "base_var", "paths_var"])?;
+                known_fields(decl, &["run", "base_var", "paths_var", "profile_var"])?;
                 let Some(Value::Action(action)) = decl.field("run") else {
                     return Err(Error::at(
                         decl.span,
@@ -266,6 +276,7 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     argv: argv(action)?,
                     base_var: optional_string(decl, "base_var")?,
                     paths_var: optional_string(decl, "paths_var")?,
+                    profile_var: optional_string(decl, "profile_var")?,
                 });
             }
             "pool" => {
@@ -328,7 +339,8 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                         "resources",
                         "meta",
                         "env",
-                        "on",
+                        "profiles",
+                        "covered_by",
                     ],
                 )?;
                 let name = label(decl)?;
@@ -370,6 +382,8 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     reads: unique(strings(decl, "reads")?),
                     cache: matches!(decl.field("cache"), Some(Value::Bool(true))),
                     resources: strings(decl, "resources")?,
+                    profiles: strings(decl, "profiles")?,
+                    covered_by: strings(decl, "covered_by")?,
                     meta: match decl.field("meta") {
                         None => BTreeMap::new(),
                         Some(value @ Value::Map(_)) => {
@@ -431,6 +445,20 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     Some(close) => error.help(format!("did you mean `{close}`?")),
                     None => error.help(format!("blocks are: {}", KINDS.join(", "))),
                 });
+            }
+        }
+    }
+    for check in &project.checks {
+        for profile in &check.profiles {
+            if !project.profiles.contains(profile) {
+                return Err(Error::at(
+                    check.span,
+                    format!(
+                        "check \"{}\": profile `{profile}` is not declared",
+                        check.name
+                    ),
+                )
+                .help("declare it in `project { profiles = [...] }`"));
             }
         }
     }

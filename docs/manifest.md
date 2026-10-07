@@ -10,6 +10,8 @@ check "test-api" {
   resources = ["contracts"]         # resource classes for the project's scheduler
   env = { SQLX_OFFLINE: "true" }    # extra environment of its steps
   meta = { linux: true }            # data for the project's own tools, kept as written
+  profiles = ["fast"]               # only in these profiles (docs/design/planner.md)
+  covered_by = ["test-all"]         # dropped when one of these is in the plan
 }
 ```
 

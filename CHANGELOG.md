@@ -38,6 +38,9 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
 - A declared cached check that a pool reported passing now counts locally
   too (evidence and receipt by inputs), so a remote PASS is reused after
   unrelated edits — before, only local passes were, and most runs are remote.
+- Profiles: `project { profiles = [...] }`, `check { profiles = [...] }`,
+  `--profile` (also `CITRUS_PROFILE`), passed to the planner (`profile_var`)
+  and the pool. `covered_by` drops a check whose covering check is planned.
 - `!glob` in `owns`/`reads` excludes paths; the last matching glob decides
   (docs/design/planner.md).
 - Submodule paths (gitlinks) are valid globs for `owns`/`reads` in `check`,

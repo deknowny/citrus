@@ -44,7 +44,9 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn open() -> Result<Context> {
+    /// `profile`: `--profile`; otherwise `CITRUS_PROFILE`, otherwise the
+    /// project's first profile.
+    pub fn open(profile: Option<String>) -> Result<Context> {
         let mut repo = Repo::discover()?;
         let (manifest, project) = match crate::lang::compile::load(&repo.root)
             .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
@@ -82,7 +84,29 @@ impl Context {
                         .as_ref()
                         .map(|var| format!("{var}={{file}}"))
                         .unwrap_or_default();
+                    config.plan.profile_arg = planner
+                        .profile_var
+                        .as_ref()
+                        .map(|var| format!("{var}={{profile}}"))
+                        .unwrap_or_default();
                 }
+                let requested = profile.or_else(|| {
+                    std::env::var("CITRUS_PROFILE")
+                        .ok()
+                        .filter(|value| !value.is_empty())
+                });
+                config.plan.profile = match requested {
+                    Some(name) if project.profiles.contains(&name) => Some(name),
+                    Some(name) => bail!(
+                        "no profile `{name}` in citrus.ci; declared: {}",
+                        if project.profiles.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            project.profiles.join(", ")
+                        }
+                    ),
+                    None => project.profiles.first().cloned(),
+                };
                 if let Some(pool) = &project.pool {
                     config.run.remote = pool.argv.clone();
                     config.run.progress_prefixes = pool.progress.clone();
@@ -329,6 +353,10 @@ impl Context {
         let mut command = Command::new(std::env::current_exe()?);
         command
             .args(args)
+            .env(
+                "CITRUS_PROFILE",
+                self.repo.config.plan.profile.clone().unwrap_or_default(),
+            )
             .current_dir(&self.repo.root)
             .stdin(Stdio::null())
             .stdout(output.try_clone()?)
@@ -629,6 +657,10 @@ impl Context {
             .current_dir(&self.repo.root)
             .env("CITRUS_CHECKS", self.manifest.export_file(&self.repo)?)
             .env("CITRUS_TARGETS", &wanted)
+            .env(
+                "CITRUS_PROFILE",
+                self.repo.config.plan.profile.clone().unwrap_or_default(),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped());
         let mut child = command.spawn()?;

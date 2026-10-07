@@ -20,6 +20,7 @@ project {
   toolchain = ["rust-toolchain.toml"]   # files every declared fingerprint depends on
   receipts = "citrus/receipts"          # PASS receipts, relative to the Git common directory
   check_env = { "test-api": { SQLX_OFFLINE: "true" } }   # extra environment per check
+  profiles = ["fast", "e2e"]  # check profiles (`--profile`); the first is the default
   after_merge = run("scripts/after-merge", before)       # after `citrus integrate` merged
 }
 
@@ -33,6 +34,7 @@ planner {                     # the project's own planner (optional)
   run = make("ci-plan")       # prints TARGET\tmake:<name> lines (docs/protocol.md)
   base_var = "BASE_REF"       # passed as BASE_REF=<base> for an explicit --base
   paths_var = "PATHS_FILE"    # passed as PATHS_FILE=<file of changed paths>
+  profile_var = "MODE"        # passed as MODE=<profile>
 }
 
 pool "builders" {             # runs the whole planned set elsewhere (optional)

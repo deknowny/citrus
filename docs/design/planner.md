@@ -1,6 +1,6 @@
 # Planning in `citrus.ci`
 
-Status: exclusions implemented; profiles and `covered_by` next. Issue #4.
+Status: implemented (exclusions, profiles, `covered_by`). Issue #4.
 
 A project planner such as Garvis' `scripts/ci-plan.sh` (≈800 lines of bash
 plus a 780-line product-impact script) answers one question: which checks do
@@ -40,7 +40,10 @@ check "test-backend" { owns = backend, profiles = ["fast"], run = make("test-bac
 check "test-backend-e2e-db" { owns = backend, profiles = ["e2e"], run = make("test-backend-e2e-db") }
 ```
 
-A check without `profiles` belongs to all of them.
+A check without `profiles` belongs to all of them. `--profile` (or
+`CITRUS_PROFILE`) picks the profile; the planner gets it as `profile_var`
+(`planner { profile_var = "MODE" }` passes `MODE=e2e`) and in
+`CITRUS_PROFILE`, and so does the pool.
 
 ## 3. Covered checks
 
@@ -53,7 +56,8 @@ check "test-clyerbot" { owns = clyer, covered_by = ["test-clyer-pipeline-contrac
 ```
 
 `covered_by` drops the check from a plan that already contains one of the
-named checks; reuse, receipts and `why` explain it as covered.
+named checks (declared or chosen by the project's planner); the plan lists
+it under notes as `covered:<name>`.
 
 ## Migration path
 

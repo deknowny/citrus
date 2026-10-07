@@ -51,6 +51,9 @@ struct Cli {
     /// Text output even when stdout is not a terminal.
     #[arg(long, global = true, conflicts_with = "json")]
     text: bool,
+    /// Plan checks of this profile (citrus.ci `project { profiles = [...] }`).
+    #[arg(long, global = true)]
+    profile: Option<String>,
     /// Without a command: what Citrus can do in this repository.
     #[command(subcommand)]
     command: Option<Command>,
@@ -279,7 +282,7 @@ enum ReleaseAction {
 fn main() {
     let cli = Cli::parse();
     let json = cli.json || (!cli.text && !std::io::stdout().is_terminal());
-    match execute(cli.command, json) {
+    match execute(cli.command, json, cli.profile) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             if json {
@@ -295,8 +298,8 @@ fn main() {
     }
 }
 
-fn execute(command: Option<Command>, json: bool) -> Result<i32> {
-    let context = Context::open()?;
+fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Result<i32> {
+    let context = Context::open(profile)?;
     let Some(command) = command else {
         return overview(&context, json);
     };

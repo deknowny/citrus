@@ -29,6 +29,10 @@ pub struct Target {
     pub steps: Vec<crate::lang::compile::Step>,
     /// `file:line` of the declaration in `citrus.ci`.
     pub source: Option<String>,
+    /// Profiles it belongs to; empty: all.
+    pub profiles: Vec<String>,
+    /// Checks that already run this one.
+    pub covered_by: Vec<String>,
     owned: GlobList,
     extra: GlobList,
 }
@@ -75,6 +79,8 @@ impl Target {
             env: check.env.iter().cloned().collect(),
             steps: check.steps.clone(),
             source: Some(source),
+            profiles: check.profiles.clone(),
+            covered_by: check.covered_by.clone(),
             owned,
             extra,
         })
@@ -151,6 +157,8 @@ impl Manifest {
                     "extra_inputs": target.extra_inputs,
                     "resources": target.resources,
                     "meta": target.extensions,
+                    "profiles": target.profiles,
+                    "covered_by": target.covered_by,
                     "source": target.source,
                     "declaration": target.declaration(),
                 })

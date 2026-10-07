@@ -25,6 +25,36 @@ pub struct Plan {
 }
 
 pub fn compute(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<Plan> {
+    let mut plan = compute_all(repo, manifest, base)?;
+    narrow(&mut plan, repo, manifest);
+    Ok(plan)
+}
+
+/// Drops declared checks outside the current profile, and checks covered by
+/// another check in the plan (docs/design/planner.md).
+fn narrow(plan: &mut Plan, repo: &Repo, manifest: &Manifest) {
+    let profile = repo.config.plan.profile.as_deref();
+    let selected = plan.targets.clone();
+    plan.targets.retain(|name| {
+        let Some(target) = manifest.targets.get(name) else {
+            return true;
+        };
+        let in_profile = target.profiles.is_empty()
+            || profile.is_some_and(|profile| target.profiles.iter().any(|item| item == profile));
+        let covered = target
+            .covered_by
+            .iter()
+            .any(|cover| cover != name && selected.contains(cover));
+        if !in_profile {
+            plan.notes.push(format!("profile:{name}"));
+        } else if covered {
+            plan.notes.push(format!("covered:{name}"));
+        }
+        in_profile && !covered
+    });
+}
+
+fn compute_all(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<Plan> {
     let config = &repo.config.plan;
     if config.command.is_empty() {
         return builtin(repo, manifest, base.unwrap_or(&config.base));
@@ -109,6 +139,12 @@ fn edited_checks(repo: &Repo, manifest: &Manifest, before: &str) -> Vec<String> 
 /// The checks that changes to exactly `paths` would select; `before` is the
 /// revision those changes start from (for manifest edits).
 pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
+    let mut plan = for_paths_all(repo, manifest, paths, before)?;
+    narrow(&mut plan, repo, manifest);
+    Ok(plan)
+}
+
+fn for_paths_all(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
     let config = &repo.config.plan;
     if config.command.is_empty() {
         return Ok(select(repo, manifest, paths.to_vec(), before));
@@ -151,7 +187,15 @@ fn external(repo: &Repo, manifest: &Manifest, extra: Option<String>) -> Result<P
     command
         .args(&config.command[1..])
         .current_dir(&repo.root)
-        .env("CITRUS_CHECKS", manifest.export_file(repo)?);
+        .env("CITRUS_CHECKS", manifest.export_file(repo)?)
+        .env("CITRUS_PROFILE", config.profile.clone().unwrap_or_default());
+    if let Some(profile) = config
+        .profile
+        .as_deref()
+        .filter(|_| !config.profile_arg.is_empty())
+    {
+        command.arg(config.profile_arg.replace("{profile}", profile));
+    }
     if let Some(extra) = extra {
         command.arg(extra);
     }

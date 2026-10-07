@@ -65,6 +65,11 @@ pub struct PlanConfig {
     /// (one per line); `{file}` is substituted. Lets `citrus integrate` ask
     /// which checks the incoming changes select. Empty: not supported.
     pub paths_arg: String,
+    /// The profile checks are planned for (`--profile`, `CITRUS_PROFILE`, or
+    /// the project's first); None when the project declares no profiles.
+    pub profile: Option<String>,
+    /// Extra argument naming the profile for the external planner; `{profile}` substituted.
+    pub profile_arg: String,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +133,8 @@ impl Default for PlanConfig {
             base: "origin/main".into(),
             command: Vec::new(),
             base_arg: String::new(),
+            profile: None,
+            profile_arg: String::new(),
             paths_arg: String::new(),
         }
     }

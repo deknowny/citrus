@@ -2095,3 +2095,52 @@ fn an_excluded_path_neither_selects_nor_invalidates_a_check() {
         "{plan}"
     );
 }
+
+#[test]
+fn profiles_and_covered_checks_shape_the_plan() {
+    let project = Project::new(
+        r#"
+project { base = "main", profiles = ["fast", "e2e"] }
+check "unit" { owns = ["lib/**"], run = make("ok"), profiles = ["fast"] }
+check "e2e" { owns = ["lib/**"], run = make("plain"), profiles = ["e2e"] }
+check "part" { owns = ["lib/**"], run = make("ok"), covered_by = ["whole"] }
+check "whole" { owns = ["lib/**"], run = make("ok") }
+"#,
+    );
+    project.git(&["checkout", "-q", "-b", "feature"]);
+    project.write("lib/a.txt", "a\n");
+    project.commit("lib");
+    let targets =
+        |args: &[&str]| project.json(&[&["plan"], args].concat()).0["plan"]["targets"].clone();
+    assert_eq!(targets(&[]), serde_json::json!(["unit", "whole"]));
+    assert_eq!(
+        targets(&["--profile", "e2e"]),
+        serde_json::json!(["e2e", "whole"])
+    );
+    let unknown = project.json(&["plan", "--profile", "nightly"]).0;
+    assert!(
+        unknown["error"]
+            .as_str()
+            .unwrap()
+            .contains("no profile `nightly`"),
+        "{unknown}"
+    );
+}
+
+#[test]
+fn the_planner_learns_the_profile() {
+    let project = Project::new(
+        "project { profiles = [\"fast\", \"e2e\"] }\nplanner { run = run(\"sh\", \"plan.sh\"), profile_var = \"MODE\" }\n",
+    );
+    project.write(
+        "plan.sh",
+        "printf 'TARGET\\tmake:%s\\n' \"${1#MODE=}-$CITRUS_PROFILE\"\n",
+    );
+    project.commit("planner");
+    let (plan, _) = project.json(&["plan", "--profile", "e2e"]);
+    assert_eq!(
+        plan["plan"]["targets"],
+        serde_json::json!(["e2e-e2e"]),
+        "{plan}"
+    );
+}
