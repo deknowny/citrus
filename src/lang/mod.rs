@@ -3,6 +3,7 @@
 //! the resulting graph, and every node keeps the span it was declared at.
 
 pub mod ast;
+pub mod cargo;
 pub mod compile;
 pub mod eval;
 pub mod lexer;

@@ -19,7 +19,8 @@ check "test-api" {
   Absolute paths and `..` are rejected; a glob matching no file is reported.
 - `owns` must be non-empty and `run` must name something to run.
 - Set `cache = true` only when `owns` + `reads` list **everything** the check
-  reads. An undeclared input makes a reused PASS false.
+  reads. An undeclared input makes a reused PASS false. For a Rust check,
+  `reads = cargo.closure("package")` lists what the package is built from.
 - Editing a check's declaration selects it on the next plan.
 
 ## For the project's own tools: `CITRUS_CHECKS`

@@ -252,7 +252,15 @@ pub const ACTIONS: &[&str] = &[
     "inputs_of",
 ];
 /// Pure helpers evaluated immediately.
-const FUNCTIONS: &[&str] = &["len", "str", "keys", "values", "range", "glob"];
+const FUNCTIONS: &[&str] = &[
+    "len",
+    "str",
+    "keys",
+    "values",
+    "range",
+    "glob",
+    "cargo.closure",
+];
 /// Values Citrus fills in while running: `before` (the commit before a merge),
 /// `version`, `next`, `previous` (releases), `release`, `short`, `commit`.
 pub const PLACEHOLDERS: &[&str] = &[
@@ -294,6 +302,37 @@ fn globals() -> Scope {
         scope.set(name, Value::Str(format!("{{{name}}}")));
     }
     scope
+}
+
+/// Repository files as the evaluator sees them, for builtins that read manifests.
+struct RepositoryFiles<'a> {
+    root: &'a Path,
+    revision: Option<&'a str>,
+    list: Vec<String>,
+}
+
+impl super::cargo::Files for RepositoryFiles<'_> {
+    fn read(&self, path: &str) -> Option<String> {
+        match self.revision {
+            None => std::fs::read_to_string(self.root.join(path)).ok(),
+            Some(revision) => {
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(self.root)
+                    .args(["show", &format!("{revision}:{path}")])
+                    .output()
+                    .ok()?;
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+            }
+        }
+    }
+
+    fn list(&self) -> &[String] {
+        &self.list
+    }
 }
 
 pub struct Evaluator<'a> {
@@ -864,6 +903,19 @@ impl Evaluator<'_> {
                     .collect();
                 matched.sort_by_key(|value| value.display());
                 Value::List(matched)
+            }
+            "cargo.closure" => {
+                let Value::Str(package) = one()? else {
+                    return Err(Error::at(span, "`cargo.closure` needs a package name"));
+                };
+                let files = RepositoryFiles {
+                    root: self.root,
+                    revision: self.revision,
+                    list: self.repository_files().clone(),
+                };
+                let globs = super::cargo::closure(&files, &package)
+                    .map_err(|error| Error::at(span, error))?;
+                Value::List(globs.into_iter().map(Value::Str).collect())
             }
             _ => return Err(Error::at(span, format!("unknown function `{name}`"))),
         })

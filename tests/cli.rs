@@ -1895,3 +1895,35 @@ release "site" {
         "{failed}"
     );
 }
+
+#[test]
+fn a_cargo_closure_keeps_a_rust_check_reused_while_unrelated_crates_change() {
+    let project = Project::new(
+        "check \"test-app\" { owns = [\"crates/app/**\"], reads = cargo.closure(\"app\"), run = make(\"ok\"), cache = true }\n",
+    );
+    project.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+    project.write(
+        "crates/app/Cargo.toml",
+        "[package]\nname = \"app\"\n[dependencies]\nlib = { path = \"../lib\" }\n",
+    );
+    project.write("crates/app/src/main.rs", "fn main() {}\n");
+    project.write("crates/lib/Cargo.toml", "[package]\nname = \"lib\"\n");
+    project.write("crates/lib/src/lib.rs", "\n");
+    project.write("crates/other/Cargo.toml", "[package]\nname = \"other\"\n");
+    project.write("crates/other/src/lib.rs", "\n");
+    project.commit("crates");
+    assert_eq!(
+        target(&project.json(&["run", "test-app"]).0, "test-app")["result"],
+        "passed"
+    );
+    project.write("crates/other/src/lib.rs", "// unrelated\n");
+    let (again, _) = project.json(&["run", "test-app"]);
+    assert_eq!(target(&again, "test-app")["result"], "reused", "{again}");
+    project.write("crates/lib/src/lib.rs", "// a dependency changed\n");
+    let (changed, _) = project.json(&["run", "test-app"]);
+    assert_eq!(
+        target(&changed, "test-app")["result"],
+        "passed",
+        "{changed}"
+    );
+}

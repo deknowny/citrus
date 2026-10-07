@@ -32,6 +32,9 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
   Dockerfile counts in the key only with the stages the target is built from
   (`FROM <stage>`, `COPY --from=`, `--mount=…,from=`), so another product's
   stage no longer asks for a rebuild.
+- `cargo.closure("package")`: the files a Cargo package is built from
+  (path-dependency closure, included files, manifests and workspace
+  settings), so Rust checks can be cached without listing crates by hand.
 - Release steps run built-in actions too (`wait.http`, `copy`,
   `links.check`, …), not only commands; `release start --version X` releases
   a version given by hand (no `version` step).

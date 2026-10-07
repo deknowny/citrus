@@ -209,9 +209,13 @@ Actions without a mark work today; *planned* ones are reserved names.
 | `check(name)` | *planned*: run a declared check as a step |
 | `lease(…)`, `annotation(…)` | *planned*; today `fence = "lease"`, `record = { annotation: … }` |
 
-**Inputs:** `glob(pattern)`, `inputs_of(command)` (a command printing
-paths, for artifact inputs a glob cannot express); `read(path)` and
-`rust_closure(package)` (a Cargo dependency closure) are planned.
+**Inputs:** `glob(pattern)`; `cargo.closure(package)` — the globs a Cargo
+package is built from in this repository (its crate, workspace crates it
+reaches through path dependencies, files outside them used by
+`include_str!`/`include_bytes!`/`sqlx::migrate!`, `Cargo.toml`, `Cargo.lock`
+and workspace settings), read from manifests without running Cargo;
+`inputs_of(command)` (a command printing paths, for artifact inputs a glob
+cannot express). `read(path)` is planned.
 
 **Values:** `secret(name)` — resolved only during execution from the
 environment or a configured store; never printed, logged, shown in the
