@@ -1863,15 +1863,19 @@ fn a_pool_that_skips_a_planned_check_does_not_pass_it() {
 #[test]
 fn fmt_removes_aligned_columns_and_keeps_meaning() {
     let project = Project::new(
-        "check t = make(\"ok\") {\n    paths   = [\"src/a.txt\",\"src/b.txt\"]   # note\n  cache = false\n}\n",
+        "check t = make(\"ok\") {\n    paths   = [\"src/a.txt\",\"src/b.txt\"]   # note\n  cache = false\n}\n\ncheck m = match changed {\n  only(t)=>make(\"ok\")\n  _   =>  make(\"plain\")\n} {\n  paths = [\"src/*\"]\n}\n",
     );
     assert_eq!(project.json(&["fmt", "--check"]).1, 1);
     let (written, code) = project.json(&["fmt"]);
     assert_eq!(code, 0, "{written}");
     let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
     assert!(text.contains("check t = make(\"ok\") {\n  paths = [\"src/a.txt\", \"src/b.txt\"]  # note\n  cache = false\n}\n"), "{text}");
+    assert!(
+        text.contains("  only(t) => make(\"ok\")\n  _ => make(\"plain\")\n"),
+        "{text}"
+    );
     assert_eq!(project.json(&["fmt", "--check"]).1, 0);
-    assert_eq!(project.json(&["check"]).0["checks"], 5);
+    assert_eq!(project.json(&["check"]).0["checks"], 6);
 }
 
 #[test]

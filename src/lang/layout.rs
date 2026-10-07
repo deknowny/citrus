@@ -151,7 +151,17 @@ fn normalize(code: &str) -> String {
             '=' => {
                 let previous = out.trim_end().chars().last();
                 let next = chars.get(index + 1).copied();
-                if matches!(previous, Some('=' | '!' | '<' | '>')) || next == Some('=') {
+                if next == Some('>') {
+                    // `=>` of a `match` arm: one space on each side.
+                    while out.ends_with(' ') {
+                        out.pop();
+                    }
+                    out.push_str(" => ");
+                    index += 1;
+                    while chars.get(index + 1).is_some_and(|c| *c == ' ') {
+                        index += 1;
+                    }
+                } else if matches!(previous, Some('=' | '!' | '<' | '>')) || next == Some('=') {
                     out.push('=');
                 } else {
                     while out.ends_with(' ') {
