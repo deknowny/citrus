@@ -259,6 +259,7 @@ const FUNCTIONS: &[&str] = &[
     "values",
     "range",
     "glob",
+    "flatten",
     "cargo.closure",
 ];
 /// Values Citrus fills in while running: `before` (the commit before a merge),
@@ -879,6 +880,24 @@ impl Evaluator<'_> {
                     ));
                 }
             },
+            "flatten" => match one()? {
+                Value::List(items) => {
+                    let mut out = Vec::new();
+                    for item in items {
+                        match item {
+                            Value::List(inner) => out.extend(inner),
+                            other => out.push(other),
+                        }
+                    }
+                    Value::List(out)
+                }
+                other => {
+                    return Err(Error::at(
+                        span,
+                        format!("`flatten` of a {}", other.type_name()),
+                    ));
+                }
+            },
             "range" => match one()? {
                 Value::Int(end) => Value::List((0..end).map(Value::Int).collect()),
                 other => {
@@ -1050,6 +1069,15 @@ mod tests {
         let mut sources = Sources::default();
         evaluate_project(dir.path(), "citrus.ci", None, &mut sources)
             .map_err(|error| sources.render(&error))
+    }
+
+    #[test]
+    fn flatten_joins_lists_of_lists() {
+        let graph = evaluate("citrus 1\nlet x = flatten([[\"a\"], [\"b\", \"c\"], \"d\"])\ncheck \"t\" { owns = x, run = run(\"true\") }\n").unwrap();
+        assert_eq!(
+            graph.decls[0].field("owns").unwrap().display(),
+            "[\"a\", \"b\", \"c\", \"d\"]"
+        );
     }
 
     #[test]

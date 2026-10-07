@@ -209,6 +209,9 @@ Actions without a mark work today; *planned* ones are reserved names.
 | `check(name)` | *planned*: run a declared check as a step |
 | `lease(…)`, `annotation(…)` | *planned*; today `fence = "lease"`, `record = { annotation: … }` |
 
+**Lists:** `len`, `keys`, `values`, `range`, `flatten` (a list of lists as
+one list), `str`.
+
 **Inputs:** `glob(pattern)`; `cargo.closure(package)` — the globs a Cargo
 package is built from in this repository (its crate, workspace crates it
 reaches through path dependencies, files outside them used by
