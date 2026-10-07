@@ -25,6 +25,15 @@ pub fn diagnose(context: &Context) -> Vec<Finding> {
             detail,
         })
     };
+    note(
+        "citrus",
+        if env!("CITRUS_COMMIT").ends_with("-dirty") || env!("CITRUS_COMMIT") == "unknown" {
+            "warn"
+        } else {
+            "ok"
+        },
+        format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("CITRUS_COMMIT")),
+    );
     let config = &context.repo.config;
     let config_file = context.repo.root.join("citrus.toml");
     note(

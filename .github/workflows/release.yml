@@ -25,6 +25,8 @@ jobs:
         run: test "v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
+        env:
+          CITRUS_BUILD_COMMIT: ${{ github.sha }}
       - name: package
         run: |
           name="citrus-${GITHUB_REF_NAME}-${{ matrix.target }}"

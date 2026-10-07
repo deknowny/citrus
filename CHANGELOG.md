@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `citrus --version` and `citrus doctor` show the commit the binary was built from (`CITRUS_BUILD_COMMIT`, or Git at build time; `-dirty` for local changes).
+
 - `[integrate] after_merge` hook (`{before}`); `--push` never forces, follows tags or recurses into submodules.
 
 - Releases (`ci/releases.toml`, `citrus release …`): ordered steps with a

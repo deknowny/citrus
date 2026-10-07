@@ -37,7 +37,7 @@ const SCHEMA: &str = "citrus/v1";
 #[derive(Parser, Debug)]
 #[command(
     name = "citrus",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CITRUS_COMMIT"), ")"),
     about = "Plan, run and explain checks; reuse results that are already proven."
 )]
 struct Cli {

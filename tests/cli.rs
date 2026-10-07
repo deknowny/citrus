@@ -1012,3 +1012,18 @@ fn integrate_runs_the_after_merge_hook() {
         "{failed}"
     );
 }
+
+#[test]
+fn version_names_the_source_commit() {
+    let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let commit = text
+        .trim()
+        .rsplit_once(" (")
+        .map(|(_, rest)| rest.trim_end_matches(')'))
+        .unwrap_or_default();
+    assert!(!commit.is_empty() && commit != "unknown", "{text}");
+}

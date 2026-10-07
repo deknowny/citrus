@@ -10,6 +10,7 @@ readme = "README.md"
 keywords = ["ci", "agents", "testing", "cli", "monorepo"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [".github/"]
+build = "build.rs"
 
 [[bin]]
 name = "citrus"
