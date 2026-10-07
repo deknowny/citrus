@@ -1,6 +1,6 @@
 # Planning in `citrus.ci`
 
-Status: implemented (exclusions, profiles, `covered_by`). Issue #4.
+Status: implemented (exclusions, profiles, `covered_by`, groups, `when`, signals). Issue #4.
 
 A project planner such as Garvis' `scripts/ci-plan.sh` (≈800 lines of bash
 plus a 780-line product-impact script) answers one question: which checks do
@@ -58,6 +58,39 @@ check "test-clyerbot" { owns = clyer, covered_by = ["test-clyer-pipeline-contrac
 `covered_by` drops the check from a plan that already contains one of the
 named checks (declared or chosen by the project's planner); the plan lists
 it under notes as `covered:<name>`.
+
+## 4. Groups, conditions and signals
+
+Some choices depend on the whole change, not on one path: Garvis runs its
+Clyer pipeline contract when pipeline files changed and every other change
+is Clyer's, the main one when none is, and the combined one otherwise.
+Named path sets (`group`) and plan-time conditions (`when`) express that:
+
+```
+group "pipeline" { owns = ["scripts/**", "make/**"] }
+group "clyer" { owns = ["crates/clyer/**", "migrations/clyer/**"] }
+group "main" { owns = ["**", "!crates/clyer/**", "!migrations/clyer/**"] }
+group "docs" { owns = ["**/*.md"], note = "no-heavy:docs" }
+
+check "test-clyer-pipeline-contract" {
+  when = touched("pipeline") and touched("clyer") and not touched("main")
+  run = make("test-clyer-pipeline-contract")
+}
+```
+
+- `touched("x")`: a changed path is owned by group or check `x`.
+- `selected("x")`: check `x` is in the plan (conditions are applied until
+  the plan stops changing).
+- `signal("x")`: the project's signal command printed `SIGNAL x`. It runs
+  with `CITRUS_PATHS` (a file of the changed paths) and is the place for
+  classification a glob cannot express (Garvis reads file contents to tell
+  which product a change affects): `project { signals = run(...) }`.
+- `and`, `or`, `not` combine them. A check with `owns` and `when` needs
+  both; a check with only `when` is chosen by the condition.
+- A touched group's `note` is listed with the plan's targets.
+
+`citrus plan --paths-file FILE` plans an explicit list of paths; the plan
+lists the touched groups and signals for tools that adapt it.
 
 ## Migration path
 

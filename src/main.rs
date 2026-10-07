@@ -70,6 +70,10 @@ enum Command {
     Plan {
         #[arg(long)]
         base: Option<String>,
+        /// Plan exactly these changed paths (one per line; `-` for stdin)
+        /// instead of the changes since the base.
+        #[arg(long, value_name = "FILE")]
+        paths_file: Option<String>,
     },
     /// Run the needed checks (or the named targets), reusing proven results.
     Run {
@@ -305,7 +309,9 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
     };
     match command {
         Command::Status { base } => status(&context, base.as_deref(), json),
-        Command::Plan { base } => plan_command(&context, base.as_deref(), json),
+        Command::Plan { base, paths_file } => {
+            plan_command(&context, base.as_deref(), paths_file.as_deref(), json)
+        }
         Command::Run {
             targets,
             base,
@@ -928,8 +934,36 @@ fn stats(context: &Context, days: u64, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-fn plan_command(context: &Context, base: Option<&str>, json: bool) -> Result<i32> {
-    let plan = plan::compute(&context.repo, &context.manifest, base)?;
+fn plan_command(
+    context: &Context,
+    base: Option<&str>,
+    paths_file: Option<&str>,
+    json: bool,
+) -> Result<i32> {
+    let plan = match paths_file {
+        None => plan::compute(&context.repo, &context.manifest, base)?,
+        Some(file) => {
+            let text = if file == "-" {
+                std::io::read_to_string(std::io::stdin())?
+            } else {
+                std::fs::read_to_string(file).with_context(|| format!("read {file}"))?
+            };
+            let mut paths: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect();
+            paths.sort();
+            paths.dedup();
+            let base = base.unwrap_or(&context.repo.config.plan.base).to_owned();
+            let before = context
+                .repo
+                .git(&["merge-base", &base, "HEAD"])
+                .unwrap_or_default();
+            plan::for_paths(&context.repo, &context.manifest, &paths, &before)?
+        }
+    };
     let files = context.repo.files()?;
     let snapshot = context.repo.snapshot()?;
     let decisions = plan

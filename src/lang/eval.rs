@@ -250,7 +250,27 @@ pub const ACTIONS: &[&str] = &[
     "env",
     "rust_closure",
     "inputs_of",
+    "touched",
+    "selected",
+    "signal",
 ];
+
+/// Plan-time conditions (`when = touched("x") and not selected("y")`):
+/// evaluated when the changed paths are known, not when the file is read.
+const CONDITIONS: &[&str] = &["touched", "selected", "signal", "and", "or", "not"];
+
+fn condition(value: &Value) -> bool {
+    matches!(value, Value::Action(action) if CONDITIONS.contains(&action.kind.as_str()))
+}
+
+fn combine(kind: &str, args: Vec<Value>, span: Span) -> Value {
+    Value::Action(Rc::new(Action {
+        kind: kind.to_owned(),
+        args,
+        named: Vec::new(),
+        span,
+    }))
+}
 /// Pure helpers evaluated immediately.
 const FUNCTIONS: &[&str] = &[
     "len",
@@ -733,6 +753,9 @@ impl Evaluator<'_> {
             }
             Expr::Unary(op, value, span) => {
                 let value = self.expr(value, scope)?;
+                if *op == "not" && condition(&value) {
+                    return Ok(combine("not", vec![value], *span));
+                }
                 match (*op, &value) {
                     ("not", value) => Value::Bool(!value.truthy()),
                     ("-", Value::Int(number)) => Value::Int(-number),
@@ -746,6 +769,18 @@ impl Evaluator<'_> {
             }
             Expr::Binary(op, left, right, span) => {
                 let left_value = self.expr(left, scope)?;
+                if matches!(*op, "and" | "or") && condition(&left_value) {
+                    let right_value = self.expr(right, scope)?;
+                    return Ok(match (*op, right_value) {
+                        (_, right) if condition(&right) => {
+                            combine(op, vec![left_value, right], *span)
+                        }
+                        ("and", right) if right.truthy() => left_value,
+                        ("and", _) => Value::Bool(false),
+                        (_, right) if right.truthy() => Value::Bool(true),
+                        _ => left_value,
+                    });
+                }
                 if *op == "and" && !left_value.truthy() {
                     return Ok(Value::Bool(false));
                 }
@@ -756,6 +791,10 @@ impl Evaluator<'_> {
                     return Ok(left_value);
                 }
                 let right_value = self.expr(right, scope)?;
+                if matches!(*op, "and" | "or") && condition(&right_value) {
+                    // The left side was true for `and`, false for `or`.
+                    return Ok(right_value);
+                }
                 binary(op, left_value, right_value, *span)?
             }
             Expr::If {

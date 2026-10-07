@@ -2144,3 +2144,72 @@ fn the_planner_learns_the_profile() {
         "{plan}"
     );
 }
+
+#[test]
+fn groups_conditions_and_signals_choose_checks() {
+    let project = Project::new(
+        r#"
+project { base = "main", signals = run("sh", "signals.sh") }
+group "docs" { owns = ["*.md"], note = "no-heavy:docs" }
+group "pipeline" { owns = ["scripts/**"] }
+group "clyer" { owns = ["clyer/**"] }
+group "main" { owns = ["**", "!clyer/**", "!*.md"] }
+check "main-pipeline" { when = touched("pipeline") and touched("main") and not touched("clyer"), run = make("ok") }
+check "clyer-pipeline" { when = touched("pipeline") and touched("clyer") and not touched("main"), run = make("ok") }
+check "mixed-pipeline" { when = touched("pipeline") and touched("main") and touched("clyer"), run = make("ok") }
+check "backend" { owns = ["crates/**"], when = signal("product:garvis"), run = make("ok") }
+check "after-backend" { when = selected("backend"), run = make("ok") }
+"#,
+    );
+    // Paths under crates/ mean the garvis product unless they name clyer.
+    project.write("signals.sh", "grep -q '^crates/' \"$CITRUS_PATHS\" && ! grep -q clyer \"$CITRUS_PATHS\" && echo 'SIGNAL product:garvis'; true\n");
+    project.commit("plan");
+    let plan_for = |files: &[(&str, &str)]| {
+        project.git(&["checkout", "-q", "-B", "feature", "main"]);
+        for (path, text) in files {
+            project.write(path, text);
+        }
+        project.commit("change");
+        let (plan, _) = project.json(&["plan"]);
+        plan["plan"].clone()
+    };
+    let plan = plan_for(&[("scripts/run.sh", "x\n"), ("README.md", "x\n")]);
+    assert_eq!(
+        plan["targets"],
+        serde_json::json!(["main-pipeline"]),
+        "{plan}"
+    );
+    assert_eq!(
+        plan["notes"],
+        serde_json::json!(["no-heavy:docs"]),
+        "{plan}"
+    );
+    let plan = plan_for(&[("scripts/run.sh", "y\n"), ("clyer/bot.rs", "x\n")]);
+    assert_eq!(
+        plan["targets"],
+        serde_json::json!(["mixed-pipeline"]),
+        "{plan}"
+    );
+    let plan = plan_for(&[("crates/api/lib.rs", "x\n")]);
+    assert_eq!(
+        plan["targets"],
+        serde_json::json!(["backend", "after-backend"]),
+        "{plan}"
+    );
+    let plan = plan_for(&[("crates/clyer/lib.rs", "x\n")]);
+    assert_eq!(plan["targets"], serde_json::json!([]), "{plan}");
+
+    // An explicit path list plans just those paths, with groups and signals.
+    project.write("paths.txt", "clyer/bot.rs\nscripts/x.sh\n");
+    let (listed, _) = project.json(&["plan", "--paths-file", "paths.txt"]);
+    assert_eq!(
+        listed["plan"]["targets"],
+        serde_json::json!(["mixed-pipeline"]),
+        "{listed}"
+    );
+    assert_eq!(
+        listed["plan"]["groups"],
+        serde_json::json!(["pipeline", "clyer", "main"]),
+        "{listed}"
+    );
+}

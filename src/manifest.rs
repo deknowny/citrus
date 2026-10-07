@@ -33,6 +33,10 @@ pub struct Target {
     pub profiles: Vec<String>,
     /// Checks that already run this one.
     pub covered_by: Vec<String>,
+    /// Plan-time condition.
+    pub when: Option<crate::lang::compile::Cond>,
+    /// Order of declaration in `citrus.ci`: plans list checks in this order.
+    pub position: usize,
     owned: GlobList,
     extra: GlobList,
 }
@@ -81,6 +85,8 @@ impl Target {
             source: Some(source),
             profiles: check.profiles.clone(),
             covered_by: check.covered_by.clone(),
+            when: check.when.clone(),
+            position: 0,
             owned,
             extra,
         })
@@ -120,6 +126,23 @@ pub struct Manifest {
     pub targets: BTreeMap<String, Target>,
     /// The `.ci` files the checks were declared in.
     pub files: Vec<String>,
+    /// Named path sets for conditions and plan notes.
+    pub groups: Vec<PathGroup>,
+    /// Prints `SIGNAL <name>` lines for changed paths.
+    pub signals: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct PathGroup {
+    pub name: String,
+    pub note: Option<String>,
+    globs: GlobList,
+}
+
+impl PathGroup {
+    pub fn owns(&self, path: &str) -> bool {
+        self.globs.matches(path)
+    }
 }
 
 impl Manifest {
@@ -129,16 +152,28 @@ impl Manifest {
         sources: &crate::lang::Sources,
     ) -> Result<Manifest> {
         let mut targets = BTreeMap::new();
-        for check in &project.checks {
+        for (position, check) in project.checks.iter().enumerate() {
             let (file, line, _) = sources.locate(check.span);
-            targets.insert(
-                check.name.clone(),
-                Target::declared(check, format!("{file}:{line}"))?,
-            );
+            let mut target = Target::declared(check, format!("{file}:{line}"))?;
+            target.position = position;
+            targets.insert(check.name.clone(), target);
         }
+        let groups = project
+            .groups
+            .iter()
+            .map(|group| {
+                Ok(PathGroup {
+                    name: group.name.clone(),
+                    note: group.note.clone(),
+                    globs: GlobList::new(&group.owns)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Manifest {
             targets,
             files: project.files.clone(),
+            groups,
+            signals: project.signals.clone(),
         })
     }
 
@@ -159,6 +194,7 @@ impl Manifest {
                     "meta": target.extensions,
                     "profiles": target.profiles,
                     "covered_by": target.covered_by,
+                    "when": target.when,
                     "source": target.source,
                     "declaration": target.declaration(),
                 })

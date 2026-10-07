@@ -126,6 +126,80 @@ impl Work {
     }
 }
 
+/// A plan-time condition (`when`), evaluated once the changed paths are known.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cond {
+    Always(bool),
+    /// A changed path is owned by this group or check.
+    Touched(String),
+    /// This check is in the plan.
+    Selected(String),
+    /// The project's signal command printed this signal.
+    Signal(String),
+    And(Box<Cond>, Box<Cond>),
+    Or(Box<Cond>, Box<Cond>),
+    Not(Box<Cond>),
+}
+
+impl Cond {
+    pub fn eval(&self, facts: &dyn Fn(&Cond) -> bool) -> bool {
+        match self {
+            Cond::Always(value) => *value,
+            Cond::And(left, right) => left.eval(facts) && right.eval(facts),
+            Cond::Or(left, right) => left.eval(facts) || right.eval(facts),
+            Cond::Not(inner) => !inner.eval(facts),
+            leaf => facts(leaf),
+        }
+    }
+}
+
+fn cond(value: &Value, span: Span) -> Result<Cond, Error> {
+    let name = |action: &Action| text(action, 0);
+    Ok(match value {
+        Value::Bool(value) => Cond::Always(*value),
+        Value::Action(action) => match action.kind.as_str() {
+            "touched" => Cond::Touched(name(action)?),
+            "selected" => Cond::Selected(name(action)?),
+            "signal" => Cond::Signal(name(action)?),
+            "and" | "or" => {
+                let left = Box::new(cond(&action.args[0], span)?);
+                let right = Box::new(cond(&action.args[1], span)?);
+                if action.kind == "and" {
+                    Cond::And(left, right)
+                } else {
+                    Cond::Or(left, right)
+                }
+            }
+            "not" => Cond::Not(Box::new(cond(&action.args[0], span)?)),
+            other => {
+                return Err(Error::at(
+                    action.span,
+                    format!(
+                        "`when` takes touched(...), selected(...), signal(...), and, or, not — not `{other}`"
+                    ),
+                ));
+            }
+        },
+        other => {
+            return Err(Error::at(
+                span,
+                format!("`when` must be a condition, not a {}", other.type_name()),
+            ));
+        }
+    })
+}
+
+/// A named set of paths for conditions and notes; nothing runs for it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Group {
+    pub name: String,
+    pub owns: Vec<String>,
+    /// Shown in the plan when the group is touched, e.g. `no-heavy:docs`.
+    pub note: Option<String>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Check {
     pub name: String,
@@ -142,6 +216,8 @@ pub struct Check {
     pub profiles: Vec<String>,
     /// Checks that already run this one: with one of them in a plan, this one is dropped.
     pub covered_by: Vec<String>,
+    /// Selected only when this holds (and, with `owns`, a path it owns changed).
+    pub when: Option<Cond>,
     pub span: Span,
 }
 
@@ -191,6 +267,9 @@ pub struct Project {
     pub pool: Option<Pool>,
     pub after_merge: Vec<String>,
     pub commands: Vec<(String, String, String)>,
+    pub groups: Vec<Group>,
+    /// Prints `SIGNAL <name>` lines for the changed paths (in CITRUS_PATHS).
+    pub signals: Vec<String>,
     #[serde(skip)]
     pub releases: BTreeMap<String, crate::release::Unit>,
     #[serde(skip)]
@@ -208,6 +287,7 @@ const KINDS: &[&str] = &[
     "project",
     "planner",
     "command",
+    "group",
     "check",
     "task",
     "artifact",
@@ -231,10 +311,14 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                         "check_env",
                         "after_merge",
                         "profiles",
+                        "signals",
                     ],
                 )?;
                 project.base = optional_string(decl, "base")?;
                 project.profiles = strings(decl, "profiles")?;
+                if let Some(Value::Action(action)) = decl.field("signals") {
+                    project.signals = argv(action)?;
+                }
                 project.logs = optional_string(decl, "logs")?;
                 project.toolchain = strings(decl, "toolchain")?;
                 project.receipts = optional_string(decl, "receipts")?;
@@ -319,6 +403,16 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     },
                 });
             }
+            "group" => {
+                known_fields(decl, &["owns", "note"])?;
+                let name = label(decl)?;
+                project.groups.push(Group {
+                    owns: unique(strings(decl, "owns")?),
+                    note: optional_string(decl, "note")?,
+                    name,
+                    span: decl.span,
+                });
+            }
             "command" => {
                 known_fields(decl, &["about", "group"])?;
                 project.commands.push((
@@ -341,6 +435,7 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                         "env",
                         "profiles",
                         "covered_by",
+                        "when",
                     ],
                 )?;
                 let name = label(decl)?;
@@ -359,10 +454,14 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     ));
                 }
                 let owns = unique(strings(decl, "owns")?);
-                if owns.is_empty() {
+                let when = match decl.field("when") {
+                    None => None,
+                    Some(value) => Some(cond(value, decl.field_span("when"))?),
+                };
+                if owns.is_empty() && when.is_none() {
                     return Err(
                         Error::at(decl.span, format!("check \"{name}\" owns no files")).help(
-                            "add `owns = [\"path/**\"]`: changing those files selects the check",
+                            "add `owns = [\"path/**\"]` (changing those files selects it) or `when = …`",
                         ),
                     );
                 }
@@ -384,6 +483,7 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     resources: strings(decl, "resources")?,
                     profiles: strings(decl, "profiles")?,
                     covered_by: strings(decl, "covered_by")?,
+                    when,
                     meta: match decl.field("meta") {
                         None => BTreeMap::new(),
                         Some(value @ Value::Map(_)) => {

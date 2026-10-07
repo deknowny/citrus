@@ -21,6 +21,7 @@ project {
   receipts = "citrus/receipts"          # PASS receipts, relative to the Git common directory
   check_env = { "test-api": { SQLX_OFFLINE: "true" } }   # extra environment per check
   profiles = ["fast", "e2e"]  # check profiles (`--profile`); the first is the default
+  signals = run("scripts/classify")  # prints SIGNAL lines for CITRUS_PATHS (docs/design/planner.md)
   after_merge = run("scripts/after-merge", before)       # after `citrus integrate` merged
 }
 
@@ -48,6 +49,8 @@ pool "builders" {             # runs the whole planned set elsewhere (optional)
   status_prefix = "BUILDER "  # its lines describing one resource each (key=value fields)
   refresh = 1m                # snapshot age before a background refresh
 }
+
+group "docs" { owns = ["**/*.md"], note = "no-heavy:docs" }   # path set for `when`, notes
 
 command "make deploy" { about = "Roll out the verified release", group = "release" }
 ```

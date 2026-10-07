@@ -22,6 +22,10 @@ pub struct Plan {
     /// (path, surfaces or `target:<name>`).
     pub mapped: Vec<(String, String)>,
     pub unmapped: Vec<String>,
+    /// Groups the changed paths touch (built-in planner).
+    pub groups: Vec<String>,
+    /// Signals the project's signal command printed.
+    pub signals: Vec<String>,
 }
 
 pub fn compute(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<Plan> {
@@ -147,7 +151,7 @@ pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &st
 fn for_paths_all(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
     let config = &repo.config.plan;
     if config.command.is_empty() {
-        return Ok(select(repo, manifest, paths.to_vec(), before));
+        return select(repo, manifest, paths.to_vec(), before);
     }
     if config.paths_arg.is_empty() {
         bail!("the planner takes no path list (`paths_var` of `planner` in citrus.ci)");
@@ -217,11 +221,11 @@ fn external(repo: &Repo, manifest: &Manifest, extra: Option<String>) -> Result<P
 fn builtin(repo: &Repo, manifest: &Manifest, base: &str) -> Result<Plan> {
     let fork = fork_point(repo, base);
     let paths = changed_paths(repo, &fork)?;
-    Ok(select(repo, manifest, paths, &fork))
+    select(repo, manifest, paths, &fork)
 }
 
 /// Declared targets owning `paths`; new or edited declarations since `before` too.
-fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> Plan {
+fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> Result<Plan> {
     let mut plan = Plan {
         files: paths.len(),
         ..Plan::default()
@@ -248,35 +252,131 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> P
         }
         plan.targets.extend(changed);
     }
-    for path in paths {
-        if edited.contains(&path) {
+    // Which groups and checks the changed paths touch.
+    let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in &paths {
+        if edited.contains(path) {
             continue;
         }
-        let owners = manifest.owners(&path);
-        if owners.is_empty() {
-            plan.unmapped.push(path);
+        let owners = manifest.owners(path);
+        let groups: Vec<&str> = manifest
+            .groups
+            .iter()
+            .filter(|group| group.owns(path))
+            .map(|group| group.name.as_str())
+            .collect();
+        if owners.is_empty() && groups.is_empty() {
+            plan.unmapped.push(path.clone());
             continue;
         }
-        for owner in &owners {
-            if !plan.targets.iter().any(|known| known == owner) {
-                plan.targets.push((*owner).to_owned());
-            }
-        }
+        touched.extend(owners.iter().map(|name| (*name).to_owned()));
+        touched.extend(groups.iter().map(|name| (*name).to_owned()));
         plan.mapped.push((
-            path,
+            path.clone(),
             owners
                 .iter()
                 .map(|owner| format!("target:{owner}"))
+                .chain(groups.iter().map(|group| format!("group:{group}")))
                 .collect::<Vec<_>>()
                 .join(","),
         ));
+    }
+    let signals = signals(repo, manifest, &paths)?;
+    // Owners whose condition holds, and checks selected by condition alone;
+    // repeated until stable because conditions may name selected checks.
+    let mut selected: Vec<String> = plan.targets.clone();
+    for _ in 0..manifest.targets.len() + 1 {
+        let mut added = false;
+        let mut ordered: Vec<&crate::manifest::Target> = manifest.targets.values().collect();
+        ordered.sort_by_key(|target| target.position);
+        for target in ordered {
+            if selected.contains(&target.name) {
+                continue;
+            }
+            if !target.inputs.is_empty() && !touched.contains(&target.name) {
+                continue;
+            }
+            let holds = target.when.as_ref().is_none_or(|when| {
+                when.eval(&|fact| match fact {
+                    crate::lang::compile::Cond::Touched(name) => touched.contains(name),
+                    crate::lang::compile::Cond::Selected(name) => selected.contains(name),
+                    crate::lang::compile::Cond::Signal(name) => signals.contains(name),
+                    _ => false,
+                })
+            });
+            if holds {
+                selected.push(target.name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    plan.targets = selected;
+    plan.groups = manifest
+        .groups
+        .iter()
+        .filter(|group| touched.contains(&group.name))
+        .map(|group| group.name.clone())
+        .collect();
+    plan.signals = signals.clone();
+    for group in &manifest.groups {
+        if let Some(note) = group
+            .note
+            .as_ref()
+            .filter(|_| touched.contains(&group.name))
+            && !plan.notes.contains(note)
+        {
+            plan.notes.push(note.clone());
+        }
     }
     plan.status = if plan.unmapped.is_empty() {
         "complete".into()
     } else {
         "partial".into()
     };
-    plan
+    Ok(plan)
+}
+
+/// Signals of the project's signal command for these paths (`SIGNAL <name>` lines).
+fn signals(repo: &Repo, manifest: &Manifest, paths: &[String]) -> Result<Vec<String>> {
+    let Some((program, args)) = manifest.signals.split_first() else {
+        return Ok(Vec::new());
+    };
+    let dir = repo.state_dir().join("tmp");
+    crate::repo::private_dir(&dir)?;
+    let file = dir.join(format!(
+        "signal-paths-{}-{}",
+        std::process::id(),
+        crate::manifest::now()
+    ));
+    std::fs::write(
+        &file,
+        paths
+            .iter()
+            .map(|path| format!("{path}\n"))
+            .collect::<String>(),
+    )?;
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(&repo.root)
+        .env("CITRUS_PATHS", &file)
+        .output();
+    let _ = std::fs::remove_file(&file);
+    let output = output?;
+    if !output.status.success() {
+        bail!(
+            "signal command {} failed: {}",
+            manifest.signals.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("SIGNAL "))
+        .map(|name| name.trim().to_owned())
+        .collect())
 }
 
 pub fn parse(output: &str) -> Plan {

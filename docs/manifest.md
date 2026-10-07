@@ -12,6 +12,7 @@ check "test-api" {
   meta = { linux: true }            # data for the project's own tools, kept as written
   profiles = ["fast"]               # only in these profiles (docs/design/planner.md)
   covered_by = ["test-all"]         # dropped when one of these is in the plan
+  when = signal("product:api")      # plan-time condition (docs/design/planner.md)
 }
 ```
 
