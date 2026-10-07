@@ -89,7 +89,7 @@ environment production = kubernetes(context: "prod", namespace: "api") { … }
 | `profile name` | a set of checks run together (`--profile`); the first one is the default; `env { }` applies to its checks |
 | `service name [= action] { ready, limit }` | something checks `need`: started by Citrus when it has an action, otherwise a resource the runner provides, `limit` at a time |
 | `runner name = action { status }` | runs the planned checks elsewhere (docs/protocol.md) |
-| `group name { paths, env, check … }` | a set of paths and the checks that protect it |
+| `group name { paths, needs, env, check … }` | a set of paths and the checks that protect it; its checks inherit `needs` and `env` |
 | `check name = action { … }` | a check; inside a group it is called `group.name` |
 | `label name { when }` | a named condition reported with the plan |
 | `task name = actions` | `citrus do name` |

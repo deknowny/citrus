@@ -2320,12 +2320,9 @@ service database = run("sh", "-c", "echo started >> .scratch/db; touch .scratch/
 
 group db {
   paths = ["db/**"]
-  check one = make("ok") {
-    needs = [database]
-  }
-  check two = make("ok") {
-    needs = [database]
-  }
+  needs = [database]
+  check one = make("ok")
+  check two = make("ok")
 }
 "#,
     );

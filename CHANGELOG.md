@@ -27,6 +27,7 @@ Every element does something, names are bare, data is quoted:
   `let main = ["**", "!clyer/**"]`); `paths - other` excludes `other`.
 - `replaces = [parts]`: one check instead of several parts when the change
   goes beyond one of them.
+- A group's `needs` and `env { }` reach every check in it.
 - Profiles are declarations with their own `env { }`; `profiles` and
   `check_env` are gone.
 - Services: started once before the first local check that needs them, or

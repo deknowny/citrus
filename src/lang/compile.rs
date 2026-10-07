@@ -347,6 +347,7 @@ struct Scope<'a> {
     name: &'a str,
     paths: &'a [String],
     env: &'a [(String, String)],
+    needs: &'a [String],
 }
 
 pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
@@ -476,7 +477,7 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     .push((name, cond(value, decl.field_span("when"))?));
             }
             "group" => {
-                known_fields(decl, &["paths"])?;
+                known_fields(decl, &["paths", "needs"])?;
                 known_children(decl, &["check", "env"])?;
                 let name = label(decl)?;
                 if project.groups.iter().any(|group| group.name == name) {
@@ -493,10 +494,12 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     name: name.clone(),
                     span: decl.span,
                 });
+                let group_needs = references(decl, "needs")?;
                 let scope = Scope {
                     name: &name,
                     paths: &paths,
                     env: &env,
+                    needs: &group_needs,
                 };
                 for child in decl.children.iter().filter(|child| child.kind == "check") {
                     compile_check(child, Some(&scope), &mut project, &mut covers, &mut needs)?;
@@ -916,7 +919,12 @@ fn compile_check(
     };
     let covered = qualify(references(decl, "covers")?);
     let replaces = qualify(references(decl, "replaces")?);
-    let required = references(decl, "needs")?;
+    let mut required: Vec<String> = group.map(|group| group.needs.to_vec()).unwrap_or_default();
+    for name in references(decl, "needs")? {
+        if !required.contains(&name) {
+            required.push(name);
+        }
+    }
     let meta = match decl.field("meta") {
         None => BTreeMap::new(),
         Some(value @ Value::Map(_)) => match to_json(value, decl.field_span("meta"))? {
