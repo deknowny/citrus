@@ -26,6 +26,8 @@ pub struct Plan {
     pub groups: Vec<String>,
     /// Signals the project's signal command printed.
     pub signals: Vec<String>,
+    /// Labels whose condition holds.
+    pub labels: Vec<String>,
 }
 
 pub fn compute(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<Plan> {
@@ -260,9 +262,12 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> R
             continue;
         }
         let owners = manifest.owners(path);
+        // A path a check owns is that check's: it touches only the groups
+        // that feed conditions (claims = false), not the claiming ones.
         let groups: Vec<&str> = manifest
             .groups
             .iter()
+            .filter(|group| owners.is_empty() || !group.claims)
             .filter(|group| {
                 group.owns(path)
                     || found
@@ -335,6 +340,19 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> R
         .iter()
         .filter(|group| touched.contains(&group.name))
         .map(|group| group.name.clone())
+        .collect();
+    plan.labels = manifest
+        .labels
+        .iter()
+        .filter(|(_, when)| {
+            when.eval(&|fact| match fact {
+                crate::lang::compile::Cond::Touched(name) => touched.contains(name),
+                crate::lang::compile::Cond::Selected(name) => plan.targets.contains(name),
+                crate::lang::compile::Cond::Signal(name) => signals.contains(name),
+                _ => false,
+            })
+        })
+        .map(|(name, _)| name.clone())
         .collect();
     plan.signals = signals.clone();
     for group in &manifest.groups {

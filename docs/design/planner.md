@@ -93,6 +93,10 @@ check "test-clyer-pipeline-contract" {
 - `claims = false`: the group feeds conditions only; a path that only such
   groups contain stays unmapped (`group "main" { owns = ["**", "!clyer/**"],
   claims = false }`).
+- A path a check owns belongs to that check: it touches only groups with
+  `claims = false`, never the claiming ones.
+- `label "name" { when = … }` reports a named condition with the plan
+  (`labels`), for tools that need the plan's character (Garvis' scope).
 - Declaring a group again adds paths: a path belongs to the group when any
   declaration matches it (each with its own `!` exclusions).
 

@@ -270,6 +270,8 @@ pub struct Project {
     pub after_merge: Vec<String>,
     pub commands: Vec<(String, String, String)>,
     pub groups: Vec<Group>,
+    /// Named conditions reported with the plan (`label "scope:main" { when = … }`).
+    pub labels: Vec<(String, Cond)>,
     /// Prints `SIGNAL <name>` lines for the changed paths (in CITRUS_PATHS).
     pub signals: Vec<String>,
     #[serde(skip)]
@@ -290,6 +292,7 @@ const KINDS: &[&str] = &[
     "planner",
     "command",
     "group",
+    "label",
     "check",
     "task",
     "artifact",
@@ -404,6 +407,19 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                         _ => 60,
                     },
                 });
+            }
+            "label" => {
+                known_fields(decl, &["when"])?;
+                let name = label(decl)?;
+                let Some(value) = decl.field("when") else {
+                    return Err(Error::at(
+                        decl.span,
+                        format!("label \"{name}\" needs `when = …`"),
+                    ));
+                };
+                project
+                    .labels
+                    .push((name, cond(value, decl.field_span("when"))?));
             }
             "group" => {
                 known_fields(decl, &["owns", "note", "claims"])?;

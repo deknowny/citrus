@@ -130,6 +130,8 @@ pub struct Manifest {
     pub groups: Vec<PathGroup>,
     /// Prints `SIGNAL <name>` lines for changed paths.
     pub signals: Vec<String>,
+    /// Named conditions reported with a plan.
+    pub labels: Vec<(String, crate::lang::compile::Cond)>,
 }
 
 /// A named path set; declaring a group again adds paths (each declaration's
@@ -185,6 +187,7 @@ impl Manifest {
             files: project.files.clone(),
             groups,
             signals: project.signals.clone(),
+            labels: project.labels.clone(),
         })
     }
 

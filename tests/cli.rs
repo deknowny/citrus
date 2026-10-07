@@ -2159,6 +2159,7 @@ check "clyer-pipeline" { when = touched("pipeline") and touched("clyer") and not
 check "mixed-pipeline" { when = touched("pipeline") and touched("main") and touched("clyer"), run = make("ok") }
 check "backend" { owns = ["crates/**"], when = signal("product:garvis"), run = make("ok") }
 check "after-backend" { when = selected("backend"), run = make("ok") }
+label "scope:mixed" { when = touched("clyer") and touched("main") }
 "#,
     );
     // Paths under crates/ mean the garvis product unless they name clyer.
