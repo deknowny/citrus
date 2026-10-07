@@ -2069,6 +2069,12 @@ label scope-mixed {
     assert_eq!(plan["arms"]["pipeline.contract"], 0, "{plan}");
     let plan = plan_for(&[("scripts/run.sh", "y\n"), ("README.md", "x\n")]);
     assert_eq!(plan["arms"]["pipeline.contract"], 1, "{plan}");
+    let (full, _) = project.json(&["plan"]);
+    assert_eq!(
+        full["run"]["pipeline.contract"],
+        serde_json::json!([["run", "make", "--no-print-directory", "plain"]]),
+        "{full}"
+    );
     assert_eq!(plan["unmapped"], serde_json::json!([]), "{plan}");
     let plan = plan_for(&[("scripts/run.sh", "z\n"), ("clyer/bot.rs", "x\n")]);
     assert_eq!(

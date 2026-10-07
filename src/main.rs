@@ -918,7 +918,16 @@ fn plan_command(
         .map(|name| context.decide(&files, &snapshot, name, false))
         .collect::<Result<Vec<_>>>()?;
     if json {
-        let value = json!({"schema": SCHEMA, "plan": plan, "targets": decisions});
+        // What each planned check runs, with its `match changed` arm chosen.
+        let runs: serde_json::Map<String, serde_json::Value> = plan
+            .targets
+            .iter()
+            .filter_map(|name| {
+                let target = context.manifest.targets.get(name)?;
+                Some((name.clone(), target.declaration()["run"].clone()))
+            })
+            .collect();
+        let value = json!({"schema": SCHEMA, "plan": plan, "targets": decisions, "run": runs});
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(0);
     }
@@ -2034,7 +2043,7 @@ fn check_command(context: &Context, json: bool) -> Result<i32> {
         );
     }
     println!(
-        "✓ citrus.ci: {} checks, {} tasks{}",
+        "✓ configuration: {} checks, {} tasks{}",
         project.checks.len(),
         project.tasks.len(),
         if project.warnings.is_empty() {
