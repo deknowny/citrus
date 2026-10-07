@@ -1027,3 +1027,44 @@ fn version_names_the_source_commit() {
         .unwrap_or_default();
     assert!(!commit.is_empty() && commit != "unknown", "{text}");
 }
+
+#[test]
+fn logs_and_state_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = Project::new("log_dir = \".private/logs\"\n");
+    project.write(".gitignore", ".citrus/\n.private/\n");
+    project.json(&["run", "ok"]);
+    for dir in [".private", ".private/logs", ".git/citrus"] {
+        let mode = fs::metadata(project.root().join(dir))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{dir}");
+    }
+}
+
+#[test]
+fn an_external_planner_that_saw_nothing_cannot_pass_unmerged_commits() {
+    // The planner reports zero changed files although the branch is ahead of the base.
+    let config = "[plan]\ncommand = [\"sh\", \"-c\", \"printf 'PLAN\\\\tstatus=complete\\\\tfiles=0\\\\n'\"]\nbase = \"main\"\n";
+    let project = Project::new(config);
+    project.git(&["checkout", "-q", "-b", "feature"]);
+    project.write("src/a.txt", "changed\n");
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "change",
+    ]);
+    let refused = project.json(&["run"]).0;
+    assert!(
+        refused["error"].as_str().unwrap().contains("--base main"),
+        "{refused}"
+    );
+    project.git(&["checkout", "-q", "main"]);
+    assert_eq!(project.json(&["run"]).0["run"]["state"], "passed");
+}

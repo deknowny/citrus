@@ -377,7 +377,7 @@ impl Receipts {
     }
 
     pub fn write(&self, target: &str, fingerprint: &str) -> Result<()> {
-        fs::create_dir_all(&self.dir)?;
+        crate::repo::private_dir(&self.dir)?;
         fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
         let path = self.path(target, fingerprint);
         let temporary = self

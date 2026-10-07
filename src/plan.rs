@@ -45,7 +45,7 @@ pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &st
         bail!("the planner takes no path list (plan.paths_arg in citrus.toml)");
     }
     let dir = repo.state_dir().join("tmp");
-    std::fs::create_dir_all(&dir)?;
+    crate::repo::private_dir(&dir)?;
     let file = dir.join(format!(
         "paths-{}-{}",
         std::process::id(),

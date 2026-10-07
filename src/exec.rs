@@ -158,7 +158,14 @@ impl Context {
         let names = if explicit {
             request.targets.clone()
         } else {
-            plan::compute(&self.repo, &self.manifest, request.base.as_deref())?.targets
+            let plan = plan::compute(&self.repo, &self.manifest, request.base.as_deref())?;
+            if plan.targets.is_empty()
+                && plan.files == 0
+                && !self.repo.config.plan.command.is_empty()
+            {
+                self.refuse_empty_plan(request.base.as_deref())?;
+            }
+            plan.targets
         };
         let files = self.repo.files()?;
         let snapshot = self.repo.snapshot()?;
@@ -198,7 +205,7 @@ impl Context {
         };
         let started = now();
         let id = format!("r-{}-{:04x}", compact_utc(started), random16());
-        fs::create_dir_all(self.repo.log_dir())?;
+        crate::repo::private_dir(&self.repo.log_dir())?;
         let log = self.repo.log_dir().join(format!("{id}.log"));
         let mut run = Run {
             id: id.clone(),
@@ -256,6 +263,26 @@ impl Context {
             });
         }
         Ok(i64::from(command.spawn()?.id()))
+    }
+
+    /// "Nothing to check" is only true if HEAD has nothing the base lacks. A
+    /// planner comparing against another base (or HEAD itself) must not turn
+    /// unmerged work into a green result.
+    fn refuse_empty_plan(&self, base: Option<&str>) -> Result<()> {
+        let base = base.unwrap_or(&self.repo.config.plan.base);
+        let Ok(ahead) = self
+            .repo
+            .git(&["rev-list", "--count", &format!("{base}..HEAD")])
+        else {
+            return Ok(());
+        };
+        let ahead: u64 = ahead.parse().unwrap_or(0);
+        if ahead > 0 {
+            bail!(
+                "the planner saw no changed files, but HEAD has {ahead} commits that {base} lacks — it compared against another base; run with --base {base}"
+            );
+        }
+        Ok(())
     }
 
     /// An unfinished run over the same sources that already covers `names`:

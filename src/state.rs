@@ -1,6 +1,5 @@
 //! Shared SQLite state: runs, their targets and the evidence they produced.
 
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -214,7 +213,7 @@ pub struct Store {
 
 impl Store {
     pub fn open(dir: &Path) -> Result<Store> {
-        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        crate::repo::private_dir(dir)?;
         let conn = Connection::open(dir.join("state.db"))?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;

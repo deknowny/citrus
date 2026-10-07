@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Log, state and receipt directories are created owner-only (0700); a group-readable state dir broke a consumer's builder pool in fresh worktrees.
+- `run` refuses a "nothing to check" from an external planner that saw no changed files while HEAD has commits the base lacks (it compared against another base) instead of passing.
+
 - `citrus --version` and `citrus doctor` show the commit the binary was built from (`CITRUS_BUILD_COMMIT`, or Git at build time; `-dirty` for local changes).
 
 - `[integrate] after_merge` hook (`{before}`); `--push` never forces, follows tags or recurses into submodules.

@@ -281,7 +281,7 @@ pub fn start(context: &Context, request: &Start) -> Result<Release> {
         crate::exec::random16()
     );
     let log = repo.log_dir().join(format!("{id}.log"));
-    fs::create_dir_all(repo.log_dir())?;
+    crate::repo::private_dir(&repo.log_dir())?;
     let (version, previous) = if request.rollback {
         // Roll back to the release before the last passed one.
         let history = context.store.releases_of(&request.unit, 50)?;

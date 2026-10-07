@@ -105,7 +105,7 @@ impl Repo {
     /// untracked non-ignored files. Equal ids mean byte-identical sources.
     pub fn snapshot(&self) -> Result<String> {
         let dir = self.state_dir().join("tmp");
-        fs::create_dir_all(&dir)?;
+        private_dir(&dir)?;
         let index = dir.join(format!(
             "index-{}-{}",
             std::process::id(),
@@ -147,6 +147,17 @@ impl Repo {
             .map(|out| out.lines().map(str::to_owned).collect())
             .unwrap_or_default()
     }
+}
+
+/// Create `path` and missing parents readable by the owner only: logs and
+/// state may hold command output, and tools often refuse group-readable state.
+pub fn private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .map_err(|error| anyhow::anyhow!("create {}: {error}", path.display()))
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
