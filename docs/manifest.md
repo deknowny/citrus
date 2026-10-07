@@ -17,6 +17,10 @@ check "test-api" {
 - Globs are repository-relative: `*` and `?` stay inside one path segment,
   `**` matches anything, `**/` matches zero or more whole directories.
   Absolute paths and `..` are rejected; a glob matching no file is reported.
+- `!glob` excludes: in each of `owns` and `reads`, the last glob that
+  matches a path decides, as in `.gitignore`
+  (`["crates/backend/**", "!crates/backend/src/bots/clyer/**"]`). Tools
+  computing the fingerprint apply the same rule when they select files.
 - `owns` must be non-empty and `run` must name something to run.
 - Set `cache = true` only when `owns` + `reads` list **everything** the check
   reads. An undeclared input makes a reused PASS false. For a Rust check,

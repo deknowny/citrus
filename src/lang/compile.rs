@@ -454,7 +454,11 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
 }
 
 /// First occurrence of each entry, in order (input lists are often joined).
+/// Lists with exclusions keep their order exactly: a later entry may re-include.
 fn unique(items: Vec<String>) -> Vec<String> {
+    if items.iter().any(|item| item.starts_with('!')) {
+        return items;
+    }
     let mut seen = std::collections::BTreeSet::new();
     items
         .into_iter()

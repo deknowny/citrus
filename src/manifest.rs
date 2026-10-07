@@ -29,24 +29,41 @@ pub struct Target {
     pub steps: Vec<crate::lang::compile::Step>,
     /// `file:line` of the declaration in `citrus.ci`.
     pub source: Option<String>,
-    owned: Vec<Glob>,
-    all: Vec<Glob>,
+    owned: GlobList,
+    extra: GlobList,
+}
+
+/// Globs in order; `!glob` removes matches of the globs before it, and the
+/// last glob that matches a path decides (like `.gitignore`).
+#[derive(Debug, Clone, Default)]
+pub struct GlobList(Vec<(bool, Glob)>);
+
+impl GlobList {
+    pub fn new(patterns: &[String]) -> Result<GlobList> {
+        patterns
+            .iter()
+            .map(|pattern| match pattern.strip_prefix('!') {
+                Some(rest) => Ok((false, Glob::new(rest)?)),
+                None => Ok((true, Glob::new(pattern)?)),
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(GlobList)
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        self.0
+            .iter()
+            .rev()
+            .find(|(_, glob)| glob.matches(path))
+            .is_some_and(|(include, _)| *include)
+    }
 }
 
 impl Target {
     /// A check declared in `citrus.ci`.
     pub fn declared(check: &crate::lang::compile::Check, source: String) -> Result<Target> {
-        let owned = check
-            .owns
-            .iter()
-            .map(|pattern| Glob::new(pattern))
-            .collect::<Result<Vec<_>>>()?;
-        let all = check
-            .owns
-            .iter()
-            .chain(&check.reads)
-            .map(|pattern| Glob::new(pattern))
-            .collect::<Result<Vec<_>>>()?;
+        let owned = GlobList::new(&check.owns)?;
+        let extra = GlobList::new(&check.reads)?;
         Ok(Target {
             name: check.name.clone(),
             description: check.description.clone(),
@@ -59,7 +76,7 @@ impl Target {
             steps: check.steps.clone(),
             source: Some(source),
             owned,
-            all,
+            extra,
         })
     }
 
@@ -84,11 +101,11 @@ impl Target {
     }
 
     pub fn owns(&self, path: &str) -> bool {
-        self.owned.iter().any(|glob| glob.matches(path))
+        self.owned.matches(path)
     }
 
     pub fn reads(&self, path: &str) -> bool {
-        self.all.iter().any(|glob| glob.matches(path))
+        self.owned.matches(path) || self.extra.matches(path)
     }
 }
 
@@ -176,8 +193,9 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 /// Whether `pattern` (a manifest glob) matches at least one of `files`.
+/// An exclusion (`!glob`) is checked for what it excludes.
 pub fn pattern_matches_any(pattern: &str, files: &[String]) -> Result<bool> {
-    let glob = Glob::new(pattern)?;
+    let glob = Glob::new(pattern.strip_prefix('!').unwrap_or(pattern))?;
     Ok(files.iter().any(|path| glob.matches(path)))
 }
 
@@ -437,6 +455,20 @@ mod tests {
         assert!(!glob("a?c", "a/c"));
         assert!(Glob::new("/abs").is_err());
         assert!(Glob::new("a/../b").is_err());
+    }
+
+    #[test]
+    fn exclusions_follow_the_last_matching_glob() {
+        let list = GlobList::new(&[
+            "crates/backend/**".into(),
+            "!crates/backend/src/bots/clyer/**".into(),
+            "crates/backend/src/bots/clyer/shared.rs".into(),
+        ])
+        .unwrap();
+        assert!(list.matches("crates/backend/src/main.rs"));
+        assert!(!list.matches("crates/backend/src/bots/clyer/mod.rs"));
+        assert!(list.matches("crates/backend/src/bots/clyer/shared.rs"));
+        assert!(!list.matches("crates/other/x.rs"));
     }
 
     #[test]

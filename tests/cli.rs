@@ -2070,3 +2070,28 @@ fn a_submodule_path_is_a_valid_input() {
         "{doctor}"
     );
 }
+
+#[test]
+fn an_excluded_path_neither_selects_nor_invalidates_a_check() {
+    let project = Project::new(
+        "check \"lib\" { owns = [\"lib/**\", \"!lib/vendor/**\"], run = make(\"ok\"), cache = true }\n",
+    );
+    project.write("lib/a.txt", "a\n");
+    project.write("lib/vendor/b.txt", "b\n");
+    project.commit("lib");
+    assert_eq!(
+        target(&project.json(&["run", "lib"]).0, "lib")["result"],
+        "passed"
+    );
+    project.write("lib/vendor/b.txt", "changed\n");
+    assert_eq!(
+        target(&project.json(&["run", "lib"]).0, "lib")["result"],
+        "reused"
+    );
+    let (plan, _) = project.json(&["plan", "--base", "HEAD"]);
+    assert_eq!(
+        plan["plan"]["unmapped"],
+        serde_json::json!(["lib/vendor/b.txt"]),
+        "{plan}"
+    );
+}
