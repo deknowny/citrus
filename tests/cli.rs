@@ -1858,3 +1858,40 @@ fn an_artifact_ignores_dockerfile_stages_it_is_not_built_from() {
         "a stage the target copies from must change the key"
     );
 }
+
+#[test]
+fn release_steps_run_built_in_actions_with_a_version_given_by_hand() {
+    let project = Project::new(
+        r#"
+release "site" {
+  environment = "web"
+  checks = none
+  step "build" { run = [copy("src/a.txt", "out/{version}.txt"), links.check("*.md")] }
+}
+"#,
+    );
+    project.write(".gitignore", ".citrus/\nout/\n");
+    project.write("README.md", "[source](src/a.txt)\n");
+    project.commit("site");
+    let refused = project.json(&["release", "start", "site"]).0;
+    assert!(
+        refused["error"].as_str().unwrap().contains("--version"),
+        "{refused}"
+    );
+    let (released, code) = project.json(&["release", "start", "site", "--version", "2.0.0"]);
+    assert_eq!(code, 0, "{released}");
+    assert_eq!(released["release"]["version"], "2.0.0", "{released}");
+    assert!(project.root().join("out/2.0.0.txt").exists());
+
+    project.write("README.md", "[gone](src/missing.txt)\n");
+    project.commit("broken link");
+    let (failed, code) = project.json(&["release", "start", "site", "--version", "2.0.1"]);
+    assert_eq!(code, 1, "{failed}");
+    assert!(
+        step(&failed, "build")["first_error"]
+            .as_str()
+            .unwrap()
+            .contains("src/missing.txt"),
+        "{failed}"
+    );
+}

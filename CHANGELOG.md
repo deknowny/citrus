@@ -32,6 +32,14 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
   Dockerfile counts in the key only with the stages the target is built from
   (`FROM <stage>`, `COPY --from=`, `--mount=…,from=`), so another product's
   stage no longer asks for a rebuild.
+- Release steps run built-in actions too (`wait.http`, `copy`,
+  `links.check`, …), not only commands; `release start --version X` releases
+  a version given by hand (no `version` step).
+- `links.check(glob)`: relative links in Markdown point at existing files.
+- `integrate --push` retries a push the remote failed (GitHub 5xx) and no
+  longer reports it as a moved base.
+- Citrus releases itself through `release "github"` in its own `citrus.ci`;
+  its Makefile and scripts are gone.
 - `citrus add` appends a `check` block to `citrus.ci` (and creates the file).
 - `apply` records a release on a workload that already runs the built image
   without touching its pod template, so nothing restarts for an identical build.

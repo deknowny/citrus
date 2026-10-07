@@ -18,7 +18,7 @@ pub struct Step {
     pub work: Work,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Work {
     Process {
         argv: Vec<String>,
@@ -41,9 +41,67 @@ pub enum Work {
         from: String,
         to: String,
     },
+    /// Relative links in Markdown files matching `pattern` point at existing files.
+    LinksCheck {
+        pattern: String,
+    },
 }
 
 impl Work {
+    /// Short human form, e.g. `make test-api` or `wait.tcp localhost:5432`.
+    pub fn label(&self) -> String {
+        match self {
+            Work::Process { argv, .. } => argv
+                .iter()
+                .filter(|part| *part != "--no-print-directory")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" "),
+            Work::WaitTcp { address, .. } => format!("wait.tcp {address}"),
+            Work::WaitHttp { url, .. } => format!("wait.http {url}"),
+            Work::WaitFile { path, .. } => format!("wait.file {path}"),
+            Work::Copy { from, to } => format!("copy {from} → {to}"),
+            Work::LinksCheck { pattern } => format!("links.check {pattern}"),
+        }
+    }
+
+    /// The same work with every text passed through `apply` (runtime values).
+    pub fn map_text(&self, apply: impl Fn(&str) -> String) -> Work {
+        match self {
+            Work::Process {
+                argv,
+                env,
+                portable,
+            } => Work::Process {
+                argv: argv.iter().map(|part| apply(part)).collect(),
+                env: env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), apply(value)))
+                    .collect(),
+                portable: *portable,
+            },
+            Work::WaitTcp { address, timeout } => Work::WaitTcp {
+                address: apply(address),
+                timeout: *timeout,
+            },
+            Work::WaitHttp { url, timeout } => Work::WaitHttp {
+                url: apply(url),
+                timeout: *timeout,
+            },
+            Work::WaitFile { path, timeout } => Work::WaitFile {
+                path: apply(path),
+                timeout: *timeout,
+            },
+            Work::Copy { from, to } => Work::Copy {
+                from: apply(from),
+                to: apply(to),
+            },
+            Work::LinksCheck { pattern } => Work::LinksCheck {
+                pattern: apply(pattern),
+            },
+        }
+    }
+
     /// `[kind, arguments…]`, the documented form hashed into fingerprints.
     pub fn canonical(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -62,6 +120,7 @@ impl Work {
                 out.extend(["wait.file".into(), path.clone(), timeout.to_string()])
             }
             Work::Copy { from, to } => out.extend(["copy".into(), from.clone(), to.clone()]),
+            Work::LinksCheck { pattern } => out.extend(["links.check".into(), pattern.clone()]),
         }
         out
     }
@@ -668,25 +727,21 @@ fn step(action: &Action, env: &[(String, String)]) -> Result<Step, Error> {
             from: text(action, 0)?,
             to: text(action, 1)?,
         },
+        "links.check" => Work::LinksCheck {
+            pattern: if action.args.is_empty() {
+                "**/*.md".into()
+            } else {
+                text(action, 0)?
+            },
+        },
         other => {
             return Err(
                 Error::at(action.span, format!("`{other}` cannot be a step here yet"))
-                    .help("steps are run, make, sh, cargo.*, compose.*, wait.*, copy"),
+                    .help("steps are run, make, sh, cargo.*, compose.*, wait.*, copy, links.check"),
             );
         }
     };
-    let label = match &work {
-        Work::Process { argv, .. } => argv
-            .iter()
-            .filter(|part| *part != "--no-print-directory")
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" "),
-        Work::WaitTcp { address, .. } => format!("wait.tcp {address}"),
-        Work::WaitHttp { url, .. } => format!("wait.http {url}"),
-        Work::WaitFile { path, .. } => format!("wait.file {path}"),
-        Work::Copy { from, to } => format!("copy {from} → {to}"),
-    };
+    let label = work.label();
     Ok(Step {
         span: action.span,
         label,
@@ -786,6 +841,34 @@ pub fn execute(step: &Step, root: &Path, stdout_to_stderr: bool) -> anyhow::Resu
             }
             Ok(0)
         }
+        Work::LinksCheck { pattern } => {
+            let files = crate::repo::Repo::discover_at(root)?.files()?;
+            let mut broken = 0;
+            let mut checked = 0;
+            for file in &files {
+                if !crate::manifest::pattern_matches_any(pattern, std::slice::from_ref(file))? {
+                    continue;
+                }
+                checked += 1;
+                let text = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+                let dir = Path::new(file).parent().unwrap_or(Path::new(""));
+                for link in markdown_links(&text) {
+                    let target = link.split('#').next().unwrap_or_default();
+                    if target.is_empty() || target.contains("://") || target.starts_with("mailto:")
+                    {
+                        continue;
+                    }
+                    if !root.join(dir).join(target).exists() {
+                        eprintln!("{file}: broken link {link}");
+                        broken += 1;
+                    }
+                }
+            }
+            if broken == 0 {
+                eprintln!("links ok: {checked} files");
+            }
+            Ok(i32::from(broken > 0))
+        }
         Work::Copy { from, to } => {
             let target = root.join(to);
             if let Some(parent) = target.parent() {
@@ -795,6 +878,23 @@ pub fn execute(step: &Step, root: &Path, stdout_to_stderr: bool) -> anyhow::Resu
             Ok(0)
         }
     }
+}
+
+/// Targets of `[text](target)` links.
+fn markdown_links(text: &str) -> Vec<&str> {
+    let mut links = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("](") {
+        rest = &rest[start + 2..];
+        if let Some(end) = rest.find(')') {
+            let link = &rest[..end];
+            if !link.contains(char::is_whitespace) {
+                links.push(link);
+            }
+            rest = &rest[end..];
+        }
+    }
+    links
 }
 
 /// `citrus.ci` of a repository, compiled; None when there is no such file.
@@ -896,16 +996,62 @@ fn none_as_word(object: &mut serde_json::Map<String, serde_json::Value>, fields:
     }
 }
 
+/// Actions of a release step as JSON `Work` values: commands and built-in steps.
+fn works_json(value: &Value, span: Span) -> Result<serde_json::Value, Error> {
+    let items = match value {
+        Value::List(items) => items.clone(),
+        other => vec![other.clone()],
+    };
+    let works = items
+        .iter()
+        .map(|item| match item {
+            Value::Action(action) => Ok(step(action, &[])?.work),
+            other => Err(Error::at(
+                span,
+                format!(
+                    "expected actions such as make(\"…\"), not a {}",
+                    other.type_name()
+                ),
+            )),
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    serde_json::to_value(works).map_err(|error| Error::at(span, error.to_string()))
+}
+
+/// A release step or rollback: `run`/`recover` hold actions, other fields data.
+fn release_step_json(
+    fields: &[(String, Value, Span)],
+) -> Result<serde_json::Map<String, serde_json::Value>, Error> {
+    let mut object = serde_json::Map::new();
+    for (name, value, span) in fields {
+        let json = if name == "run" || name == "recover" {
+            works_json(value, *span)?
+        } else {
+            to_json(value, *span)?
+        };
+        object.insert(name.clone(), json);
+    }
+    Ok(object)
+}
+
 fn release_json(decl: &Decl) -> Result<serde_json::Value, Error> {
     no_children(decl, "step")?;
-    let mut object = fields_json(decl, &[])?;
+    let mut object = fields_json(decl, &["rollback"])?;
     none_as_word(&mut object, &["checks"]);
+    if let Some(Value::Map(entries)) = decl.field("rollback") {
+        let span = decl.field_span("rollback");
+        let fields: Vec<(String, Value, Span)> = entries
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone(), span))
+            .collect();
+        object.insert("rollback".into(), release_step_json(&fields)?.into());
+    }
     let steps = decl
         .children
         .iter()
         .map(|step| {
             no_children(step, "")?;
-            let mut fields = fields_json(step, &[])?;
+            let mut fields = release_step_json(&step.fields)?;
             fields.insert("name".into(), label(step)?.into());
             Ok(serde_json::Value::Object(fields))
         })

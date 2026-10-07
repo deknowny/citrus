@@ -28,14 +28,14 @@ check "lint" {
 
 check "docs" {
   about = "Relative links in Markdown point at existing files"
-  owns = ["*.md", "docs/**", "skills/**", "scripts/check-links.sh"]
-  run = run("./scripts/check-links.sh")
+  owns = ["*.md", "docs/**", "skills/**", "examples/**"]
+  run = links.check("**/*.md")
   cache = true
 }
 
 check "doctor" {
   about = "This repository's own Citrus configuration is valid"
-  owns = ["citrus.ci", "Makefile", "scripts/release.sh"]
+  owns = ["citrus.ci"]
   reads = rust + cargo_files
   run = run("cargo", "run", "--quiet", "--locked", "--", "doctor", "--text")
   cache = true
@@ -44,4 +44,32 @@ check "doctor" {
 task "fmt" {
   about = "Format the code"
   steps = [run("cargo", "fmt")]
+}
+
+# `citrus release start github --version X.Y.Z --approve`: tag a proven main
+# commit; the release workflow publishes the binaries and SHA256SUMS.
+release "github" {
+  about = "Tag a version and wait for its binaries"
+  environment = "github"
+  step "main" {
+    # Only a commit that is on origin/main, with its version and notes.
+    run = [
+      run("git", "fetch", "--quiet", "origin", "main"),
+      run("git", "merge-base", "--is-ancestor", "HEAD", "origin/main"),
+      run("grep", "-q", "^version = \"{version}\"", "Cargo.toml"),
+      run("grep", "-q", "^## {version} ", "CHANGELOG.md"),
+    ]
+  }
+  step "tag" {
+    production = true
+    run = [
+      run("git", "tag", "-a", "v{version}", "-m", "Citrus v{version}"),
+      run("git", "push", "--quiet", "origin", "v{version}"),
+    ]
+    # The tag may exist already: only push it.
+    recover = run("git", "push", "--quiet", "origin", "v{version}")
+  }
+  step "binaries" {
+    run = wait.http("https://github.com/deknowny/citrus/releases/download/v{version}/SHA256SUMS", timeout: 30m)
+  }
 }

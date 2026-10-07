@@ -279,7 +279,7 @@ inputs and why it was selected or reused.
 
 | Today | Lines | In `.ci` (sketch below, to be measured on the implementation) |
 |---|---|---|
-| Citrus's own setup: Makefile, citrus.toml, ci/targets.toml, two scripts | 96 | ~30 |
+| Citrus's own setup: Makefile, citrus.toml, ci/targets.toml, two scripts | 96 | 75 (measured: checks, a task and the GitHub release) |
 | Garvis Citrus config: citrus.toml + 4 TOML files | 284 | ~110 |
 | 15 MT3S component release scripts | 4,761 | one loop over components + shared provider code |
 

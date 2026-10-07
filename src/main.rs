@@ -224,6 +224,10 @@ enum ReleaseAction {
         /// Show the gates and exact commands without running anything.
         #[arg(long)]
         dry_run: bool,
+        /// Release this version instead of reserving one (the unit's `version`
+        /// step is skipped), e.g. for a project that names versions by hand.
+        #[arg(long = "version", value_name = "VERSION")]
+        version: Option<String>,
     },
     /// Wait for a release (id, prefix or `last`) and print its result.
     Wait {
@@ -1284,6 +1288,69 @@ fn overview(context: &Context, json: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// The push lost a race: the base has commits this branch lacks.
+fn base_moved(error: &str) -> bool {
+    error.contains("non-fast-forward")
+        || error.contains("fetch first")
+        || error.contains("[rejected]")
+}
+
+/// A failure of the remote itself (GitHub 5xx, a dropped connection), worth retrying.
+fn transient_push_error(error: &str) -> bool {
+    !base_moved(error)
+        && [
+            "Internal Server Error",
+            "502",
+            "503",
+            "504",
+            "Connection reset",
+            "timed out",
+            "RPC failed",
+            "unexpected disconnect",
+        ]
+        .iter()
+        .any(|marker| error.contains(marker))
+}
+
+/// `git push HEAD:<branch>` without force; remote failures are retried after
+/// 2, 4, 8 and 16 seconds.
+fn push_with_retries(
+    context: &Context,
+    remote: &str,
+    branch: &str,
+) -> Result<std::process::Output> {
+    let mut delay = 2;
+    loop {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&context.repo.root)
+            .args([
+                "push",
+                "--quiet",
+                "--no-force",
+                "--no-follow-tags",
+                "--recurse-submodules=no",
+                remote,
+                &format!("HEAD:{branch}"),
+            ])
+            .output()?;
+        let error = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() || !transient_push_error(&error) || delay > 16 {
+            return Ok(output);
+        }
+        eprintln!(
+            "citrus: the remote failed ({}); retrying the push in {delay}s",
+            error
+                .lines()
+                .find(|line| line.contains("remote"))
+                .unwrap_or("error")
+                .trim()
+        );
+        std::thread::sleep(std::time::Duration::from_secs(delay));
+        delay *= 2;
+    }
+}
+
 fn integrate_command(
     context: &Context,
     base: Option<String>,
@@ -1393,19 +1460,7 @@ fn integrate_command(
         let Some(remote) = remote else {
             anyhow::bail!("--push needs a remote base such as origin/main, not {base}");
         };
-        let pushed = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&context.repo.root)
-            .args([
-                "push",
-                "--quiet",
-                "--no-force",
-                "--no-follow-tags",
-                "--recurse-submodules=no",
-                &remote,
-                &format!("HEAD:{branch}"),
-            ])
-            .output()?;
+        let pushed = push_with_retries(context, &remote, &branch)?;
         if pushed.status.success() {
             if json {
                 println!(
@@ -1420,10 +1475,7 @@ fn integrate_command(
             return Ok(0);
         }
         let error = String::from_utf8_lossy(&pushed.stderr);
-        if !(error.contains("rejected")
-            || error.contains("non-fast-forward")
-            || error.contains("fetch first"))
-        {
+        if !base_moved(&error) {
             anyhow::bail!("git push failed: {}", error.trim());
         }
         if !json {
@@ -1609,9 +1661,10 @@ fn release_command(context: &Context, action: ReleaseAction, json: bool) -> Resu
             unchecked,
             detach,
             dry_run,
+            version,
         } => {
             if dry_run {
-                let plan = release::dry_run(context, &unit)?;
+                let plan = release::dry_run(context, &unit, version.as_deref())?;
                 if json {
                     println!(
                         "{}",
@@ -1648,13 +1701,21 @@ fn release_command(context: &Context, action: ReleaseAction, json: bool) -> Resu
                             .join(", ")
                     );
                 }
+                let reserved = plan["steps"]
+                    .as_array()
+                    .is_some_and(|steps| steps.iter().any(|step| step["step"] == "version"));
                 println!(
-                    "  previous: {} · next: {} (the reservation may pick a later free version)",
+                    "  previous: {} · next: {}{}",
                     plan["previous"]
                         .as_str()
                         .filter(|value| !value.is_empty())
                         .unwrap_or("none recorded"),
-                    plan["next_version"].as_str().unwrap_or_default()
+                    plan["next_version"].as_str().unwrap_or_default(),
+                    if reserved {
+                        " (the reservation may pick a later free version)"
+                    } else {
+                        ""
+                    }
                 );
                 for step in plan["steps"].as_array().cloned().unwrap_or_default() {
                     let mark = if step["production"] == true { "*" } else { " " };
@@ -1676,6 +1737,7 @@ fn release_command(context: &Context, action: ReleaseAction, json: bool) -> Resu
                     approve,
                     unchecked,
                     rollback: false,
+                    version,
                 },
             )?;
             if detach {
@@ -1696,6 +1758,7 @@ fn release_command(context: &Context, action: ReleaseAction, json: bool) -> Resu
                     approve,
                     unchecked: true,
                     rollback: true,
+                    version: None,
                 },
             )?;
             let finished = wait_release(context, &started.id, json)?;
@@ -2046,4 +2109,19 @@ fn do_command(context: &Context, task: Option<String>, json: bool) -> Result<i32
         println!("✓ {name} · {}", age(started.elapsed().as_secs() as i64));
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_server_error_is_not_a_moved_base() {
+        let server = "remote: Internal Server Error\n ! [remote rejected]   HEAD -> main (Internal Server Error)";
+        assert!(!base_moved(server));
+        assert!(transient_push_error(server));
+        let raced = " ! [rejected]        HEAD -> main (fetch first)";
+        assert!(base_moved(raced));
+        assert!(!transient_push_error(raced));
+    }
 }

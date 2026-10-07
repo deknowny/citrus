@@ -34,8 +34,10 @@ green `main` commit and build it with
 
 1. Update `version` in `Cargo.toml` and add a `## X.Y.Z` entry to `CHANGELOG.md`.
 2. Push to `main` and let CI pass.
-3. `make release VERSION=vX.Y.Z` — tags the commit after its CI is green and
-   waits for the binaries and `SHA256SUMS`.
+3. `citrus run`, then `citrus release start github --version X.Y.Z --approve`
+   (the `release "github"` block in `citrus.ci`): checks the commit is on
+   `origin/main` with that version and notes, tags it and waits for the
+   binaries and `SHA256SUMS`.
 
 ## Compatibility
 

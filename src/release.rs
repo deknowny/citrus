@@ -13,6 +13,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
 use crate::exec::{Context, agent, read_log, segment};
+use crate::lang::compile::Work;
 use crate::manifest::now;
 use crate::report::{self, compact_utc};
 use crate::state::{Release, ReleaseStep};
@@ -60,13 +61,36 @@ fn release_prefix() -> String {
 pub struct Step {
     #[serde(default)]
     pub name: String,
-    pub run: Vec<String>,
+    /// Commands and built-in steps (`wait.http`, `copy`, …), in order.
+    pub run: Vec<Work>,
     /// Changes production: the release needs `--approve`.
     #[serde(default)]
     pub production: bool,
     /// Run instead of repeating this step when its outcome is unknown.
     #[serde(default)]
-    pub recover: Vec<String>,
+    pub recover: Vec<Work>,
+}
+
+/// Runtime values in every text of `works`.
+fn substitute_works(works: &[Work], values: &BTreeMap<&str, String>) -> Vec<Work> {
+    works
+        .iter()
+        .map(|work| {
+            work.map_text(|text| {
+                values.iter().fold(text.to_owned(), |text, (key, value)| {
+                    text.replace(&format!("{{{key}}}"), value)
+                })
+            })
+        })
+        .collect()
+}
+
+fn describe(works: &[Work]) -> String {
+    works
+        .iter()
+        .map(Work::label)
+        .collect::<Vec<_>>()
+        .join(" && ")
 }
 
 #[derive(Debug, Default)]
@@ -145,10 +169,16 @@ pub struct Start {
     pub approve: bool,
     pub unchecked: bool,
     pub rollback: bool,
+    /// Given by hand: no `version` step.
+    pub version: Option<String>,
 }
 
 /// What `start` would do, without doing it: gates, version and exact commands.
-pub fn dry_run(context: &Context, unit_name: &str) -> Result<serde_json::Value> {
+pub fn dry_run(
+    context: &Context,
+    unit_name: &str,
+    given: Option<&str>,
+) -> Result<serde_json::Value> {
     let releases = Releases::load(context)?;
     let unit = releases.unit(unit_name)?;
     let repo = &context.repo;
@@ -160,10 +190,11 @@ pub fn dry_run(context: &Context, unit_name: &str) -> Result<serde_json::Value> 
         .last_passed_release(unit_name)?
         .map(|release| release.version)
         .unwrap_or_default();
-    let next = match &unit.version {
-        Some(spec) if previous.is_empty() => spec.initial.clone(),
-        Some(_) => bump(&previous).unwrap_or_default(),
-        None => String::new(),
+    let next = match (given, &unit.version) {
+        (Some(version), _) => version.to_owned(),
+        (None, Some(spec)) if previous.is_empty() => spec.initial.clone(),
+        (None, Some(_)) => bump(&previous).unwrap_or_default(),
+        (None, None) => String::new(),
     };
     let plan = crate::plan::compute(repo, &context.manifest, None)?;
     let files = repo.files()?;
@@ -189,14 +220,14 @@ pub fn dry_run(context: &Context, unit_name: &str) -> Result<serde_json::Value> 
         ("next", next.clone()),
     ]);
     let mut commands = Vec::new();
-    if let Some(spec) = &unit.version {
+    if let (None, Some(spec)) = (given, &unit.version) {
         commands.push(serde_json::json!({"step": "version", "run": substitute(&spec.reserve, &values).join(" ")}));
     }
     for step in &unit.steps {
         commands.push(serde_json::json!({
             "step": step.name, "production": step.production,
-            "run": substitute(&step.run, &values).join(" "),
-            "recover": if step.recover.is_empty() { None } else { Some(substitute(&step.recover, &values).join(" ")) },
+            "run": describe(&substitute_works(&step.run, &values)),
+            "recover": if step.recover.is_empty() { None } else { Some(describe(&substitute_works(&step.recover, &values))) },
         }));
     }
     let holder = context.store.environment_holder(&unit.environment)?;
@@ -288,15 +319,21 @@ pub fn start(context: &Context, request: &Start) -> Result<Release> {
         (target, current)
     } else {
         (
-            String::new(),
+            request.version.clone().unwrap_or_default(),
             previous_release
                 .as_ref()
                 .map(|release| release.version.clone())
                 .unwrap_or_default(),
         )
     };
+    if request.version.is_none() && unit.version.is_none() && !request.rollback {
+        bail!(
+            "release {}: no `version` to reserve one; pass --version",
+            request.unit
+        );
+    }
     let mut names: Vec<String> = Vec::new();
-    if !request.rollback && unit.version.is_some() {
+    if !request.rollback && request.version.is_none() && unit.version.is_some() {
         names.push("version".into());
     }
     names.extend(steps.iter().map(|step| step.name.clone()));
@@ -485,7 +522,7 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
                 ("unit", release.unit.clone()),
             ])
         };
-        let (command, recovering) = if state.name == "version" {
+        let (works, recovering) = if state.name == "version" {
             let spec = unit
                 .version
                 .as_ref()
@@ -498,16 +535,24 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
             };
             let mut values = values(&version);
             values.insert("next", next);
-            (substitute(&spec.reserve, &values), false)
+            let argv = substitute(&spec.reserve, &values);
+            (
+                vec![Work::Process {
+                    argv,
+                    env: Vec::new(),
+                    portable: true,
+                }],
+                false,
+            )
         } else {
             let step = steps
                 .iter()
                 .find(|step| step.name == state.name)
                 .context("step no longer declared")?;
             if state.state == "unknown" && !step.recover.is_empty() {
-                (substitute(&step.recover, &values(&version)), true)
+                (substitute_works(&step.recover, &values(&version)), true)
             } else {
-                (substitute(&step.run, &values(&version)), false)
+                (substitute_works(&step.run, &values(&version)), false)
             }
         };
         println!(
@@ -518,18 +563,20 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
         state.state = "running".into();
         context.store.update_step(id, &state)?;
         let started = now();
-        let (program, args) = command.split_first().context("empty step command")?;
-        let mut child = Command::new(program);
-        child
-            .args(args)
-            .current_dir(&context.repo.root)
-            .stdin(Stdio::null());
+        let mut code = 0;
         if state.name == "version" {
-            child.stdout(Stdio::piped());
-        }
-        let output = child.spawn()?.wait_with_output()?;
-        let code = i64::from(output.status.code().unwrap_or(-1));
-        if state.name == "version" {
+            let Some(Work::Process { argv, .. }) = works.first() else {
+                bail!("the version step reserves with a command");
+            };
+            let (program, args) = argv.split_first().context("empty version command")?;
+            let output = Command::new(program)
+                .args(args)
+                .current_dir(&context.repo.root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()?
+                .wait_with_output()?;
+            code = i64::from(output.status.code().unwrap_or(-1));
             let text = String::from_utf8_lossy(&output.stdout);
             print!("{text}");
             let prefix = &unit
@@ -550,6 +597,22 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
                     _ => println!(
                         "CITRUS_NOTE no line starting with {prefix:?} in the version output"
                     ),
+                }
+            }
+        } else {
+            for work in &works {
+                let step = crate::lang::compile::Step {
+                    span: Default::default(),
+                    label: work.label(),
+                    work: work.clone(),
+                };
+                code = i64::from(crate::lang::compile::execute(
+                    &step,
+                    &context.repo.root,
+                    false,
+                )?);
+                if code != 0 {
+                    break;
                 }
             }
         }
