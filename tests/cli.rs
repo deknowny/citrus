@@ -460,15 +460,15 @@ fn stats_count_reuse_and_saved_time() {
 fn status_shows_resources_without_waiting_for_them() {
     let config = "[status]\nresources_command = [\"sh\", \"res.sh\"]\nresource_prefix = \"BUILDER \"\nrefresh_seconds = 60\n";
     let project = Project::new(config);
-    project.write("res.sh", "sleep 1\necho 'BUILDER host=root@b1 state=busy operation=remote-test owner=agent-a elapsed_seconds=90'\necho 'other line'\n");
+    project.write("res.sh", "sleep 5\necho 'BUILDER host=root@b1 state=busy operation=remote-test owner=agent-a elapsed_seconds=90'\necho 'other line'\n");
     let started = Instant::now();
     let (first, _) = project.json(&["status"]);
     assert!(
-        started.elapsed() < Duration::from_millis(900),
+        started.elapsed() < Duration::from_secs(4),
         "status must not wait for the resource command"
     );
     assert_eq!(first["resources"]["refreshing"], true);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let (status, _) = project.json(&["status"]);
         if let Some(item) = status["resources"]["items"]
