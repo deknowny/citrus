@@ -35,7 +35,7 @@ The runner runs with `CITRUS_CHECKS` set to a JSON file; `citrus targets --json`
 ```
 
 `inputs` are `paths`, `extra_inputs` are `reads`, `resources` are the
-services in `needs`. `run` is what the check runs: for a `match changed`
+services in `needs`, `arms` the `match changed` arms with what each runs. `run` is what the check runs: for a `match changed`
 check, the arm the plan chose (`CITRUS_CHECKS` of a run), otherwise `_`.
 
 ## Input fingerprint

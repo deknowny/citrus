@@ -228,6 +228,18 @@ fn select(
             });
             groups.retain(|group| homes.contains(group));
         }
+        // The signal command made the path one check's alone this time.
+        let given: Vec<&str> = found
+            .owns
+            .iter()
+            .filter(|(owned, _)| owned == path)
+            .map(|(_, check)| check.as_str())
+            .filter(|check| manifest.targets.contains_key(*check))
+            .collect();
+        if !given.is_empty() {
+            owners = given;
+            groups.clear();
+        }
         // Checks that name a group in their paths run for its paths too.
         for target in manifest.targets.values() {
             if target
@@ -358,10 +370,12 @@ fn select(
 }
 
 /// What the project's signal command says about these paths: `SIGNAL <name>`
-/// lines, and `CLAIM <path> <group>` lines that put a path into a group.
+/// lines, `CLAIM <path> <group>` lines that put a path into a group, and
+/// `OWN <path> <check>` lines that make a path one check's alone.
 struct Signals {
     names: Vec<String>,
     claims: Vec<(String, String)>,
+    owns: Vec<(String, String)>,
 }
 
 fn signals(
@@ -375,6 +389,7 @@ fn signals(
         return Ok(Signals {
             names: Vec::new(),
             claims: Vec::new(),
+            owns: Vec::new(),
         });
     };
     let dir = repo.state_dir().join("tmp");
@@ -423,6 +438,12 @@ fn signals(
             .filter_map(|line| line.strip_prefix("CLAIM "))
             .filter_map(|rest| rest.trim().rsplit_once(' '))
             .map(|(path, group)| (path.to_owned(), group.to_owned()))
+            .collect(),
+        owns: stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("OWN "))
+            .filter_map(|rest| rest.trim().rsplit_once(' '))
+            .map(|(path, check)| (path.to_owned(), check.to_owned()))
             .collect(),
     })
 }

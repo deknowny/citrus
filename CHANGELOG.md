@@ -44,6 +44,8 @@ Every element does something, names are bare, data is quoted:
 - Citrus is the only planner: `planner`, `CITRUS_PLANNER` and the `TARGET`
   protocol are gone, and so are undeclared checks run as `make <name>` and
   `citrus add`.
+- The signal command can print `OWN <path> <check>`: that path is the
+  check's alone for this plan. The checks export lists `match` arms.
 - Runners speak a fixed protocol (`CITRUS_TARGET`, `CITRUS_WAIT`,
   `CITRUS_RUNNING`, `CITRUS_STAGE`, `CITRUS_LOG`, `CITRUS_RESOURCE`) and get
   `CITRUS_BASE`; their prefix settings are gone (docs/protocol.md).

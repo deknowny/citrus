@@ -2528,3 +2528,44 @@ check named = make("ok") {
         "a group it names is an input: {targets}"
     );
 }
+
+#[test]
+fn a_signal_command_can_give_a_path_to_one_check() {
+    let project = Project::new(
+        r#"
+project {
+  signals = run("sh", "classify.sh")
+}
+
+group web {
+  paths = ["web/**"]
+  check build = make("ok")
+}
+
+# Only the audited part of the workspace file changed.
+check audit = make("ok") {
+  when = signal("audit-only")
+}
+"#,
+    );
+    project.write(
+        "classify.sh",
+        "grep -q '^web/workspace.yaml$' \"$CITRUS_PATHS\" && echo 'SIGNAL audit-only' && echo 'OWN web/workspace.yaml audit'; true\n",
+    );
+    project.commit("classify");
+    project.write("paths.txt", "web/workspace.yaml\n");
+    let (plan, _) = project.json(&["plan", "--paths-file", "paths.txt"]);
+    assert_eq!(
+        plan["plan"]["targets"],
+        serde_json::json!(["audit"]),
+        "{plan}"
+    );
+    assert_eq!(plan["plan"]["mapped"][0][1], "target:audit", "{plan}");
+    project.write("paths.txt", "web/workspace.yaml\nweb/page.tsx\n");
+    let (plan, _) = project.json(&["plan", "--paths-file", "paths.txt"]);
+    assert_eq!(
+        plan["plan"]["targets"],
+        serde_json::json!(["web.build", "audit"]),
+        "{plan}"
+    );
+}

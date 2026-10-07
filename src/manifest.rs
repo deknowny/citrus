@@ -239,6 +239,11 @@ impl Manifest {
                     "when": target.when,
                     "source": target.source,
                     "declaration": target.declaration(),
+                    // `match changed` arms: what the check runs when each holds.
+                    "arms": target.arms.iter().map(|(when, steps)| serde_json::json!({
+                        "when": when,
+                        "run": steps.iter().map(|step| step.work.canonical()).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
                 })
             })
             .collect();

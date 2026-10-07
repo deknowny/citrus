@@ -56,6 +56,7 @@ given rather than diffed) and `CITRUS_PROFILE`, and prints:
 ```
 SIGNAL product:api            a fact conditions can test: signal("product:api")
 CLAIM scripts/old.sh pipeline a changed path that belongs to group `pipeline`
+OWN web/pnpm-workspace.yaml deps-audit   this time the path is that check's alone
 ```
 
 ## Local checks
