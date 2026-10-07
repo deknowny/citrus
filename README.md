@@ -121,6 +121,13 @@ clone; nothing to host. Runs execute in their own session (`setsid`), so they
 outlive the terminal or agent that started them. A shared server backend for
 several machines and people is planned.
 
+## Where it is going
+
+Releases are moving from ordered steps to desired state: artifacts keyed by
+their inputs, environments with providers, `citrus diff` and `citrus apply`
+that observe what runs and reconcile it — see
+[docs/design/declarative.md](docs/design/declarative.md).
+
 ## Status
 
 Early, used daily in a multi-agent monorepo. The CLI contract (`citrus/v1`)
