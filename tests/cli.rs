@@ -1951,3 +1951,23 @@ fn an_edited_declaration_joins_the_plan_of_an_external_planner() {
         "{plan}"
     );
 }
+
+#[test]
+fn checks_that_passed_quickly_run_locally_others_in_the_pool() {
+    let project = Project::new("pool \"builders\" { run = run(\"sh\", \"remote.sh\") }\n");
+    project.write(
+        "remote.sh",
+        "echo 'CITRUS_TARGET target=ok status=PASS exit=0'\n",
+    );
+    project.commit("pool");
+    project.write("src/a.txt", "changed\n");
+    let (first, _) = project.json(&["run"]);
+    assert_eq!(
+        first["run"]["mode"], "remote",
+        "never passed: assumed heavy {first}"
+    );
+    assert_eq!(project.json(&["run", "ok"]).1, 0);
+    project.write("src/a.txt", "changed again\n");
+    let (second, _) = project.json(&["run"]);
+    assert_eq!(second["run"]["mode"], "local", "{second}");
+}

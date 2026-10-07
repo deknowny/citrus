@@ -35,6 +35,9 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
 - `cargo.closure("package")`: the files a Cargo package is built from
   (path-dependency closure, included files, manifests and workspace
   settings), so Rust checks can be cached without listing crates by hand.
+- `citrus run` picks local or pool by history: local only when every needed
+  check passed within a minute recently (declared caching no longer implies
+  "light").
 - Release steps run built-in actions too (`wait.http`, `copy`,
   `links.check`, …), not only commands; `release start --version X` releases
   a version given by hand (no `version` step).

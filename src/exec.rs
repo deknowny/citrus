@@ -15,6 +15,9 @@ use crate::repo::Repo;
 use crate::report::{self, compact_utc, strip_ansi};
 use crate::state::{Run, RunTarget, Store};
 
+/// A check this fast runs locally rather than waiting for a pool.
+const QUICK_SECONDS: i64 = 60;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Auto,
@@ -122,11 +125,16 @@ impl Context {
         (self.repo.config.receipts.snapshot_max_age_hours * 3600) as i64
     }
 
-    fn declared_cache(&self, target: &str) -> bool {
-        self.manifest
-            .targets
-            .get(target)
-            .is_some_and(|entry| entry.cache)
+    /// Every check passed before within a minute: not worth a pool's queue.
+    /// A check that never passed is assumed heavy.
+    fn all_quick(&self, pending: &[&RunTarget]) -> Result<bool> {
+        for decision in pending {
+            match self.store.typical_seconds(&decision.target)? {
+                Some(seconds) if seconds <= QUICK_SECONDS => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     /// Whether `target` is already proven for the current sources, and why not otherwise.
@@ -270,15 +278,7 @@ impl Context {
         let mode = match request.mode {
             Mode::Local => "local",
             Mode::Remote => "remote",
-            Mode::Auto
-                if explicit
-                    || !remote_available
-                    || pending
-                        .iter()
-                        .all(|decision| self.declared_cache(&decision.target)) =>
-            {
-                "local"
-            }
+            Mode::Auto if explicit || !remote_available || self.all_quick(&pending)? => "local",
             Mode::Auto => "remote",
         };
         let started = now();

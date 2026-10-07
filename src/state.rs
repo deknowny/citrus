@@ -730,6 +730,16 @@ impl Store {
             .optional()?)
     }
 
+    /// The longest of the last five passes of `target` in seconds, if any.
+    pub fn typical_seconds(&self, target: &str) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(seconds) FROM (SELECT seconds FROM run_targets JOIN runs ON runs.id = run_targets.run
+             WHERE target = ?1 AND result = 'passed' AND seconds IS NOT NULL ORDER BY runs.started DESC LIMIT 5)",
+            [target],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn latest_evidence(&self, target: &str, kind: &str) -> Result<Option<Evidence>> {
         Ok(self
             .conn

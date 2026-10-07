@@ -60,9 +60,9 @@ the declared checks (docs/manifest.md), so they never parse `citrus.ci`.
 ## Choosing local or remote
 
 `citrus run` without flags runs locally when it was given target names, when
-no pool is declared, or when every check still needed is a declared
-`cache = true` check (usually light). Otherwise it uses the pool. `--local`
-and `--remote` override this.
+no pool is declared, or when every check still needed passed within a minute
+in its last five passes here. A check that never passed is assumed heavy and
+goes to the pool. `--local` and `--remote` override this.
 
 ## Agents
 
