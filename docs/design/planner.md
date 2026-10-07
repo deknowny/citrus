@@ -85,7 +85,9 @@ check "test-clyer-pipeline-contract" {
 - `signal("x")`: the project's signal command printed `SIGNAL x`. It runs
   with `CITRUS_PATHS` (a file of the changed paths) and is the place for
   classification a glob cannot express (Garvis reads file contents to tell
-  which product a change affects): `project { signals = run(...) }`. It may
+  which product a change affects): `project { signals = run(...) }`. It also
+  gets `CITRUS_BASE` (the commit the changes start from),
+  `CITRUS_PATHS_EXPLICIT` (`1` for a given path list) and `CITRUS_PROFILE`. It may
   also print `CLAIM <path> <group>` to put one path into a group (a file
   that existed at the base and is gone now).
 - `and`, `or`, `not` combine them. A check with `owns` and `when` needs

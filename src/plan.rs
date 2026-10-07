@@ -153,7 +153,7 @@ pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &st
 fn for_paths_all(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
     let config = &repo.config.plan;
     if config.command.is_empty() {
-        return select(repo, manifest, paths.to_vec(), before);
+        return select(repo, manifest, paths.to_vec(), before, true);
     }
     if config.paths_arg.is_empty() {
         bail!("the planner takes no path list (`paths_var` of `planner` in citrus.ci)");
@@ -223,11 +223,18 @@ fn external(repo: &Repo, manifest: &Manifest, extra: Option<String>) -> Result<P
 fn builtin(repo: &Repo, manifest: &Manifest, base: &str) -> Result<Plan> {
     let fork = fork_point(repo, base);
     let paths = changed_paths(repo, &fork)?;
-    select(repo, manifest, paths, &fork)
+    select(repo, manifest, paths, &fork, false)
 }
 
 /// Declared targets owning `paths`; new or edited declarations since `before` too.
-fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> Result<Plan> {
+/// `explicit`: the paths were given (`--paths-file`, integrate), not diffed from the base.
+fn select(
+    repo: &Repo,
+    manifest: &Manifest,
+    paths: Vec<String>,
+    fork: &str,
+    explicit: bool,
+) -> Result<Plan> {
     let mut plan = Plan {
         files: paths.len(),
         ..Plan::default()
@@ -254,7 +261,7 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> R
         }
         plan.targets.extend(changed);
     }
-    let found = signals(repo, manifest, &paths)?;
+    let found = signals(repo, manifest, &paths, fork, explicit)?;
     // Which groups and checks the changed paths touch.
     let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for path in &paths {
@@ -386,7 +393,13 @@ struct Signals {
     claims: Vec<(String, String)>,
 }
 
-fn signals(repo: &Repo, manifest: &Manifest, paths: &[String]) -> Result<Signals> {
+fn signals(
+    repo: &Repo,
+    manifest: &Manifest,
+    paths: &[String],
+    base: &str,
+    explicit: bool,
+) -> Result<Signals> {
     let Some((program, args)) = manifest.signals.split_first() else {
         return Ok(Signals {
             names: Vec::new(),
@@ -411,6 +424,12 @@ fn signals(repo: &Repo, manifest: &Manifest, paths: &[String]) -> Result<Signals
         .args(args)
         .current_dir(&repo.root)
         .env("CITRUS_PATHS", &file)
+        .env("CITRUS_BASE", base)
+        .env("CITRUS_PATHS_EXPLICIT", if explicit { "1" } else { "0" })
+        .env(
+            "CITRUS_PROFILE",
+            repo.config.plan.profile.clone().unwrap_or_default(),
+        )
         .output();
     let _ = std::fs::remove_file(&file);
     let output = output?;
