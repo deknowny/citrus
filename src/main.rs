@@ -2009,14 +2009,18 @@ fn check_command(context: &Context, json: bool) -> Result<i32> {
         if json {
             println!("{}", json!({"schema": SCHEMA, "ok": true, "file": null}));
         } else {
-            println!("no citrus.ci in this repository; nothing to check (`citrus add` starts one)");
+            println!("no Citrus configuration here (citrus.ci or .citrus/*.ci); nothing to check");
         }
         return Ok(0);
     };
     // Context::open already failed on errors; here only warnings remain.
     let (_, sources) = lang::compile::load(&context.repo.root)
         .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
-        .context("citrus.ci disappeared")?;
+        .context("the configuration disappeared")?;
+    let mut project = project.clone();
+    let dead = lang::compile::dead_globs(&project, &context.repo.root);
+    project.warnings.extend(dead);
+    let project = &project;
     if json {
         let warnings: Vec<Value> = project
             .warnings

@@ -354,7 +354,7 @@ struct Scope<'a> {
     cache: Option<bool>,
 }
 
-pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
+pub fn compile(graph: &Graph) -> Result<Project, Error> {
     let mut project = Project::default();
     let mut runners: Vec<(String, Pool, Span)> = Vec::new();
     let mut chosen_runner: Option<(String, Span)> = None;
@@ -645,42 +645,6 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
             }
         }
     }
-    // Globs that match nothing are almost always typos: each is reported once,
-    // where it is written (a group's paths, a check's own paths and reads).
-    let files = crate::repo::Repo::discover_at(root)
-        .and_then(|repo| repo.paths())
-        .unwrap_or_default();
-    if !files.is_empty() {
-        let dead = |pattern: &String| {
-            !pattern.starts_with('!')
-                && !crate::manifest::pattern_matches_any(pattern, &files).unwrap_or(true)
-        };
-        for group in &project.groups {
-            for pattern in group.owns.iter().filter(|pattern| dead(pattern)) {
-                project.warnings.push(Error::at(
-                    group.span,
-                    format!("group {}: `{pattern}` matches no file", group.name),
-                ));
-            }
-        }
-        for check in &project.checks {
-            let own = if check.narrows || check.group.is_none() {
-                check.owns.as_slice()
-            } else {
-                &[]
-            };
-            for pattern in own
-                .iter()
-                .chain(&check.reads)
-                .filter(|pattern| dead(pattern))
-            {
-                project.warnings.push(Error::at(
-                    check.span,
-                    format!("check {}: `{pattern}` matches no file", check.name),
-                ));
-            }
-        }
-    }
     // A group a check names in its paths is part of its inputs; a check with
     // no known inputs is never reused by them.
     let group_paths: BTreeMap<String, Vec<String>> = project
@@ -725,6 +689,48 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
         }
     }
     Ok(project)
+}
+
+/// Globs that match no file: almost always typos. Each is reported once,
+/// where it is written (a group's paths, a check's own paths and reads).
+/// Slow on large repositories, so only `citrus check` asks.
+pub fn dead_globs(project: &Project, root: &Path) -> Vec<Error> {
+    let mut dead_globs = Vec::new();
+    let files = crate::repo::Repo::discover_at(root)
+        .and_then(|repo| repo.paths())
+        .unwrap_or_default();
+    if !files.is_empty() {
+        let dead = |pattern: &String| {
+            !pattern.starts_with('!')
+                && !crate::manifest::pattern_matches_any(pattern, &files).unwrap_or(true)
+        };
+        for group in &project.groups {
+            for pattern in group.owns.iter().filter(|pattern| dead(pattern)) {
+                dead_globs.push(Error::at(
+                    group.span,
+                    format!("group {}: `{pattern}` matches no file", group.name),
+                ));
+            }
+        }
+        for check in &project.checks {
+            let own = if check.narrows || check.group.is_none() {
+                check.owns.as_slice()
+            } else {
+                &[]
+            };
+            for pattern in own
+                .iter()
+                .chain(&check.reads)
+                .filter(|pattern| dead(pattern))
+            {
+                dead_globs.push(Error::at(
+                    check.span,
+                    format!("check {}: `{pattern}` matches no file", check.name),
+                ));
+            }
+        }
+    }
+    dead_globs
 }
 
 /// First occurrence of each entry, in order (input lists are often joined).
@@ -1484,7 +1490,7 @@ pub fn load_at(root: &Path, revision: Option<&str>) -> Result<Option<(Project, S
         }
     };
     match super::load_at(root, entry, revision) {
-        Ok((graph, sources)) => match compile(&graph, root) {
+        Ok((graph, sources)) => match compile(&graph) {
             Ok(mut project) => {
                 project.files = sources
                     .files
