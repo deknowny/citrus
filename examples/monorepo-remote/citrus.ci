@@ -1,0 +1,50 @@
+citrus 1
+
+# A monorepo with its own planner and a remote runner on shared builders.
+project {
+  toolchain = ["rust-toolchain.toml", ".python-version"]
+  logs = ".validation/citrus"
+  check_env = { "test-backend": { DATABASE_URL: "" } }
+}
+
+# The project's planner routes paths no check owns. It prints
+# `TARGET\tmake:<name>` lines (optionally PLAN/MAPPED/UNMAPPED).
+planner {
+  run = make("ci-plan")
+  base_var = "BASE_REF"
+}
+
+# Runs the whole planned set on a builder and reports each check as
+#   LANE target=<name> status=START|PASS|FAIL exit=<n> seconds=<n>
+pool "builders" {
+  run = make("remote-check")
+  progress = ["LANE"]
+  waiting = "QUEUED resource="
+  acquired = ["ACQUIRED resource="]
+  stage = "STAGE "
+  # The runner keeps detailed output in its own file and prints its path.
+  log_after = ["full log: "]
+  # A slow command describing the builders: `status` shows its last
+  # snapshot instantly and refreshes it in the background.
+  status = make("builders-status")
+  status_prefix = "BUILDER "
+  refresh = 1m
+}
+
+# `meta` is data for the project's own tools (here: its scheduler).
+check "test-network" {
+  about = "Network inventory and listener admission"
+  owns = ["scripts/network*.py", "config/network.toml"]
+  reads = ["config/**"]
+  run = make("test-network")
+  cache = true
+  resources = ["contracts"]
+}
+
+check "test-web-e2e" {
+  about = "Browser end-to-end tests"
+  owns = ["web/e2e/**"]
+  run = make("test-web-e2e")
+  resources = ["playwright"]
+  meta = { linux: true }
+}

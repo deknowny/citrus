@@ -2,10 +2,10 @@
 
 use std::fs;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::exec::Context;
-use crate::manifest::{Manifest, pattern_matches_any};
+use crate::manifest::pattern_matches_any;
 
 #[derive(Debug)]
 pub struct Declaration {
@@ -17,15 +17,12 @@ pub struct Declaration {
     pub resources: Vec<String>,
 }
 
-/// Validates the declaration against the checkout and appends it to the manifest.
-/// Returns the TOML block that was written.
+/// Validates the declaration against the checkout and appends a `check` block
+/// to `citrus.ci` (created when missing). Returns the block that was written.
 pub fn add(context: &Context, declaration: &Declaration) -> Result<String> {
     let name = &declaration.target;
     if context.manifest.targets.contains_key(name) {
-        bail!(
-            "{name} is already declared in {}; edit its entry instead",
-            context.repo.config.manifest
-        );
+        bail!("{name} is already declared in citrus.ci; edit its block instead");
     }
     if declaration.inputs.is_empty() {
         bail!("--inputs: name the files this check owns (globs)");
@@ -60,42 +57,20 @@ pub fn add(context: &Context, declaration: &Declaration) -> Result<String> {
             context.repo.config.target_definitions.join(", ")
         );
     }
-    if context.project.is_some() {
-        if !declaration.inputs.iter().all(|pattern| !pattern.is_empty()) {
-            bail!("--inputs: empty pattern");
+    let block = render_ci(declaration);
+    let path = context.repo.root.join("citrus.ci");
+    let created = !path.exists();
+    let existing = fs::read_to_string(&path).unwrap_or_else(|_| "citrus 1\n".into());
+    fs::write(&path, format!("{}\n\n{block}", existing.trim_end()))?;
+    // The result must still be a valid project; otherwise nothing changes.
+    if let Err(rendered) = crate::lang::compile::load(&context.repo.root) {
+        if created {
+            fs::remove_file(&path)?;
+        } else {
+            fs::write(&path, existing)?;
         }
-        let block = render_ci(declaration);
-        let path = context.repo.root.join("citrus.ci");
-        let mut text = fs::read_to_string(&path)?;
-        text = format!("{}\n\n{block}", text.trim_end());
-        fs::write(&path, &text)?;
-        if let Err(rendered) = crate::lang::compile::load(&context.repo.root) {
-            let original = text
-                .trim_end()
-                .strip_suffix(block.trim_end())
-                .unwrap_or(&text)
-                .trim_end()
-                .to_owned()
-                + "\n";
-            fs::write(&path, original)?;
-            bail!("the new check would make citrus.ci invalid:\n{rendered}");
-        }
-        return Ok(block);
+        bail!("the new check would make citrus.ci invalid:\n{rendered}");
     }
-    let block = render(declaration);
-    let path = context.repo.manifest_path();
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let mut text = existing.trim_end().to_owned();
-    if !text.is_empty() {
-        text.push_str("\n\n");
-    }
-    text.push_str(&block);
-    // The result must still be a valid manifest before anything is written.
-    Manifest::parse(&text).context("the new entry would make the manifest invalid")?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, text)?;
     Ok(block)
 }
 
@@ -125,50 +100,21 @@ pub fn defined(context: &Context, name: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn render(declaration: &Declaration) -> String {
-    let list = |items: &[String]| {
-        if items.len() <= 2 {
-            format!(
-                "[{}]",
-                items
-                    .iter()
-                    .map(|item| quote(item))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        } else {
-            format!(
-                "[\n{}\n]",
-                items
-                    .iter()
-                    .map(|item| format!("  {},", quote(item)))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
+/// A `.ci` string literal: braces are literal, not interpolation.
+pub fn quote(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '{' => out.push_str("{{"),
+            '}' => out.push_str("}}"),
+            other => out.push(other),
         }
-    };
-    let mut block = format!("[targets.{}]\n", declaration.target);
-    if let Some(description) = &declaration.description {
-        block.push_str(&format!("description = {}\n", quote(description)));
     }
-    if declaration.cache {
-        block.push_str("cache = true\n");
-    }
-    if !declaration.resources.is_empty() {
-        block.push_str(&format!("resources = {}\n", list(&declaration.resources)));
-    }
-    block.push_str(&format!("inputs = {}\n", list(&declaration.inputs)));
-    if !declaration.extra_inputs.is_empty() {
-        block.push_str(&format!(
-            "extra_inputs = {}\n",
-            list(&declaration.extra_inputs)
-        ));
-    }
-    block
-}
-
-fn quote(value: &str) -> String {
-    toml::Value::String(value.to_owned()).to_string()
+    out.push('"');
+    out
 }
 
 /// A `check` block for citrus.ci; the run step is `make <target>`.
@@ -178,20 +124,20 @@ fn render_ci(declaration: &Declaration) -> String {
             "[{}]",
             items
                 .iter()
-                .map(|item| format!("{item:?}"))
+                .map(|item| quote(item))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
     };
-    let mut block = format!("check {:?} {{\n", declaration.target);
+    let mut block = format!("check {} {{\n", quote(&declaration.target));
     if let Some(description) = &declaration.description {
-        block.push_str(&format!("  about = {description:?}\n"));
+        block.push_str(&format!("  about = {}\n", quote(description)));
     }
-    block.push_str(&format!("  owns  = {}\n", list(&declaration.inputs)));
+    block.push_str(&format!("  owns = {}\n", list(&declaration.inputs)));
     if !declaration.extra_inputs.is_empty() {
         block.push_str(&format!("  reads = {}\n", list(&declaration.extra_inputs)));
     }
-    block.push_str(&format!("  run   = make({:?})\n", declaration.target));
+    block.push_str(&format!("  run = make({})\n", quote(&declaration.target)));
     if declaration.cache {
         block.push_str("  cache = true\n");
     }

@@ -108,10 +108,15 @@ impl fmt::Display for Error {
     }
 }
 
-/// Parse and evaluate `citrus.ci` (and the files it `use`s) under `root`.
-pub fn load(root: &Path, entry: &str) -> Result<(eval::Graph, Sources), (Error, Sources)> {
+/// Parse and evaluate `entry` (and the files it `use`s) under `root`, read
+/// from the working tree or as committed at `revision`.
+pub fn load_at(
+    root: &Path,
+    entry: &str,
+    revision: Option<&str>,
+) -> Result<(eval::Graph, Sources), (Error, Sources)> {
     let mut sources = Sources::default();
-    match eval::evaluate_project(root, entry, &mut sources) {
+    match eval::evaluate_project(root, entry, revision, &mut sources) {
         Ok(graph) => Ok((graph, sources)),
         Err(error) => Err((error, sources)),
     }

@@ -3,7 +3,7 @@
 //! comparing what runs with what HEAD would run (docs/design/declarative.md).
 
 use std::collections::BTreeMap;
-use std::fs;
+
 use std::process::Command;
 
 use anyhow::{Context as _, Result, bail};
@@ -29,9 +29,9 @@ pub struct Artifact {
     pub description: String,
     /// Provider-specific build settings (opaque to the core, part of the key).
     #[serde(default)]
-    pub build: BTreeMap<String, toml::Value>,
+    pub build: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
-    pub publish: BTreeMap<String, toml::Value>,
+    pub publish: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -142,54 +142,40 @@ fn deployment() -> String {
     "deployment".into()
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArtifactsFile {
-    #[serde(default)]
-    artifacts: BTreeMap<String, Artifact>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EnvironmentsFile {
-    #[serde(default)]
-    environments: BTreeMap<String, Environment>,
-}
-
+/// Artifacts declared in `citrus.ci`.
 pub fn artifacts(context: &Context) -> Result<BTreeMap<String, Artifact>> {
-    let path = context.repo.root.join(&context.repo.config.artifacts);
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let parsed: ArtifactsFile = toml::from_str(&fs::read_to_string(&path)?)
-        .with_context(|| format!("invalid {}", path.display()))?;
-    for (name, artifact) in &parsed.artifacts {
+    let artifacts = context
+        .project
+        .as_ref()
+        .map(|project| project.artifacts.clone())
+        .unwrap_or_default();
+    for (name, artifact) in &artifacts {
         if artifact.inputs.is_empty() == artifact.inputs_command.is_empty() {
-            bail!("artifact {name}: set exactly one of inputs or inputs_command");
+            bail!("artifact {name}: set inputs to globs or to inputs_of(command)");
         }
     }
-    Ok(parsed.artifacts)
+    Ok(artifacts)
 }
 
+/// Environments declared in `citrus.ci`.
 pub fn environments(context: &Context) -> Result<BTreeMap<String, Environment>> {
-    let path = context.repo.root.join(&context.repo.config.environments);
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let parsed: EnvironmentsFile = toml::from_str(&fs::read_to_string(&path)?)
-        .with_context(|| format!("invalid {}", path.display()))?;
+    let environments = context
+        .project
+        .as_ref()
+        .map(|project| project.environments.clone())
+        .unwrap_or_default();
     let artifacts = artifacts(context)?;
-    for (name, environment) in &parsed.environments {
+    for (name, environment) in &environments {
         for (workload, spec) in &environment.workloads {
             if !artifacts.contains_key(&spec.artifact) {
                 bail!(
-                    "environment {name}: workload {workload} names unknown artifact {}",
+                    "environment {name}: deploy {workload} names unknown artifact {}",
                     spec.artifact
                 );
             }
         }
     }
-    Ok(parsed.environments)
+    Ok(environments)
 }
 
 /// Input paths of an artifact given by its `inputs_command`, if it has one.
@@ -590,25 +576,4 @@ pub fn diff(context: &Context, name: &str) -> Result<Diff> {
         actions,
         plan_hash,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn environment_declarations_parse_with_defaults() {
-        let parsed: EnvironmentsFile = toml::from_str(
-            "[environments.prod]\nprovider = \"kubernetes\"\nconnection = { namespace = \"shop\" }\nrecord = { annotation = \"example.com/release\" }\n[environments.prod.workloads.api]\nartifact = \"api\"\n",
-        )
-        .unwrap();
-        let workload = &parsed.environments["prod"].workloads["api"];
-        assert_eq!(workload.kind, "deployment");
-        assert!(
-            toml::from_str::<EnvironmentsFile>(
-                "[environments.x]\nprovider = \"k\"\nbogus = 1\nworkloads = {}\n"
-            )
-            .is_err()
-        );
-    }
 }

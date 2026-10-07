@@ -1,0 +1,23 @@
+citrus 1
+
+# A JavaScript project without Make: each check is an npm script.
+project {
+  toolchain = [".nvmrc", "package-lock.json"]
+}
+
+fn npm(script) { run("npm", "run", "--silent", script) }
+
+check "test" {
+  about = "Vitest unit tests"
+  owns = ["src/**", "test/**"]
+  reads = ["vitest.config.ts", "tsconfig.json"]
+  run = npm("test")
+  cache = true
+}
+
+check "typecheck" {
+  owns = ["src/**/*.ts"]
+  reads = ["tsconfig.json"]
+  run = npm("typecheck")
+  cache = true
+}

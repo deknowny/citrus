@@ -35,67 +35,28 @@ pub fn diagnose(context: &Context) -> Vec<Finding> {
         format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("CITRUS_COMMIT")),
     );
     let config = &context.repo.config;
-    let config_file = context.repo.root.join("citrus.toml");
-    note(
-        "config",
-        "ok",
-        if config_file.exists() {
-            "citrus.toml loaded".into()
-        } else {
-            "no citrus.toml: generic defaults".into()
-        },
-    );
-
-    if context.project.is_some() {
-        let ignored: Vec<&str> = ["citrus.toml", config.manifest.as_str()]
-            .into_iter()
-            .filter(|path| context.repo.root.join(path).exists())
-            .collect();
-        if !ignored.is_empty() {
-            note(
-                "citrus.ci",
-                "warn",
-                format!(
-                    "citrus.ci is the configuration; {} are ignored and can be deleted",
-                    ignored.join(", ")
-                ),
-            );
-        } else {
-            note(
-                "citrus.ci",
-                "ok",
-                format!(
-                    "{} checks, {} tasks",
-                    context.manifest.targets.len(),
-                    context
-                        .project
-                        .as_ref()
-                        .map_or(0, |project| project.tasks.len())
-                ),
-            );
-        }
-    }
-    let manifest_path = context.repo.manifest_path();
-    if context.project.is_some() {
-        // Declarations come from citrus.ci.
-    } else if !manifest_path.exists() {
-        note(
-            "manifest",
-            "warn",
-            format!(
-                "{} is missing: nothing is declared, only identical snapshots are reused",
-                config.manifest
-            ),
-        );
-    } else {
-        note(
-            "manifest",
+    match &context.project {
+        Some(project) => note(
+            "citrus.ci",
             "ok",
             format!(
-                "{}: {} targets",
-                config.manifest,
-                context.manifest.targets.len()
+                "{} checks, {} tasks, {} releases",
+                context.manifest.targets.len(),
+                project.tasks.len(),
+                project.releases.len()
             ),
+        ),
+        None => note(
+            "citrus.ci",
+            "warn",
+            "no citrus.ci: nothing is declared, only identical snapshots are reused (`citrus add` starts one)".into(),
+        ),
+    }
+    if context.repo.root.join("citrus.toml").exists() {
+        note(
+            "citrus.toml",
+            "warn",
+            "Citrus no longer reads citrus.toml; describe the project in citrus.ci".into(),
         );
     }
     match context.repo.files() {

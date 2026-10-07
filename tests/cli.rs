@@ -12,21 +12,33 @@ struct Project {
 }
 
 const MAKEFILE: &str = "ok:\n\t@echo fine\nplain:\n\t@echo plain\nfail:\n\t@echo building; echo 'AssertionError: broken thing'; exit 1\nslow:\n\t@sleep 30\n";
-const MANIFEST: &str = "[targets.ok]\ninputs = [\"src/*.txt\"]\ncache = true\nresources = [\"contracts\"]\n\n[targets.fail]\ninputs = [\"other/*\"]\nresources = [\"contracts\"]\n";
+const BASE: &str = r#"citrus 1
+
+check "ok" {
+  owns = ["src/*.txt"]
+  run = make("ok")
+  cache = true
+  resources = ["contracts"]
+}
+
+check "fail" {
+  owns = ["other/*"]
+  run = make("fail")
+  resources = ["contracts"]
+}
+"#;
 
 impl Project {
+    /// `config`: more of citrus.ci after the two base checks.
     fn new(config: &str) -> Project {
         let project = Project {
             dir: tempfile::tempdir().unwrap(),
         };
         project.write("Makefile", MAKEFILE);
-        project.write("ci/targets.toml", MANIFEST);
+        project.write("citrus.ci", &format!("{BASE}\n{config}"));
         project.write("src/a.txt", "one\n");
         project.write("other/x", "x\n");
         project.write(".gitignore", ".citrus/\n");
-        if !config.is_empty() {
-            project.write("citrus.toml", config);
-        }
         project.git(&["init", "-q", "-b", "main"]);
         project.git(&["add", "-A"]);
         project.git(&[
@@ -83,6 +95,25 @@ impl Project {
             )
         });
         (value, output.status.code().unwrap_or(-1))
+    }
+
+    /// Append to citrus.ci (not committed).
+    fn declare(&self, text: &str) {
+        let current = fs::read_to_string(self.root().join("citrus.ci")).unwrap();
+        self.write("citrus.ci", &format!("{current}\n{text}"));
+    }
+
+    fn commit(&self, message: &str) {
+        self.git(&["add", "-A"]);
+        self.git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            message,
+        ]);
     }
 
     fn receipts(&self) -> PathBuf {
@@ -254,7 +285,10 @@ fn builtin_plan_selects_targets_owning_changed_paths() {
 
 #[test]
 fn remote_runner_progress_is_recorded_per_target() {
-    let config = "[plan]\ncommand = [\"sh\", \"plan.sh\"]\n\n[run]\nremote = [\"sh\", \"remote.sh\"]\nprogress_prefixes = [\"LANE\"]\nwaiting_prefix = \"QUEUED resource=\"\n";
+    let config = r#"
+planner { run = run("sh", "plan.sh") }
+pool "builders" { run = run("sh", "remote.sh"), progress = ["LANE"], waiting = "QUEUED resource=" }
+"#;
     let project = Project::new(config);
     project.write("plan.sh", "printf 'PLAN\\tstatus=complete\\tfiles=1\\nTARGET\\tmake:alpha\\nTARGET\\tmake:beta\\nTARGET\\tno-heavy:docs\\n'\n");
     project.write(
@@ -284,7 +318,10 @@ fn remote_runner_progress_is_recorded_per_target() {
 
 #[test]
 fn remote_details_are_read_from_the_linked_log() {
-    let config = "[plan]\ncommand = [\"sh\", \"plan.sh\"]\n\n[run]\nremote = [\"sh\", \"remote.sh\"]\nprogress_prefixes = [\"LANE\"]\nlinked_log_markers = [\"full log: \"]\n";
+    let config = r#"
+planner { run = run("sh", "plan.sh") }
+pool "builders" { run = run("sh", "remote.sh"), progress = ["LANE"], log_after = ["full log: "] }
+"#;
     let project = Project::new(config);
     project.write(
         "plan.sh",
@@ -333,7 +370,7 @@ fn remote_details_are_read_from_the_linked_log() {
 /// this value was computed by an independent implementation of that spec.
 #[test]
 fn fingerprint_matches_the_documented_format() {
-    let config = "toolchain_files = [\"rust-toolchain.toml\", \".tool-versions\"]\n";
+    let config = "project { toolchain = [\"rust-toolchain.toml\", \".tool-versions\"] }\n";
     let project = Project::new(config);
     project.write("rust-toolchain.toml", "[toolchain]\nchannel = \"1\"\n");
     project.write("src/\u{e9}.txt", "unicode path\n");
@@ -354,7 +391,7 @@ fn fingerprint_matches_the_documented_format() {
         .file_name();
     assert_eq!(
         receipt.to_string_lossy(),
-        "ok-bfc713c0adc9e9b4165a7f72141cc6b5f1ea2c7e4ea1de991c0dce8fa908e80f.pass"
+        "ok-b626444adc1a561321355d57268a67907ae6ee9b450da80d37bf49319f1d1cae.pass"
     );
 }
 
@@ -416,10 +453,10 @@ fn add_declares_a_check_after_validating_it() {
         "plain check",
     ]);
     assert_eq!(code, 0, "{added}");
-    let manifest = fs::read_to_string(project.root().join("ci/targets.toml")).unwrap();
+    let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
     assert!(
-        manifest.contains("[targets.plain]\ndescription = \"plain check\"\ncache = true"),
-        "{manifest}"
+        text.contains("check \"plain\" {\n  about = \"plain check\"\n  owns = [\"Makefile\"]\n  run = make(\"plain\")\n  cache = true\n  resources = [\"contracts\"]\n}"),
+        "{text}"
     );
     let (plan, _) = project.json(&["plan"]);
     assert_eq!(plan["plan"]["unmapped"], serde_json::json!([]), "{plan}");
@@ -458,7 +495,7 @@ fn stats_count_reuse_and_saved_time() {
 
 #[test]
 fn status_shows_resources_without_waiting_for_them() {
-    let config = "[status]\nresources_command = [\"sh\", \"res.sh\"]\nresource_prefix = \"BUILDER \"\nrefresh_seconds = 60\n";
+    let config = "pool \"builders\" { run = run(\"true\"), status = run(\"sh\", \"res.sh\"), status_prefix = \"BUILDER \", refresh = 1m }\n";
     let project = Project::new(config);
     project.write("res.sh", "sleep 5\necho 'BUILDER host=root@b1 state=busy operation=remote-test owner=agent-a elapsed_seconds=90'\necho 'other line'\n");
     let started = Instant::now();
@@ -514,10 +551,7 @@ fn doctor_reports_setup_problems() {
     assert_eq!(code, 0, "{healthy}");
     assert_eq!(healthy["ok"], true);
 
-    project.write(
-        "ci/targets.toml",
-        &format!("{MANIFEST}\n[targets.ghost]\ninputs = [\"missing/*\"]\n"),
-    );
+    project.declare("check \"ghost\" { owns = [\"missing/*\"], run = make(\"ghost\") }\n");
     project.write(".gitignore", "");
     let (broken, code) = project.json(&["doctor"]);
     assert_eq!(code, 1);
@@ -537,19 +571,13 @@ fn bundled_examples_are_valid_configurations() {
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     for entry in fs::read_dir(&examples).unwrap() {
         let dir = entry.unwrap().path();
-        let project = Project::new(&fs::read_to_string(dir.join("citrus.toml")).unwrap());
+        let project = Project::new("");
         project.write(
-            "ci/targets.toml",
-            &fs::read_to_string(dir.join("targets.toml")).unwrap(),
+            "citrus.ci",
+            &fs::read_to_string(dir.join("citrus.ci")).unwrap(),
         );
-        let (status, _) = project.json(&["why", "nothing"]);
-        assert!(
-            status
-                .get("error")
-                .is_none_or(|error| !error.as_str().unwrap().contains("invalid")),
-            "{}: {status}",
-            dir.display()
-        );
+        let (checked, code) = project.json(&["check"]);
+        assert_eq!(code, 0, "{}: {checked}", dir.display());
     }
 }
 
@@ -608,10 +636,9 @@ fn commit_upstream(origin: &Path, path: &str, content: &str) {
     git(&["push", "-q", "origin", "HEAD:main"]);
 }
 
-const PLANNER: &str =
-    "[plan]\ncommand = [\"sh\", \"plan.sh\"]\npaths_arg = \"{file}\"\nbase = \"origin/main\"\n";
+const PLANNER: &str = "project { base = \"origin/main\" }\nplanner { run = run(\"sh\", \"plan.sh\"), paths_var = \"PATHS\" }\n";
 // Changes under web/ select `plain`; without a path list the plan is this task's own changes.
-const PLAN_SH: &str = "if [ -n \"$1\" ]; then grep -q '^web/' \"$1\" && printf 'TARGET\\tmake:plain\\n'; printf 'PLAN\\tstatus=complete\\n'; else printf 'TARGET\\tmake:plain\\n'; fi\n";
+const PLAN_SH: &str = "if [ -n \"$1\" ]; then grep -q '^web/' \"${1#PATHS=}\" && printf 'TARGET\\tmake:plain\\n'; printf 'PLAN\\tstatus=complete\\n'; else printf 'TARGET\\tmake:plain\\n'; fi\n";
 
 #[test]
 fn integrate_keeps_checks_the_incoming_changes_do_not_touch() {
@@ -751,8 +778,7 @@ fn tasks_and_notes_show_other_worktrees() {
 
 #[test]
 fn overview_lists_commands_and_the_project_catalog() {
-    let config =
-        "[[catalog]]\ncommand = \"make deploy\"\ndescription = \"ship it\"\ngroup = \"release\"\n";
+    let config = "command \"make deploy\" { about = \"ship it\", group = \"release\" }\n";
     let project = Project::new(config);
     let (overview, code) = project.json(&[]);
     assert_eq!(code, 0, "{overview}");
@@ -769,32 +795,23 @@ fn overview_lists_commands_and_the_project_catalog() {
 }
 
 const RELEASES: &str = r#"
-[releases.app]
-description = "test app"
-environment = "prod"
-
-[releases.app.version]
-reserve = ["sh", "-c", "echo reserving {next}; echo RELEASE={next}"]
-initial = "1.0.0-app"
-
-[[releases.app.steps]]
-name = "build"
-run = ["sh", "-c", "echo built {version}"]
-
-[[releases.app.steps]]
-name = "deploy"
-production = true
-run = ["sh", "deploy.sh", "{version}"]
-recover = ["sh", "-c", "echo recovered {version}"]
-
-[releases.app.rollback]
-production = true
-run = ["sh", "-c", "echo rolled back to {version} from {previous}"]
+release "app" {
+  about = "test app"
+  environment = "prod"
+  # Reserves the next free version; prints RELEASE=<version>.
+  version = { reserve: run("sh", "-c", "echo reserving {next}; echo RELEASE={next}"), initial: "1.0.0-app" }
+  step "build" { run = run("sh", "-c", "echo built {version}") }
+  step "deploy" {
+    production = true
+    run = run("sh", "deploy.sh", version)
+    recover = run("sh", "-c", "echo recovered {version}")
+  }
+  rollback = { production: true, run: run("sh", "-c", "echo rolled back to {version} from {previous}") }
+}
 "#;
 
 fn release_project() -> Project {
-    let project = Project::new("[plan]\nbase = \"main\"\n");
-    project.write("ci/releases.toml", RELEASES);
+    let project = Project::new(&format!("project {{ base = \"main\" }}\n{RELEASES}"));
     project.write("deploy.sh", "if [ -f .fail ]; then echo 'Error: cluster unreachable'; exit 1; fi\nif [ -f .slow ]; then sleep 30; fi\necho deployed $1\n");
     project.write(".gitignore", ".citrus/\n.fail\n.slow\n");
     project.git(&["add", "-A"]);
@@ -970,7 +987,7 @@ fn interrupted_release_keeps_the_environment_and_recovers() {
 
 #[test]
 fn integrate_runs_the_after_merge_hook() {
-    let config = "[integrate]\nafter_merge = [\"sh\", \"-c\", \"mkdir -p .citrus && echo $0 > .citrus/hook\", \"{before}\"]\n";
+    let config = "project { after_merge = run(\"sh\", \"-c\", \"mkdir -p .citrus && echo $0 > .citrus/hook\", before) }\n";
     let project = Project::new(config);
     let origin = with_origin(&project);
     let before = String::from_utf8(
@@ -992,7 +1009,10 @@ fn integrate_runs_the_after_merge_hook() {
         before.trim()
     );
 
-    project.write("citrus.toml", "[integrate]\nafter_merge = [\"false\"]\n");
+    project.write(
+        "citrus.ci",
+        &format!("{BASE}\nproject {{ after_merge = run(\"false\") }}\n"),
+    );
     project.git(&[
         "-c",
         "user.name=t",
@@ -1031,7 +1051,7 @@ fn version_names_the_source_commit() {
 #[test]
 fn logs_and_state_are_private() {
     use std::os::unix::fs::PermissionsExt;
-    let project = Project::new("log_dir = \".private/logs\"\n");
+    let project = Project::new("project { logs = \".private/logs\" }\n");
     project.write(".gitignore", ".citrus/\n.private/\n");
     project.json(&["run", "ok"]);
     for dir in [".private", ".private/logs", ".git/citrus"] {
@@ -1047,7 +1067,7 @@ fn logs_and_state_are_private() {
 #[test]
 fn an_external_planner_that_saw_nothing_cannot_pass_unmerged_commits() {
     // The planner reports zero changed files although the branch is ahead of the base.
-    let config = "[plan]\ncommand = [\"sh\", \"-c\", \"printf 'PLAN\\\\tstatus=complete\\\\tfiles=0\\\\n'\"]\nbase = \"main\"\n";
+    let config = "project { base = \"main\" }\nplanner { run = run(\"sh\", \"-c\", \"printf 'PLAN\\\\tstatus=complete\\\\tfiles=0\\\\n'\") }\n";
     let project = Project::new(config);
     project.git(&["checkout", "-q", "-b", "feature"]);
     project.write("src/a.txt", "changed\n");
@@ -1082,13 +1102,16 @@ JSON
 #[test]
 fn diff_compares_what_runs_with_what_head_would_build() {
     let project = Project::new("");
-    project.write(
-        "ci/artifacts.toml",
-        "[artifacts.api]\ninputs = [\"src/**\"]\n",
-    );
-    project.write(
-        "ci/environments.toml",
-        "[environments.prod]\nprovider = \"kubernetes\"\nconnection = { kubectl = \"./kubectl.sh\", namespace = \"shop\" }\nrecord = { annotation = \"example.com/release\", tag_prefix = \"v\" }\n[environments.prod.workloads.api]\nartifact = \"api\"\n",
+    project.declare(
+        r#"
+artifact "api" { inputs = ["src/**"] }
+
+environment "prod" {
+  on = kubernetes(kubectl: "./kubectl.sh", namespace: "shop")
+  record = { annotation: "example.com/release", tag_prefix: "v" }
+  deploy "api" { artifact = "api" }
+}
+"#,
     );
     project.write("kubectl.sh", KUBECTL);
     let mut perms = fs::metadata(project.root().join("kubectl.sh"))
@@ -1174,13 +1197,16 @@ fn diff_compares_what_runs_with_what_head_would_build() {
 #[test]
 fn artifact_inputs_can_come_from_a_command() {
     let project = Project::new("");
-    project.write(
-        "ci/artifacts.toml",
-        "[artifacts.api]\ninputs_command = [\"sh\", \"-c\", \"echo src/a.txt; echo Makefile\"]\n",
-    );
-    project.write(
-        "ci/environments.toml",
-        "[environments.prod]\nprovider = \"kubernetes\"\nconnection = { kubectl = \"./kubectl.sh\" }\nrecord = { annotation = \"example.com/release\", tag_prefix = \"v\" }\n[environments.prod.workloads.api]\nartifact = \"api\"\n",
+    project.declare(
+        r#"
+artifact "api" { inputs = inputs_of(run("sh", "-c", "echo src/a.txt; echo Makefile")) }
+
+environment "prod" {
+  on = kubernetes(kubectl: "./kubectl.sh")
+  record = { annotation: "example.com/release", tag_prefix: "v" }
+  deploy "api" { artifact = "api" }
+}
+"#,
     );
     project.write("kubectl.sh", KUBECTL);
     let mut perms = fs::metadata(project.root().join("kubectl.sh"))
@@ -1229,15 +1255,18 @@ fn artifact_inputs_can_come_from_a_command() {
         serde_json::json!(["Makefile"]),
         "{changed}"
     );
+    let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
     project.write(
-        "ci/artifacts.toml",
-        "[artifacts.api]\ninputs = [\"a\"]\ninputs_command = [\"true\"]\n",
+        "citrus.ci",
+        &text.replace(
+            "inputs = inputs_of(run(\"sh\", \"-c\", \"echo src/a.txt; echo Makefile\"))",
+            "inputs = []",
+        ),
     );
+    let error = project.json(&["artifacts"]).0;
     assert!(
-        project.json(&["artifacts"]).0["error"]
-            .as_str()
-            .unwrap()
-            .contains("exactly one")
+        error["error"].as_str().unwrap().contains("inputs_of"),
+        "{error}"
     );
 }
 
@@ -1293,18 +1322,23 @@ else:
 
 fn apply_project() -> Project {
     let project = Project::new("");
-    project.write(
-        "ci/artifacts.toml",
-        "[artifacts.api]\ninputs = [\"src/**\"]\nbuild = { provider = \"command\", run = [\"sh\", \"-c\", \"echo {artifact} >> .kube/builds; echo IMAGE=registry.example/{artifact}@sha256:{key}\"] }\n\n\
-         [artifacts.backup]\ninputs = [\"other/**\"]\nbuild = { provider = \"command\", run = [\"sh\", \"-c\", \"echo IMAGE=registry.example/{artifact}@sha256:{key}\"] }\n\n\
-         [artifacts.migrations]\ninputs = [\"migrations/**\"]\nbuild = { provider = \"command\", run = [\"sh\", \"-c\", \"echo {artifact} >> .kube/builds; echo IMAGE=registry.example/{artifact}@sha256:{key}\"] }\n",
-    );
-    project.write(
-        "ci/environments.toml",
-        "[environments.prod]\nprovider = \"kubernetes\"\nconnection = { kubectl = \"./kubectl.py\", namespace = \"shop\" }\nrecord = { annotation = \"example.com/release\", tag_prefix = \"v\" }\n\
-         migrations = { artifact = \"migrations\", job = \"job.yaml\" }\n\n\
-         [environments.prod.workloads.api]\nartifact = \"api\"\nfence = \"api-lease\"\ntimeout = 10\n\n\
-         [environments.prod.workloads.backup]\nartifact = \"backup\"\nkind = \"cronjob\"\nquiesce = true\n",
+    project.declare(
+        r#"
+fn image() { "echo IMAGE=registry.example/{artifact}@sha256:{key}" }
+fn logged() { run("sh", "-c", "echo {artifact} >> .kube/builds; " + image()) }
+
+artifact "api" { inputs = ["src/**"], build = { provider: "command", run: logged() } }
+artifact "backup" { inputs = ["other/**"], build = { provider: "command", run: run("sh", "-c", image()) } }
+artifact "migrations" { inputs = ["migrations/**"], build = { provider: "command", run: logged() } }
+
+environment "prod" {
+  on = kubernetes(kubectl: "./kubectl.py", namespace: "shop")
+  record = { annotation: "example.com/release", tag_prefix: "v" }
+  migrations = { artifact: "migrations", job: "job.yaml" }
+  deploy "api" { artifact = "api", fence = "api-lease", timeout = 10s }
+  deploy "backup" { artifact = "backup", kind = cronjob, quiesce = true }
+}
+"#,
     );
     project.write(
         "job.yaml",
@@ -1508,9 +1542,13 @@ fn a_failed_apply_resumes_quiesced_work_and_frees_the_environment() {
 fn a_worker_that_dies_without_a_result_does_not_hang_wait() {
     // The worker of this release has no unit to run and exits at once.
     let project = release_project();
+    let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
     project.write(
-        "ci/releases.toml",
-        &RELEASES.replace("[releases.app]", "[releases.app]\nchecks = \"none\""),
+        "citrus.ci",
+        &text.replace(
+            "environment = \"prod\"",
+            "environment = \"prod\"\n  checks = none",
+        ),
     );
     project.git(&[
         "-c",
@@ -1523,7 +1561,7 @@ fn a_worker_that_dies_without_a_result_does_not_hang_wait() {
     ]);
     let (started, _) = project.json(&["release", "start", "app", "--approve", "--detach"]);
     let id = started["release"]["id"].as_str().unwrap().to_owned();
-    fs::write(project.root().join("ci/releases.toml"), "").unwrap();
+    fs::write(project.root().join("citrus.ci"), BASE).unwrap();
     let begun = Instant::now();
     let (waited, _) = project.json(&["release", "wait", &id]);
     assert!(
@@ -1567,7 +1605,6 @@ fn an_identical_image_is_recorded_without_touching_the_pod_template() {
 
 fn ci_project(source: &str) -> Project {
     let project = Project::new("");
-    fs::remove_file(project.root().join("ci/targets.toml")).unwrap();
     project.write("citrus.ci", source);
     project.git(&["add", "-A"]);
     project.git(&[
@@ -1682,16 +1719,93 @@ fn add_and_doctor_follow_citrus_ci() {
     let (added, code) = project.json(&["add", "plain", "--inputs", "Makefile", "--cache"]);
     assert_eq!(code, 0, "{added}");
     let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
-    assert!(text.contains("check \"plain\" {\n  owns  = [\"Makefile\"]\n  run   = make(\"plain\")\n  cache = true\n}"), "{text}");
+    assert!(
+        text.contains(
+            "check \"plain\" {\n  owns = [\"Makefile\"]\n  run = make(\"plain\")\n  cache = true\n}"
+        ),
+        "{text}"
+    );
     assert_eq!(project.json(&["check"]).0["checks"], 3);
 
-    project.write("ci/targets.toml", MANIFEST);
+    project.write("citrus.toml", "[run]\n");
     let (doctor, _) = project.json(&["doctor"]);
     let warn = doctor["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|finding| finding["check"] == "citrus.ci")
+        .find(|finding| finding["check"] == "citrus.toml")
         .unwrap();
     assert_eq!(warn["status"], "warn", "{doctor}");
+}
+
+#[test]
+fn an_edited_declaration_selects_its_check() {
+    let project = Project::new("project { base = \"main\" }\n");
+    project.git(&["checkout", "-q", "-b", "feature"]);
+    let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
+    project.write(
+        "citrus.ci",
+        &text.replace("run = make(\"fail\")", "run = make(\"plain\")"),
+    );
+    project.commit("fail runs plain now");
+    let (plan, _) = project.json(&["plan"]);
+    assert_eq!(
+        plan["plan"]["targets"],
+        serde_json::json!(["fail"]),
+        "{plan}"
+    );
+    assert_eq!(plan["plan"]["unmapped"], serde_json::json!([]), "{plan}");
+
+    // A change outside checks maps the file to the configuration, not to every check.
+    project.declare("command \"make deploy\" { about = \"ship it\" }\n");
+    project.commit("catalog");
+    project.write(
+        "citrus.ci",
+        &fs::read_to_string(project.root().join("citrus.ci"))
+            .unwrap()
+            .replace("run = make(\"plain\")", "run = make(\"fail\")"),
+    );
+    project.commit("back");
+    let (plan, _) = project.json(&["plan"]);
+    assert_eq!(plan["plan"]["targets"], serde_json::json!([]), "{plan}");
+    assert_eq!(plan["plan"]["mapped"][0][1], "config", "{plan}");
+}
+
+#[test]
+fn project_tools_read_the_declared_checks() {
+    let project = Project::new(
+        "planner { run = run(\"sh\", \"plan.sh\") }\ncheck \"e2e\" { owns = [\"web/**\"], run = make(\"plain\"), meta = { linux: true, snapshot: [\"assets\"] } }\n",
+    );
+    project.write("web/x", "x\n");
+    project.write("plan.sh", "mkdir -p .citrus && cp \"$CITRUS_CHECKS\" .citrus/checks.json\nprintf 'TARGET\\tmake:ok\\n'\n");
+    project.commit("planner");
+    assert_eq!(
+        project.json(&["plan"]).0["plan"]["targets"],
+        serde_json::json!(["ok"])
+    );
+    let checks: Value = serde_json::from_str(
+        &fs::read_to_string(project.root().join(".citrus/checks.json")).unwrap(),
+    )
+    .unwrap();
+    let e2e = checks["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["target"] == "e2e")
+        .unwrap();
+    assert_eq!(e2e["meta"]["linux"], true);
+    assert_eq!(
+        e2e["declaration"]["run"],
+        serde_json::json!([["run", "make", "--no-print-directory", "plain"]])
+    );
+    assert_eq!(checks["files"], serde_json::json!(["citrus.ci"]));
+    let (targets, _) = project.json(&["targets"]);
+    assert!(
+        targets["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["source"] == "citrus.ci:17"),
+        "{targets}"
+    );
 }

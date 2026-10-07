@@ -253,6 +253,12 @@ pub const ACTIONS: &[&str] = &[
 ];
 /// Pure helpers evaluated immediately.
 const FUNCTIONS: &[&str] = &["len", "str", "keys", "values", "range", "glob"];
+/// Values Citrus fills in while running: `before` (the commit before a merge),
+/// `version`, `next`, `previous` (releases), `release`, `short`, `commit`.
+pub const PLACEHOLDERS: &[&str] = &[
+    "before", "version", "next", "previous", "unit", "release", "short", "commit", "artifact",
+    "key", "tag",
+];
 /// Named constants.
 const CONSTANTS: &[&str] = &[
     "local",
@@ -283,6 +289,10 @@ fn globals() -> Scope {
     for constant in CONSTANTS {
         scope.set(constant, Value::Str((*constant).to_owned()));
     }
+    // Values known only while Citrus runs; actions receive them as placeholders.
+    for name in PLACEHOLDERS {
+        scope.set(name, Value::Str(format!("{{{name}}}")));
+    }
     scope
 }
 
@@ -291,14 +301,22 @@ pub struct Evaluator<'a> {
     sources: &'a mut Sources,
     loaded: Vec<String>,
     files: Option<Vec<String>>,
+    /// Read files as committed at this revision instead of the working tree.
+    revision: Option<&'a str>,
 }
 
-pub fn evaluate_project(root: &Path, entry: &str, sources: &mut Sources) -> Result<Graph, Error> {
+pub fn evaluate_project(
+    root: &Path,
+    entry: &str,
+    revision: Option<&str>,
+    sources: &mut Sources,
+) -> Result<Graph, Error> {
     let mut evaluator = Evaluator {
         root,
         sources,
         loaded: Vec::new(),
         files: None,
+        revision,
     };
     let mut graph = Graph::default();
     let scope = globals();
@@ -324,9 +342,13 @@ impl Evaluator<'_> {
             return Ok(());
         }
         self.loaded.push(relative.to_owned());
-        let path = self.root.join(relative);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| Error::at(at, format!("cannot read {relative}: {error}")))?;
+        let text = match self.revision {
+            None => std::fs::read_to_string(self.root.join(relative))
+                .map_err(|error| Error::at(at, format!("cannot read {relative}: {error}")))?,
+            Some(revision) => self
+                .git(&["show", &format!("{revision}:{relative}")])
+                .ok_or_else(|| Error::at(at, format!("cannot read {relative} at {revision}")))?,
+        };
         let id = self
             .sources
             .add(Path::new(relative).to_path_buf(), text.clone());
@@ -847,19 +869,27 @@ impl Evaluator<'_> {
         })
     }
 
+    fn git(&self, args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(self.root)
+            .args(args)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn repository_files(&mut self) -> &Vec<String> {
         if self.files.is_none() {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(self.root)
-                .args(["ls-files", "--cached", "--others", "--exclude-standard"])
-                .output()
-                .map(|output| {
-                    String::from_utf8_lossy(&output.stdout)
-                        .lines()
-                        .map(str::to_owned)
-                        .collect()
-                })
+            let listing = match self.revision {
+                None => self.git(&["ls-files", "--cached", "--others", "--exclude-standard"]),
+                Some(revision) => self.git(&["ls-tree", "-r", "--name-only", revision]),
+            };
+            let output = listing
+                .map(|text| text.lines().map(str::to_owned).collect())
                 .unwrap_or_default();
             self.files = Some(output);
         }
@@ -966,7 +996,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("citrus.ci"), source).unwrap();
         let mut sources = Sources::default();
-        evaluate_project(dir.path(), "citrus.ci", &mut sources)
+        evaluate_project(dir.path(), "citrus.ci", None, &mut sources)
             .map_err(|error| sources.render(&error))
     }
 

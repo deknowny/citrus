@@ -30,7 +30,7 @@ impl Repo {
             &root,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )?);
-        let config = Config::load(&root)?;
+        let config = Config::default();
         Ok(Repo {
             root,
             common,
@@ -56,14 +56,6 @@ impl Repo {
 
     pub fn log_dir(&self) -> PathBuf {
         self.root.join(&self.config.log_dir)
-    }
-
-    pub fn releases_path(&self) -> PathBuf {
-        self.root.join(&self.config.releases)
-    }
-
-    pub fn manifest_path(&self) -> PathBuf {
-        self.root.join(&self.config.manifest)
     }
 
     pub fn branch(&self) -> String {

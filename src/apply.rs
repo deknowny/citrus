@@ -599,7 +599,7 @@ fn build_artifact(
     commit: &str,
     extra_env: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let text = |table: &BTreeMap<String, toml::Value>, field: &str| {
+    let text = |table: &BTreeMap<String, serde_json::Value>, field: &str| {
         table
             .get(field)
             .and_then(|value| value.as_str())

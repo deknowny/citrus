@@ -1,6 +1,7 @@
-//! Which checks the current changes need. A project with its own planner keeps
-//! owning path → target routing (`plan.command`); otherwise the declared
-//! targets that own the changed paths are selected.
+//! Which checks the current changes need. A project with its own `planner`
+//! keeps owning path → check routing (it reads the declared checks from
+//! `CITRUS_CHECKS`); otherwise the declared checks owning the changed paths
+//! are selected.
 
 use std::process::Command;
 
@@ -31,7 +32,7 @@ pub fn compute(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<P
     let extra = base
         .filter(|_| !config.base_arg.is_empty())
         .map(|base| config.base_arg.replace("{base}", base));
-    external(repo, extra)
+    external(repo, manifest, extra)
 }
 
 /// The checks that changes to exactly `paths` would select; `before` is the
@@ -42,7 +43,7 @@ pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &st
         return Ok(select(repo, manifest, paths.to_vec(), before));
     }
     if config.paths_arg.is_empty() {
-        bail!("the planner takes no path list (plan.paths_arg in citrus.toml)");
+        bail!("the planner takes no path list (`paths_var` of `planner` in citrus.ci)");
     }
     let dir = repo.state_dir().join("tmp");
     crate::repo::private_dir(&dir)?;
@@ -60,6 +61,7 @@ pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &st
     )?;
     let result = external(
         repo,
+        manifest,
         Some(
             config
                 .paths_arg
@@ -70,10 +72,13 @@ pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &st
     result
 }
 
-fn external(repo: &Repo, extra: Option<String>) -> Result<Plan> {
+fn external(repo: &Repo, manifest: &Manifest, extra: Option<String>) -> Result<Plan> {
     let config = &repo.config.plan;
     let mut command = Command::new(&config.command[0]);
-    command.args(&config.command[1..]).current_dir(&repo.root);
+    command
+        .args(&config.command[1..])
+        .current_dir(&repo.root)
+        .env("CITRUS_CHECKS", manifest.export_file(repo)?);
     if let Some(extra) = extra {
         command.arg(extra);
     }
@@ -121,13 +126,21 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> P
         files: paths.len(),
         ..Plan::default()
     };
-    let manifest_path = repo.config.manifest.clone();
-    if paths.contains(&manifest_path) {
+    let edited: Vec<String> = paths
+        .iter()
+        .filter(|path| manifest.files.contains(path))
+        .cloned()
+        .collect();
+    if !edited.is_empty() {
         // New or edited declarations are checked right away.
-        let before = repo
-            .git(&["show", &format!("{fork}:{manifest_path}")])
-            .ok()
-            .and_then(|text| Manifest::parse(&text).ok())
+        let before = (!fork.is_empty())
+            .then(|| {
+                crate::lang::compile::load_at(&repo.root, Some(fork))
+                    .ok()
+                    .flatten()
+            })
+            .flatten()
+            .and_then(|(project, sources)| Manifest::from_project(&project, &sources).ok())
             .unwrap_or_default();
         let changed: Vec<String> = manifest
             .targets
@@ -140,25 +153,22 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> P
             })
             .map(|target| target.name.clone())
             .collect();
-        if !changed.is_empty() {
-            plan.mapped.push((
-                manifest_path.clone(),
-                changed
-                    .iter()
-                    .map(|name| format!("target:{name}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ));
-            plan.targets.extend(changed);
+        let surfaces = if changed.is_empty() {
+            "config".to_owned()
+        } else {
+            changed
+                .iter()
+                .map(|name| format!("target:{name}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for path in &edited {
+            plan.mapped.push((path.clone(), surfaces.clone()));
         }
+        plan.targets.extend(changed);
     }
     for path in paths {
-        if path == manifest_path
-            && plan
-                .mapped
-                .iter()
-                .any(|(mapped, _)| *mapped == manifest_path)
-        {
+        if edited.contains(&path) {
             continue;
         }
         let owners = manifest.owners(&path);

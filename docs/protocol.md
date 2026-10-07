@@ -18,7 +18,7 @@ Only `TARGET	make:<name>` lines select checks; other `TARGET` entries are shown 
 notes. `PLAN`, `MAPPED` and `UNMAPPED` are optional and only improve the
 explanation. A non-zero exit without any `TARGET` line is a planner failure.
 
-## Runner progress (`run.remote`, and any local target)
+## Runner progress (a `pool`, and any local target)
 
 ```
 CITRUS_TARGET target=<name> status=START
@@ -27,23 +27,26 @@ CITRUS_TARGET target=<name> status=FAIL exit=2 seconds=12
 ```
 
 Your runner can use its own prefix with the same fields; list it in
-`run.progress_prefixes`. Output between a target's START and its result is
+the `progress` markers of the pool. Output between a target's START and its result is
 that target's log; Citrus takes the first error from it. If the runner exits
 non-zero without failing any target, the run shows a `suite` row with the
 first error of the whole output.
 
 Optional markers, all configured by prefix:
 
-| Key | Meaning | Example line |
+| `pool` field | Meaning | Example line |
 |---|---|---|
-| `waiting_prefix` | queued for a resource (first word after the prefix) | `QUEUED resource=builder` |
-| `acquired_prefixes` | the resource was granted | `ACQUIRED resource=builder` |
-| `stage_prefix` | a stage name shown in `status` | `STAGE [2/5] preparing runner` |
-| `linked_log_markers` | the path of a fuller log, read after the run | `… full log: logs/run-42.log` |
+| `waiting` | queued for a resource (first word after the prefix) | `QUEUED resource=builder` |
+| `acquired` | the resource was granted | `ACQUIRED resource=builder` |
+| `stage` | a stage name shown in `status` | `STAGE [2/5] preparing runner` |
+| `log_after` | the path of a fuller log, read after the run | `… full log: logs/run-42.log` |
 
-## Resources (`status.resources_command`)
+The pool command runs with `CITRUS_CHECKS` (docs/manifest.md), so it can
+send the declared checks wherever it runs them.
 
-Lines starting with `resource_prefix` describe one resource as `key=value`
+## Resources (`status` of a pool)
+
+Lines starting with `status_prefix` describe one resource as `key=value`
 fields. `host`/`name`, `state`, `operation`, `owner` and `elapsed_seconds` are
 shown; anything else is kept in JSON output.
 

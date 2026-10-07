@@ -1,6 +1,6 @@
 # The `.ci` language
 
-Status: `citrus 1`, first part implemented — values, `let`, functions, `for`/`if`, comprehensions, interpolation, durations, `use`; `project`, `check`, `task`; `citrus check`, `citrus do`. Artifacts, environments, pools and events follow. Issue #11.
+Status: `citrus 1` is Citrus's only configuration. Implemented: values, `let`, functions, `for`/`if`, comprehensions, interpolation, durations, `use`; blocks `project`, `check`, `task`, `release`, `artifact`, `environment`, `planner`, `pool`, `command` (reference: docs/configuration.md); `citrus check`, `citrus do`. Execution events, `citrus fmt` and the actions marked *planned* below follow. Issue #11.
 
 A `.ci` file describes a project's CI/CD — checks, artifacts, environments,
 tasks — in a form a person reads at a glance and an agent writes correctly
@@ -51,17 +51,17 @@ language can be exactly as small as the job requires.
 ## Values and expressions
 
 ```
-let name    = "api"                       # string; "{expr}" interpolates, "{{" is a literal brace
-let count   = 3                           # integer
-let enabled = true                        # bool
-let none_   = none                        # absence
-let items   = ["a", "b"]                  # list
-let opts    = { file: "Dockerfile", target: name }   # map with identifier or string keys
+let name = "api"  # string; "{expr}" interpolates, "{{" is a literal brace
+let count = 3  # integer
+let enabled = true  # bool
+let nothing = none  # absence
+let items = ["a", "b"]  # list
+let opts = { file: "Dockerfile", target: name }  # map with identifier or string keys
 
-let doubled = [x * 2 for x in [1, 2, 3] if x > 1]     # comprehension
-let label   = if enabled { "on" } else { "off" }      # if is an expression
-let joined  = items.join(", ")                       # methods on built-in types
-let line    = """
+let doubled = [x * 2 for x in [1, 2, 3] if x > 1]  # comprehension
+let label = if enabled { "on" } else { "off" }  # if is an expression
+let joined = items.join(", ")  # methods on built-in types
+let line = """
   multi-line string, common indentation removed
 """
 ```
@@ -90,9 +90,9 @@ dashboard shows each instance separately with the same source line.
 
 ```
 project {
-  base    = "origin/main"          # what "changed" is measured against
-  logs    = ".citrus/logs"         # must be ignored by Git
-  toolchain = ["rust-toolchain.toml", ".python-version"]   # inputs of every cached check
+  base = "origin/main"  # what "changed" is measured against
+  logs = ".citrus/logs"  # must be ignored by Git
+  toolchain = ["rust-toolchain.toml", ".python-version"]  # inputs of every cached check
 }
 ```
 
@@ -100,12 +100,12 @@ project {
 
 ```
 check "test-api" {
-  owns    = ["crates/api/**"]       # changing these selects the check
-  reads   = ["Cargo.lock"]          # these invalidate reuse but do not select it
-  run     = cargo.test("api")       # an action
-  cache   = true                    # reuse a PASS while owns+reads are unchanged
-  env     = { SQLX_OFFLINE: "true" }
-  on      = local                   # local | remote(pool) | linux
+  owns = ["crates/api/**"]  # changing these selects the check
+  reads = ["Cargo.lock"]  # these invalidate reuse but do not select it
+  run = cargo.test("api")  # an action
+  cache = true  # reuse a PASS while owns, reads and run are unchanged
+  env = { SQLX_OFFLINE: "true" }
+  meta = { linux: true }  # data for the project's own tools
 }
 ```
 
@@ -113,9 +113,9 @@ check "test-api" {
 
 ```
 artifact "api" {
-  inputs = rust_closure("api") + ["Dockerfile"]  # key = content of inputs + this declaration
-  build  = docker(file: "Dockerfile", target: "api")
-  push   = "registry.example.com/shop/api"
+  inputs = ["crates/api/**", "Cargo.lock", "Dockerfile"]  # key = content of inputs + this declaration
+  build = { provider: "docker", dockerfile: "Dockerfile", target: "api" }
+  publish = { registry: "registry.example.com/shop/api" }
 }
 ```
 
@@ -123,17 +123,30 @@ artifact "api" {
 
 ```
 environment "shop-production" {
-  on       = kubernetes(context: "prod", namespace: "shop")
+  on = kubernetes(context: "prod", namespace: "shop")
   approval = required
-  checks   = proven
-  migrate  = job("deploy/migrate.yaml", artifact: "api-migrations", timeout: 5m)
+  checks = proven
+  migrations = { artifact: "api-migrations", job: "deploy/migrate.yaml", timeout: 5m }
 
-  deploy "api" { artifact = "api", strategy = rolling }
-  deploy "bot" { artifact = "bot", strategy = recreate, fence = lease("bot-session") }
+  deploy "api" { artifact = "api" }
+  deploy "bot" { artifact = "bot", fence = "bot-session" }
   deploy "backup" { artifact = "backup", kind = cronjob, quiesce = true }
 
-  record   = annotation("example.com/release", name: "{short}")
-  verify   = [http("https://shop.example.com/health"), check("smoke-shop")]
+  record = { annotation: "example.com/release" }
+  verify = { http: ["https://shop.example.com/health"] }
+}
+```
+
+### `release` and `step`
+
+Ordered steps of the project's own commands (docs/releases.md):
+
+```
+release "web" {
+  environment = "web-production"
+  version = { reserve: make("version-reserve", START: next), initial: "1.4.0" }
+  step "build" { run = make("image", VERSION: version) }
+  step "deploy" { production = true, run = make("deploy", VERSION: version) }
 }
 ```
 
@@ -153,26 +166,32 @@ task "seed-dev-db" {
 }
 ```
 
-### `pool` and `remote`
-
-```
-pool "builders" {
-  run    = make("check-remote-suite")          # the project's own remote runner, for now
-  report = progress(prefix: "CI_PARALLEL_LANE", log: after("full log: "))
-}
-```
-
-### `use`, `planner`, `hook`
+### `planner`, `pool`, `command`, `use`
 
 ```
 use "ci/mt3s.ci"
-planner = external(make("ci-plan"), base: arg("BASE_REF={base}"), paths: arg("GARVIS_CHANGED_PATHS_FILE={file}"))
-hook after_merge = run("python3", "-B", "scripts/task-flow.py", "retire-gitlinks", "--since", before)
+
+planner { run = make("ci-plan"), base_var = "BASE_REF", paths_var = "PATHS_FILE" }
+
+pool "builders" {
+  run = make("check-remote-suite")  # the project's own remote runner, for now
+  progress = ["CI_PARALLEL_LANE"]
+  log_after = ["full log: "]
+}
+
+command "make deploy" { about = "Roll out the verified release", group = "release" }
 ```
+
+Values known only while Citrus runs are names: `before` (in
+`project.after_merge`), `version`, `next`, `previous`, `unit`, `commit`
+(releases), `artifact`, `key`, `release`, `short`, `tag` (artifacts and
+environments). Inside a string they are written `{version}`.
 
 ## Standard library
 
 **Actions** (values describing work; Citrus executes them, each carries its span):
+
+Actions without a mark work today; *planned* ones are reserved names.
 
 | Action | Meaning |
 |---|---|
@@ -180,19 +199,19 @@ hook after_merge = run("python3", "-B", "scripts/task-flow.py", "retire-gitlinks
 | `make(target, vars…)` | `make <target>` |
 | `cargo.test(pkg)`, `cargo.build(…)` | Cargo commands |
 | `sh("…")` | a shell command — explicit, flagged non-portable by `citrus check` |
-| `docker(file:, target:, platform:)` | build and push, result is a digest |
-| `kubectl(…)`, `kubernetes(context:, namespace:)` | cluster access |
+| `docker(…)` | *planned*; today `build = { provider: "docker", … }` |
+| `kubernetes(context:, namespace:, kubectl:)` | the provider of an environment (`on = …`) |
 | `compose.up(service)`, `compose.down()` | Docker Compose |
-| `job(template, artifact:, timeout:)` | run a Kubernetes Job from a template |
+| `job(…)` | *planned*; today `migrations = { artifact:, job:, timeout: }` |
 | `wait.tcp(addr)`, `wait.http(url)`, `wait.file(path)` | readiness |
-| `http(url)` | a verification request |
-| `copy(from, to)`, `archive(dir, to)` | files |
-| `check(name)` | run a declared check as a step |
-| `lease(name)`, `annotation(key, name:)` | fences and records |
+| `http(url)` | *planned*; today `verify = { http: [...] }` |
+| `copy(from, to)` | copy a file; `archive` *planned* |
+| `check(name)` | *planned*: run a declared check as a step |
+| `lease(…)`, `annotation(…)` | *planned*; today `fence = "lease"`, `record = { annotation: … }` |
 
-**Inputs:** `glob(pattern)`, `read(path)`, `rust_closure(package)` (a Cargo
-dependency closure), `inputs_of(command)` (a command printing paths; an
-escape hatch, flagged by `check`).
+**Inputs:** `glob(pattern)`, `inputs_of(command)` (a command printing
+paths, for artifact inputs a glob cannot express); `read(path)` and
+`rust_closure(package)` (a Cargo dependency closure) are planned.
 
 **Values:** `secret(name)` — resolved only during execution from the
 environment or a configured store; never printed, logged, shown in the
@@ -210,8 +229,16 @@ dashboard or returned to agents. `env(name)` — a non-secret variable.
    inputs miss files they read (when detectable), non-portable actions.
 3. Commands (`status`, `run`, `diff`, `apply`, `do`) select a part of the
    graph and execute it. The runtime records every transition as an event.
-4. `citrus fmt` prints the canonical layout, so files written by different
-   agents look the same.
+4. `citrus fmt` (planned) prints the canonical layout, so files written by
+   different agents look the same.
+
+## Layout
+
+One space around `=`, two-space indentation, one block per declaration. No
+vertical alignment of `=` or comments: aligned columns cost tokens on every
+line an agent reads or writes, and adding one longer field re-aligns its
+neighbours — noisy diffs and merge conflicts between agents working in
+parallel. `citrus fmt` will enforce this layout.
 
 ## Execution events
 
@@ -270,12 +297,12 @@ check "docs" { owns = ["*.md", "docs/**", "skills/**"], run = links.check("**/*.
 for target in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
   artifact "citrus-{target}" {
     inputs = ["src/**", "Cargo.*"]
-    build  = cargo.build(release: true, target: target)
+    build = cargo.build(release: true, target: target)
   }
 }
 
 environment "github" {
-  on     = github.release(repository: "deknowny/citrus", tag: "v{version}")
+  on = github.release(repository: "deknowny/citrus", tag: "v{version}")
   checks = proven
   verify = [checksums()]
 }
@@ -288,8 +315,8 @@ environment "github" {
 - Running commands during evaluation.
 - Templating other formats with string concatenation (Kubernetes manifests
   stay manifests; `job()` and `kubernetes()` substitute declared fields).
-- Backwards compatibility with TOML forever: TOML stays readable while
-  consumers move, then goes.
+- Compatibility before 1.0. The TOML configuration is gone; language
+  changes before 1.0 are breaking and listed in CHANGELOG.md.
 
 ## Plan
 
@@ -297,7 +324,8 @@ environment "github" {
    MT3S releases, a few shell scripts).
 2. Lexer, parser with spans, evaluator into the existing graph types;
    `citrus check`, `citrus fmt`; errors with source excerpts.
-3. Citrus describes itself in `citrus.ci`; TOML remains a supported input.
+3. Citrus describes itself in `citrus.ci`; `citrus.ci` becomes the only
+   configuration (done).
 4. Execution events with spans; the CLI live view; `citrus do <task>`.
 5. Garvis moves product by product, deleting scripts as it goes.
 6. Dashboard on events; syntax highlighting; LSP.

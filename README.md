@@ -56,7 +56,7 @@ their results shared, reusable and short.
 | `citrus tasks` / `citrus note <text>` | Every worktree as a task — branch, unmerged commits, runs — and what its owner wants others to know |
 | `citrus diff <env>` / `citrus apply <env> --approve` | What an environment runs versus what HEAD builds; build what is missing by input key and roll it out by digest ([docs/design/declarative.md](docs/design/declarative.md)) |
 | `citrus release start <unit> --approve` | Release a unit from HEAD: version → build → deploy → postcheck with gates, an environment lock, recovery of interrupted steps and rollback ([docs/releases.md](docs/releases.md)) |
-| `citrus` | What can be done here: Citrus commands plus the project's own catalog from `citrus.toml` |
+| `citrus` | What can be done here: Citrus commands plus the project's own `command` blocks |
 | `citrus targets` | Declared checks and when they last passed |
 | `citrus add <target> --inputs …` | Declare a check after validating it — instead of writing another wrapper script |
 | `citrus stats` | Runs, reuse rate, time not spent thanks to reuse |
@@ -68,9 +68,9 @@ get structured results with a `next` list of valid follow-up commands.
 
 ## How reuse stays honest
 
-- **Declared checks** (`ci/targets.toml`, `cache = true`) are reused while every
-  file they own or read, their manifest entry and the toolchain files are
-  unchanged (7 days by default). A PASS is recorded only if the inputs did not
+- **Declared checks** (`check` blocks with `cache = true`) are reused while
+  every file they own or read, what they run and the toolchain files are
+  unchanged (7 days). A PASS is recorded only if the inputs did not
   change while the check ran.
 - **Any other check** is reused only for the byte-identical source tree
   (Git tree of all non-ignored files), for 24 hours.
@@ -88,8 +88,8 @@ cat > citrus.ci <<'CI'
 citrus 1
 
 check "test" {
-  owns  = ["src/**", "tests/**"]
-  run   = make("test")
+  owns = ["src/**", "tests/**"]
+  run = make("test")
   cache = true
 }
 
@@ -104,13 +104,14 @@ citrus run
 citrus do dev-db
 ```
 
-`citrus.ci` is a small language: blocks describe checks and tasks, expressions
+`citrus.ci` is the whole configuration, in a small language: blocks describe
+checks, tasks, releases and environments, expressions
 compute values (`let`, functions, `for`, `if`, `"{interpolation}"`), and steps
 are built into Citrus so they behave the same on macOS, Linux and Windows —
 see [docs/design/language.md](docs/design/language.md). This repository's own
-[`citrus.ci`](citrus.ci) is a short real example. The older TOML configuration
-([docs/configuration.md](docs/configuration.md), [examples/](examples/)) still
-works where `citrus.ci` is absent.
+[`citrus.ci`](citrus.ci) is a short real example; every block is listed in
+[docs/configuration.md](docs/configuration.md), and [examples/](examples/)
+shows a Make project, an npm project and a monorepo with remote builders.
 
 ## Pinning Citrus in a repository
 

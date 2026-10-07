@@ -46,7 +46,7 @@ impl Context {
         let (manifest, project) = match crate::lang::compile::load(&repo.root)
             .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
         {
-            // `citrus.ci` is the source of truth when it exists.
+            // `citrus.ci` is the whole configuration; without it, generic defaults.
             Some((project, sources)) => {
                 if let Some(base) = &project.base {
                     repo.config.plan.base = base.clone();
@@ -57,17 +57,53 @@ impl Context {
                 if !project.toolchain.is_empty() {
                     repo.config.toolchain_files = project.toolchain.clone();
                 }
-                let mut targets = std::collections::BTreeMap::new();
-                for check in &project.checks {
-                    let (file, line, _) = sources.locate(check.span);
-                    targets.insert(
-                        check.name.clone(),
-                        crate::manifest::Target::declared(check, format!("{file}:{line}"))?,
-                    );
+                let config = &mut repo.config;
+                if let Some(receipts) = &project.receipts {
+                    config.receipts.dir = receipts.clone();
                 }
-                (Manifest { targets }, Some(project))
+                for (name, vars) in &project.check_env {
+                    config
+                        .run
+                        .env
+                        .insert(name.clone(), vars.iter().cloned().collect());
+                }
+                if let Some(planner) = &project.planner {
+                    config.plan.command = planner.argv.clone();
+                    config.plan.base_arg = planner
+                        .base_var
+                        .as_ref()
+                        .map(|var| format!("{var}={{base}}"))
+                        .unwrap_or_default();
+                    config.plan.paths_arg = planner
+                        .paths_var
+                        .as_ref()
+                        .map(|var| format!("{var}={{file}}"))
+                        .unwrap_or_default();
+                }
+                if let Some(pool) = &project.pool {
+                    config.run.remote = pool.argv.clone();
+                    config.run.progress_prefixes = pool.progress.clone();
+                    config.run.waiting_prefix = pool.waiting.clone().unwrap_or_default();
+                    config.run.acquired_prefixes = pool.acquired.clone();
+                    config.run.stage_prefix = pool.stage.clone().unwrap_or_default();
+                    config.run.linked_log_markers = pool.log_after.clone();
+                    config.status.resources_command = pool.status.clone();
+                    config.status.resource_prefix = pool.status_prefix.clone().unwrap_or_default();
+                    config.status.refresh_seconds = pool.refresh;
+                }
+                if !project.after_merge.is_empty() {
+                    config.integrate.after_merge = project.after_merge.clone();
+                }
+                for (command, about, group) in &project.commands {
+                    config.catalog.push(crate::config::CatalogEntry {
+                        command: command.clone(),
+                        description: about.clone(),
+                        group: group.clone(),
+                    });
+                }
+                (Manifest::from_project(&project, &sources)?, Some(project))
             }
-            None => (Manifest::load(&repo.manifest_path())?, None),
+            None => (Manifest::default(), None),
         };
         let store = Store::open(&repo.state_dir())?;
         Ok(Context {
@@ -178,7 +214,7 @@ impl Context {
         let explicit = !request.targets.is_empty();
         let remote_available = !self.repo.config.run.remote.is_empty();
         if request.mode == Mode::Remote && !remote_available {
-            bail!("no remote runner configured (run.remote in citrus.toml)");
+            bail!("no remote runner: declare a `pool` in citrus.ci");
         }
         if explicit && request.mode == Mode::Remote {
             bail!("--remote runs the planned set; drop the target names or use --local");
@@ -552,6 +588,7 @@ impl Context {
             .arg("citrus-remote")
             .args(&argv)
             .current_dir(&self.repo.root)
+            .env("CITRUS_CHECKS", self.manifest.export_file(&self.repo)?)
             .stdin(Stdio::null())
             .stdout(Stdio::piped());
         let mut child = command.spawn()?;

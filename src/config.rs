@@ -1,27 +1,13 @@
-//! Project configuration: `citrus.toml` at the repository root.
-//!
-//! Every project-specific choice lives here. Without the file Citrus works with
-//! generic defaults: the built-in planner selects declared targets owning the
-//! changed paths, targets run as `make <target>`, state is a local SQLite file
-//! shared by all worktrees of the clone.
+//! Settings Citrus runs with: generic defaults, overridden by the `project`,
+//! `planner` and `pool` blocks of `citrus.ci` (see `exec::Context::open`).
+//! Without them the built-in planner selects declared checks owning the
+//! changed paths, and state is a local SQLite file shared by all worktrees.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone)]
 pub struct Config {
-    /// Declared targets, repository-relative.
-    pub manifest: String,
-    /// Release units, repository-relative (docs/releases.md).
-    pub releases: String,
-    /// Artifacts and environments for `citrus diff` (docs/design/declarative.md).
-    pub artifacts: String,
-    pub environments: String,
     /// Files every declared target's fingerprint depends on (toolchain pins).
     pub toolchain_files: Vec<String>,
     /// Where run logs go, repository-relative; should be ignored by Git.
@@ -38,8 +24,7 @@ pub struct Config {
     pub catalog: Vec<CatalogEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Default)]
 pub struct IntegrateConfig {
     /// Runs after a successful merge, before checks; `{before}` is the commit
     /// before the merge. For project housekeeping such as retiring removed
@@ -47,19 +32,16 @@ pub struct IntegrateConfig {
     pub after_merge: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CatalogEntry {
     /// What to type, e.g. `make release-prepare-web`.
     pub command: String,
     pub description: String,
     /// Optional heading the entry is listed under.
-    #[serde(default)]
     pub group: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Default)]
 pub struct StatusConfig {
     /// Slow command describing shared execution resources (builders, runners).
     /// `status` shows its last snapshot and refreshes it in the background.
@@ -70,8 +52,7 @@ pub struct StatusConfig {
     pub refresh_seconds: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone)]
 pub struct PlanConfig {
     /// Default base for "what changed" when `--base` is not given.
     pub base: String,
@@ -86,8 +67,7 @@ pub struct PlanConfig {
     pub paths_arg: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone)]
 pub struct RunConfig {
     /// Command for one target on this machine; `{target}` is substituted.
     pub local: Vec<String>,
@@ -109,8 +89,7 @@ pub struct RunConfig {
     pub linked_log_markers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone)]
 pub struct ReceiptsConfig {
     /// PASS receipts of declared targets; relative to the Git common dir.
     pub dir: String,
@@ -120,11 +99,8 @@ pub struct ReceiptsConfig {
     pub snapshot_max_age_hours: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone)]
 pub struct StateConfig {
-    /// `sqlite`: one file shared by the worktrees of this clone.
-    pub backend: String,
     /// SQLite directory, relative to the Git common dir.
     pub path: String,
 }
@@ -132,10 +108,6 @@ pub struct StateConfig {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            manifest: "ci/targets.toml".into(),
-            releases: "ci/releases.toml".into(),
-            artifacts: "ci/artifacts.toml".into(),
-            environments: "ci/environments.toml".into(),
             toolchain_files: Vec::new(),
             log_dir: ".citrus/logs".into(),
             target_definitions: vec!["Makefile".into(), "*.mk".into(), "make/*.mk".into()],
@@ -189,43 +161,12 @@ impl Default for ReceiptsConfig {
 impl Default for StateConfig {
     fn default() -> Self {
         StateConfig {
-            backend: "sqlite".into(),
             path: "citrus".into(),
         }
     }
 }
 
 impl Config {
-    pub fn load(root: &Path) -> Result<Config> {
-        let path = root.join("citrus.toml");
-        if !path.exists() {
-            return Ok(Config::default());
-        }
-        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    fn validate(&self) -> Result<()> {
-        if self.state.backend != "sqlite" {
-            bail!(
-                "state.backend = {:?} is not supported yet; available: sqlite",
-                self.state.backend
-            );
-        }
-        if self.run.local.is_empty() {
-            bail!("run.local must name a command");
-        }
-        for relative in [&self.manifest, &self.log_dir] {
-            if Path::new(relative).is_absolute() || relative.split('/').any(|part| part == "..") {
-                bail!("{relative}: must stay inside the repository");
-            }
-        }
-        Ok(())
-    }
-
     pub fn in_common(common: &Path, relative: &str) -> PathBuf {
         if Path::new(relative).is_absolute() {
             PathBuf::from(relative)
@@ -240,31 +181,4 @@ pub fn substitute(template: &[String], key: &str, value: &str) -> Vec<String> {
         .iter()
         .map(|part| part.replace(key, value))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn defaults_are_generic_and_files_override_them() {
-        let config: Config =
-            toml::from_str("[run]\nremote = [\"make\", \"remote-check\"]\n").unwrap();
-        assert_eq!(config.run.local, vec!["make", "{target}"]);
-        assert_eq!(config.run.remote, vec!["make", "remote-check"]);
-        assert_eq!(config.state.backend, "sqlite");
-        assert!(toml::from_str::<Config>("bogus = 1\n").is_err());
-    }
-
-    #[test]
-    fn unsupported_backend_is_explicit() {
-        let config: Config = toml::from_str("[state]\nbackend = \"postgres\"\n").unwrap();
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("not supported yet")
-        );
-    }
 }

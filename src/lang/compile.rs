@@ -2,6 +2,7 @@
 //! with their steps, tasks. Validation that needs the meaning of a block
 //! (known kinds and fields, portable actions, globs that match) lives here.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,30 @@ pub enum Work {
     },
 }
 
+impl Work {
+    /// `[kind, arguments…]`, the documented form hashed into fingerprints.
+    pub fn canonical(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        match self {
+            Work::Process { argv, .. } => {
+                out.push("run".to_owned());
+                out.extend(argv.iter().cloned());
+            }
+            Work::WaitTcp { address, timeout } => {
+                out.extend(["wait.tcp".into(), address.clone(), timeout.to_string()])
+            }
+            Work::WaitHttp { url, timeout } => {
+                out.extend(["wait.http".into(), url.clone(), timeout.to_string()])
+            }
+            Work::WaitFile { path, timeout } => {
+                out.extend(["wait.file".into(), path.clone(), timeout.to_string()])
+            }
+            Work::Copy { from, to } => out.extend(["copy".into(), from.clone(), to.clone()]),
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Check {
     pub name: String,
@@ -50,6 +75,8 @@ pub struct Check {
     pub reads: Vec<String>,
     pub cache: bool,
     pub resources: Vec<String>,
+    /// Project-specific data for the project's own tools (`meta = { … }`).
+    pub meta: BTreeMap<String, serde_json::Value>,
     pub env: Vec<(String, String)>,
     pub steps: Vec<Step>,
     pub span: Span,
@@ -63,6 +90,26 @@ pub struct Task {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Planner {
+    pub argv: Vec<String>,
+    pub base_var: Option<String>,
+    pub paths_var: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Pool {
+    pub argv: Vec<String>,
+    pub progress: Vec<String>,
+    pub waiting: Option<String>,
+    pub acquired: Vec<String>,
+    pub stage: Option<String>,
+    pub log_after: Vec<String>,
+    pub status: Vec<String>,
+    pub status_prefix: Option<String>,
+    pub refresh: u64,
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Project {
     pub base: Option<String>,
@@ -70,6 +117,21 @@ pub struct Project {
     pub toolchain: Vec<String>,
     pub checks: Vec<Check>,
     pub tasks: Vec<Task>,
+    pub receipts: Option<String>,
+    /// Extra environment per check name.
+    pub check_env: Vec<(String, Vec<(String, String)>)>,
+    pub planner: Option<Planner>,
+    pub pool: Option<Pool>,
+    pub after_merge: Vec<String>,
+    pub commands: Vec<(String, String, String)>,
+    #[serde(skip)]
+    pub releases: BTreeMap<String, crate::release::Unit>,
+    #[serde(skip)]
+    pub artifacts: BTreeMap<String, crate::deploy::Artifact>,
+    #[serde(skip)]
+    pub environments: BTreeMap<String, crate::deploy::Environment>,
+    /// Repository-relative `.ci` files this project was read from.
+    pub files: Vec<String>,
     /// Declarations Citrus reads but does not execute from `.ci` yet.
     pub pending: Vec<(String, String, Span)>,
     pub warnings: Vec<Error>,
@@ -77,11 +139,14 @@ pub struct Project {
 
 const KINDS: &[&str] = &[
     "project",
+    "planner",
+    "command",
     "check",
     "task",
     "artifact",
     "environment",
     "pool",
+    "release",
 ];
 
 pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
@@ -89,10 +154,108 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
     for decl in &graph.decls {
         match decl.kind.as_str() {
             "project" => {
-                known_fields(decl, &["base", "logs", "toolchain"])?;
+                known_fields(
+                    decl,
+                    &[
+                        "base",
+                        "logs",
+                        "toolchain",
+                        "receipts",
+                        "check_env",
+                        "after_merge",
+                    ],
+                )?;
                 project.base = optional_string(decl, "base")?;
                 project.logs = optional_string(decl, "logs")?;
                 project.toolchain = strings(decl, "toolchain")?;
+                project.receipts = optional_string(decl, "receipts")?;
+                if let Some(value) = decl.field("check_env") {
+                    let Value::Map(entries) = value else {
+                        return Err(Error::at(
+                            decl.field_span("check_env"),
+                            "`check_env` is a map from check name to a map of variables",
+                        ));
+                    };
+                    for (name, vars) in entries {
+                        let Value::Map(vars) = vars else {
+                            return Err(Error::at(
+                                decl.field_span("check_env"),
+                                format!("`check_env.{name}` must be a map of variables"),
+                            ));
+                        };
+                        project.check_env.push((
+                            name.clone(),
+                            vars.iter()
+                                .map(|(key, value)| (key.clone(), value_text(value)))
+                                .collect(),
+                        ));
+                    }
+                }
+                if let Some(Value::Action(action)) = decl.field("after_merge") {
+                    project.after_merge = argv(action)?;
+                }
+            }
+            "planner" => {
+                known_fields(decl, &["run", "base_var", "paths_var"])?;
+                let Some(Value::Action(action)) = decl.field("run") else {
+                    return Err(Error::at(
+                        decl.span,
+                        "`planner` needs `run = make(\"…\")` printing TARGET lines",
+                    ));
+                };
+                project.planner = Some(Planner {
+                    argv: argv(action)?,
+                    base_var: optional_string(decl, "base_var")?,
+                    paths_var: optional_string(decl, "paths_var")?,
+                });
+            }
+            "pool" => {
+                known_fields(
+                    decl,
+                    &[
+                        "run",
+                        "progress",
+                        "waiting",
+                        "acquired",
+                        "stage",
+                        "log_after",
+                        "status",
+                        "status_prefix",
+                        "refresh",
+                    ],
+                )?;
+                let Some(Value::Action(action)) = decl.field("run") else {
+                    return Err(Error::at(
+                        decl.span,
+                        "`pool` needs `run = …`: the command that runs the planned checks there",
+                    ));
+                };
+                let status = match decl.field("status") {
+                    Some(Value::Action(action)) => argv(action)?,
+                    _ => Vec::new(),
+                };
+                project.pool = Some(Pool {
+                    argv: argv(action)?,
+                    progress: strings(decl, "progress")?,
+                    waiting: optional_string(decl, "waiting")?,
+                    acquired: strings(decl, "acquired")?,
+                    stage: optional_string(decl, "stage")?,
+                    log_after: strings(decl, "log_after")?,
+                    status,
+                    status_prefix: optional_string(decl, "status_prefix")?,
+                    refresh: match decl.field("refresh") {
+                        Some(Value::Duration(seconds)) => *seconds,
+                        _ => 60,
+                    },
+                });
+            }
+            "command" => {
+                known_fields(decl, &["about", "group"])?;
+                project.commands.push((
+                    label(decl)?,
+                    optional_string(decl, "about")?.unwrap_or_default(),
+                    optional_string(decl, "group")?.unwrap_or_default(),
+                ));
             }
             "check" => {
                 known_fields(
@@ -104,11 +267,20 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                         "cache",
                         "about",
                         "resources",
+                        "meta",
                         "env",
                         "on",
                     ],
                 )?;
                 let name = label(decl)?;
+                if !crate::manifest::valid_name(&name) {
+                    return Err(Error::at(
+                        decl.span,
+                        format!(
+                            "check name \"{name}\" must be lowercase letters, digits, `.`, `_` or `-`"
+                        ),
+                    ));
+                }
                 if project.checks.iter().any(|check| check.name == name) {
                     return Err(Error::at(
                         decl.span,
@@ -139,6 +311,21 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     reads: strings(decl, "reads")?,
                     cache: matches!(decl.field("cache"), Some(Value::Bool(true))),
                     resources: strings(decl, "resources")?,
+                    meta: match decl.field("meta") {
+                        None => BTreeMap::new(),
+                        Some(value @ Value::Map(_)) => {
+                            match to_json(value, decl.field_span("meta"))? {
+                                serde_json::Value::Object(map) => map.into_iter().collect(),
+                                _ => BTreeMap::new(),
+                            }
+                        }
+                        Some(other) => {
+                            return Err(Error::at(
+                                decl.field_span("meta"),
+                                format!("`meta` must be a map, not a {}", other.type_name()),
+                            ));
+                        }
+                    },
                     env,
                     steps,
                     span: decl.span,
@@ -154,6 +341,25 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     name,
                     span: decl.span,
                 });
+            }
+            "release" => {
+                let name = label(decl)?;
+                let unit: crate::release::Unit = typed(decl, release_json(decl)?)?;
+                unit.validate(&name)
+                    .map_err(|error| Error::at(decl.span, error.to_string()))?;
+                project.releases.insert(name, unit);
+            }
+            "artifact" => {
+                let name = label(decl)?;
+                project
+                    .artifacts
+                    .insert(name, typed(decl, artifact_json(decl)?)?);
+            }
+            "environment" => {
+                let name = label(decl)?;
+                project
+                    .environments
+                    .insert(name, typed(decl, environment_json(decl)?)?);
             }
             kind if KINDS.contains(&kind) => project.pending.push((
                 kind.to_owned(),
@@ -488,6 +694,17 @@ fn step(action: &Action, env: &[(String, String)]) -> Result<Step, Error> {
     })
 }
 
+/// The program and arguments of a process action.
+fn argv(action: &Action) -> Result<Vec<String>, Error> {
+    match step(action, &[])?.work {
+        Work::Process { argv, .. } => Ok(argv),
+        _ => Err(Error::at(
+            action.span,
+            format!("`{}` is not a command here", action.kind),
+        )),
+    }
+}
+
 fn value_text(value: &Value) -> String {
     match value {
         Value::Str(text) => text.clone(),
@@ -585,11 +802,183 @@ pub fn load(root: &Path) -> Result<Option<(Project, Sources)>, String> {
     if !root.join("citrus.ci").exists() {
         return Ok(None);
     }
-    match super::load(root, "citrus.ci") {
+    load_at(root, None)
+}
+
+/// `citrus.ci` as committed at `revision` (or the working tree), compiled.
+pub fn load_at(root: &Path, revision: Option<&str>) -> Result<Option<(Project, Sources)>, String> {
+    match super::load_at(root, "citrus.ci", revision) {
         Ok((graph, sources)) => match compile(&graph, root) {
-            Ok(project) => Ok(Some((project, sources))),
+            Ok(mut project) => {
+                project.files = sources
+                    .files
+                    .iter()
+                    .map(|(path, _)| path.display().to_string())
+                    .collect();
+                Ok(Some((project, sources)))
+            }
             Err(error) => Err(sources.render(&error)),
         },
         Err((error, sources)) => Err(sources.render(&error)),
     }
+}
+
+/// A `.ci` value as JSON: durations become seconds, commands their argv.
+fn to_json(value: &Value, span: Span) -> Result<serde_json::Value, Error> {
+    use serde_json::Value as Json;
+    Ok(match value {
+        Value::None => Json::Null,
+        Value::Bool(flag) => Json::Bool(*flag),
+        Value::Int(number) => Json::from(*number),
+        Value::Duration(seconds) => Json::from(*seconds),
+        Value::Str(text) => Json::String(text.clone()),
+        Value::List(items) => Json::Array(
+            items
+                .iter()
+                .map(|item| to_json(item, span))
+                .collect::<Result<_, _>>()?,
+        ),
+        Value::Map(entries) => Json::Object(
+            entries
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), to_json(value, span)?)))
+                .collect::<Result<_, Error>>()?,
+        ),
+        Value::Action(action) => Json::from(argv(action)?),
+        other => {
+            return Err(Error::at(
+                span,
+                format!("a {} cannot be used as data", other.type_name()),
+            ));
+        }
+    })
+}
+
+/// Fields of a block as a JSON object; `about` is stored as `description`.
+fn fields_json(
+    decl: &Decl,
+    skip: &[&str],
+) -> Result<serde_json::Map<String, serde_json::Value>, Error> {
+    let mut object = serde_json::Map::new();
+    for (name, value, span) in &decl.fields {
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
+        let key = if name == "about" {
+            "description"
+        } else {
+            name.as_str()
+        };
+        object.insert(key.to_owned(), to_json(value, *span)?);
+    }
+    Ok(object)
+}
+
+fn no_children(decl: &Decl, allowed: &str) -> Result<(), Error> {
+    match decl.children.iter().find(|child| child.kind != allowed) {
+        Some(child) => Err(Error::at(
+            child.span,
+            format!(
+                "`{}` blocks cannot contain `{}` blocks",
+                decl.kind, child.kind
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// `checks = none` / `approval = none` read as the word, not as absence.
+fn none_as_word(object: &mut serde_json::Map<String, serde_json::Value>, fields: &[&str]) {
+    for field in fields {
+        if object.get(*field).is_some_and(serde_json::Value::is_null) {
+            object.insert((*field).to_owned(), "none".into());
+        }
+    }
+}
+
+fn release_json(decl: &Decl) -> Result<serde_json::Value, Error> {
+    no_children(decl, "step")?;
+    let mut object = fields_json(decl, &[])?;
+    none_as_word(&mut object, &["checks"]);
+    let steps = decl
+        .children
+        .iter()
+        .map(|step| {
+            no_children(step, "")?;
+            let mut fields = fields_json(step, &[])?;
+            fields.insert("name".into(), label(step)?.into());
+            Ok(serde_json::Value::Object(fields))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    object.insert("steps".into(), steps.into());
+    Ok(object.into())
+}
+
+fn artifact_json(decl: &Decl) -> Result<serde_json::Value, Error> {
+    no_children(decl, "")?;
+    let mut object = fields_json(decl, &["inputs"])?;
+    match decl.field("inputs") {
+        Some(Value::Action(action)) if action.kind == "inputs_of" => {
+            let Some(Value::Action(command)) = action.args.first() else {
+                return Err(Error::at(
+                    action.span,
+                    "`inputs_of` takes a command, e.g. inputs_of(run(\"…\"))",
+                ));
+            };
+            object.insert("inputs_command".into(), argv(command)?.into());
+        }
+        Some(value) => {
+            object.insert("inputs".into(), to_json(value, decl.field_span("inputs"))?);
+        }
+        None => {}
+    }
+    Ok(object.into())
+}
+
+fn environment_json(decl: &Decl) -> Result<serde_json::Value, Error> {
+    no_children(decl, "deploy")?;
+    let mut object = fields_json(decl, &["on"])?;
+    none_as_word(&mut object, &["checks", "approval"]);
+    match decl.field("on") {
+        Some(Value::Action(action)) => {
+            object.insert("provider".into(), action.kind.clone().into());
+            let mut connection = serde_json::Map::new();
+            for (key, value) in &action.named {
+                connection.insert(key.clone(), value_text(value).into());
+            }
+            object.insert("connection".into(), connection.into());
+        }
+        _ => {
+            return Err(Error::at(
+                decl.span,
+                format!(
+                    "environment \"{}\" needs `on`",
+                    decl.name.clone().unwrap_or_default()
+                ),
+            )
+            .help("on = kubernetes(context: \"…\", namespace: \"…\")"));
+        }
+    }
+    let mut workloads = serde_json::Map::new();
+    for deploy in &decl.children {
+        no_children(deploy, "")?;
+        workloads.insert(label(deploy)?, fields_json(deploy, &[])?.into());
+    }
+    object.insert("workloads".into(), workloads.into());
+    Ok(object.into())
+}
+
+/// Read a block's JSON form into Citrus's own type; errors point at the block.
+fn typed<T: serde::de::DeserializeOwned>(decl: &Decl, json: serde_json::Value) -> Result<T, Error> {
+    serde_json::from_value(json).map_err(|error| {
+        Error::at(
+            decl.span,
+            format!(
+                "{} \"{}\": {}",
+                decl.kind,
+                decl.name.clone().unwrap_or_default(),
+                error.to_string().replace("description", "about")
+            ),
+        )
+    })
 }

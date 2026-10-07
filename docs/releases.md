@@ -1,42 +1,36 @@
-# Releases: `ci/releases.toml`
+# Releases
 
 A release unit is a named sequence of your own commands. Citrus runs them in
 order from a committed source, records every step, holds the unit's
 environment for one release at a time, and knows what to do after an
 interruption.
 
-```toml
-[releases.web]
-description = "Web app to production"
-environment = "web-production"   # one release at a time here, across worktrees
-checks = "proven"                # default: every planned check must be proven for the commit
+```
+release "web" {
+  about = "Web app to production"
+  environment = "web-production"   # one release at a time here, across worktrees
+  checks = proven                  # default; `none`: no check gate
+  # Reserves and prints RELEASE=<version>; `initial` is the first `next`.
+  version = { reserve: make("version-reserve", START: next), initial: "1.4.0" }
 
-[releases.web.version]
-reserve = ["make", "version-reserve", "START={next}"]   # prints RELEASE=<version>
-prefix = "RELEASE="              # default
-initial = "1.4.0"                # first {next} when Citrus has no passed release yet
+  step "build" { run = make("image", VERSION: version) }
+  step "deploy" {
+    production = true              # needs --approve
+    run = make("deploy", VERSION: version)
+    recover = make("deploy-reconcile", VERSION: version)   # when the outcome is unknown
+  }
+  step "postcheck" { run = make("smoke", VERSION: version) }
 
-[[releases.web.steps]]
-name = "build"
-run = ["make", "image", "VERSION={version}"]
-
-[[releases.web.steps]]
-name = "deploy"
-production = true                # needs --approve
-run = ["make", "deploy", "VERSION={version}"]
-recover = ["make", "deploy-reconcile", "VERSION={version}"]   # used when the outcome is unknown
-
-[[releases.web.steps]]
-name = "postcheck"
-run = ["make", "smoke", "VERSION={version}"]
-
-[releases.web.rollback]
-production = true
-run = ["make", "deploy", "VERSION={version}"]   # {version} = the release before the last passed one
+  # `version` is the release before the last passed one.
+  rollback = { production: true, run: make("deploy", VERSION: version) }
+}
 ```
 
-Values in commands: `{version}` (reserved, or the rollback target), `{previous}`
-(last passed release), `{next}` (after `{previous}`, or `initial`), `{commit}`, `{unit}`.
+Values Citrus fills in: `version` (reserved, or the rollback target),
+`previous` (last passed release), `next` (after `previous`, or `initial`),
+`commit`, `unit`; inside strings write `{version}`. `version` also takes
+`prefix` (default `"RELEASE="`), the text before the version in the output
+of `reserve`.
 
 ## Commands
 
@@ -53,7 +47,7 @@ Values in commands: `{version}` (reserved, or the rollback target), `{previous}`
 ## Guarantees
 
 - **Gates before anything runs:** a committed tree; checks proven for this
-  commit (`checks = "proven"`, or `--unchecked`, which is recorded); `--approve`
+  commit (`checks = proven`, or `--unchecked`, which is recorded); `--approve`
   when any step changes production; the environment not held by an unfinished
   or unknown release.
 - **One release per environment.** A failed release frees it; a release whose

@@ -1,4 +1,4 @@
-//! `ci/targets.toml`: declared targets, their input globs and input fingerprints.
+//! Declared checks (from `citrus.ci`), their input globs and input fingerprints.
 //!
 //! The fingerprint and receipt formats are specified in `docs/manifest.md`, so
 //! other tools of a project can produce and reuse the same receipts.
@@ -12,14 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-const KNOWN_KEYS: [&str; 5] = [
-    "inputs",
-    "extra_inputs",
-    "cache",
-    "description",
-    "resources",
-];
-
 #[derive(Debug, Clone)]
 pub struct Target {
     pub name: String,
@@ -29,9 +21,11 @@ pub struct Target {
     pub cache: bool,
     /// Resource classes the project's scheduler gives this target (free-form for Citrus).
     pub resources: Vec<String>,
-    /// Project-specific keys, kept as written.
-    pub extensions: BTreeMap<String, toml::Value>,
-    /// Steps declared in `citrus.ci`; empty for TOML targets (run as `run.local`).
+    /// Project-specific data (`meta = { … }`), kept as written.
+    pub extensions: BTreeMap<String, serde_json::Value>,
+    /// Extra environment of its steps.
+    pub env: BTreeMap<String, String>,
+    /// Steps declared in `citrus.ci`; empty means `run.local` (`make <target>`).
     pub steps: Vec<crate::lang::compile::Step>,
     /// `file:line` of the declaration in `citrus.ci`.
     pub source: Option<String>,
@@ -60,7 +54,8 @@ impl Target {
             extra_inputs: check.reads.clone(),
             cache: check.cache,
             resources: check.resources.clone(),
-            extensions: BTreeMap::new(),
+            extensions: check.meta.clone(),
+            env: check.env.iter().cloned().collect(),
             steps: check.steps.clone(),
             source: Some(source),
             owned,
@@ -70,11 +65,22 @@ impl Target {
 
     /// Same inputs, cache and resources: a reformatted entry is not a new check.
     pub fn same_declaration(&self, other: &Target) -> bool {
-        self.inputs == other.inputs
-            && self.extra_inputs == other.extra_inputs
+        self.declaration() == other.declaration()
             && self.cache == other.cache
             && self.resources == other.resources
             && self.extensions == other.extensions
+    }
+
+    /// What a PASS of this check proves, as hashed first in its fingerprint
+    /// (docs/manifest.md): its globs, what it runs and with which environment.
+    pub fn declaration(&self) -> serde_json::Value {
+        serde_json::json!({
+            "env": self.env,
+            "extra_inputs": self.extra_inputs,
+            "inputs": self.inputs,
+            "run": self.steps.iter().map(|step| step.work.canonical()).collect::<Vec<_>>(),
+            "target": self.name,
+        })
     }
 
     pub fn owns(&self, path: &str) -> bool {
@@ -89,88 +95,68 @@ impl Target {
 #[derive(Debug, Default)]
 pub struct Manifest {
     pub targets: BTreeMap<String, Target>,
+    /// The `.ci` files the checks were declared in.
+    pub files: Vec<String>,
 }
 
 impl Manifest {
-    pub fn load(path: &Path) -> Result<Manifest> {
-        if !path.exists() {
-            return Ok(Manifest::default());
-        }
-        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("invalid {}", path.display()))
-    }
-
-    pub fn parse(text: &str) -> Result<Manifest> {
-        let table: toml::Table = toml::from_str(text)?;
-        let Some(toml::Value::Table(targets)) = table.get("targets") else {
-            bail!("manifest has no [targets.*] entries");
-        };
-        let mut result = BTreeMap::new();
-        for (name, value) in targets {
-            if !valid_name(name) {
-                bail!("invalid target name: {name}");
-            }
-            let toml::Value::Table(entry) = value else {
-                bail!("{name}: entry must be a table")
-            };
-            // Keys Citrus does not know belong to the project's own planner
-            // (for example scheduling hints); they are kept, not rejected.
-            let extensions: BTreeMap<String, toml::Value> = entry
-                .iter()
-                .filter(|(key, _)| !KNOWN_KEYS.contains(&key.as_str()))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            let inputs = strings(entry.get("inputs"))
-                .with_context(|| format!("{name}: inputs must be a non-empty list of globs"))?;
-            if inputs.is_empty() {
-                bail!("{name}: inputs must be a non-empty list of globs");
-            }
-            let extra_inputs = match entry.get("extra_inputs") {
-                None => Vec::new(),
-                some => strings(some)
-                    .with_context(|| format!("{name}: extra_inputs must be a list of globs"))?,
-            };
-            let cache = match entry.get("cache") {
-                None => false,
-                Some(toml::Value::Boolean(value)) => *value,
-                Some(_) => bail!("{name}: cache must be true or false"),
-            };
-            let resources = match entry.get("resources") {
-                None => Vec::new(),
-                some => strings(some)
-                    .with_context(|| format!("{name}: resources must be a list of names"))?,
-            };
-            let description = entry
-                .get("description")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned);
-            let owned = inputs
-                .iter()
-                .map(|pattern| Glob::new(pattern))
-                .collect::<Result<Vec<_>>>()?;
-            let all = inputs
-                .iter()
-                .chain(&extra_inputs)
-                .map(|pattern| Glob::new(pattern))
-                .collect::<Result<Vec<_>>>()?;
-            result.insert(
-                name.clone(),
-                Target {
-                    name: name.clone(),
-                    description,
-                    inputs,
-                    extra_inputs,
-                    cache,
-                    resources,
-                    extensions,
-                    steps: Vec::new(),
-                    source: None,
-                    owned,
-                    all,
-                },
+    /// The checks of a compiled `citrus.ci`.
+    pub fn from_project(
+        project: &crate::lang::compile::Project,
+        sources: &crate::lang::Sources,
+    ) -> Result<Manifest> {
+        let mut targets = BTreeMap::new();
+        for check in &project.checks {
+            let (file, line, _) = sources.locate(check.span);
+            targets.insert(
+                check.name.clone(),
+                Target::declared(check, format!("{file}:{line}"))?,
             );
         }
-        Ok(Manifest { targets: result })
+        Ok(Manifest {
+            targets,
+            files: project.files.clone(),
+        })
+    }
+
+    /// The declared checks as other tools of the project read them
+    /// (`CITRUS_CHECKS`, `citrus targets --json`; docs/manifest.md).
+    pub fn export(&self, toolchain: &[String]) -> serde_json::Value {
+        let checks: Vec<serde_json::Value> = self
+            .targets
+            .values()
+            .map(|target| {
+                serde_json::json!({
+                    "target": target.name,
+                    "description": target.description,
+                    "cache": target.cache,
+                    "inputs": target.inputs,
+                    "extra_inputs": target.extra_inputs,
+                    "resources": target.resources,
+                    "meta": target.extensions,
+                    "source": target.source,
+                    "declaration": target.declaration(),
+                })
+            })
+            .collect();
+        serde_json::json!({"toolchain": toolchain, "files": self.files, "checks": checks})
+    }
+
+    /// `export` in a file under the state directory, named by its content.
+    pub fn export_file(&self, repo: &crate::repo::Repo) -> Result<PathBuf> {
+        let text = serde_json::to_string_pretty(&self.export(&repo.config.toolchain_files))?;
+        let dir = repo.state_dir().join("tmp");
+        crate::repo::private_dir(&dir)?;
+        let path = dir.join(format!(
+            "checks-{}.json",
+            &hex::encode(Sha256::digest(&text))[..16]
+        ));
+        if !path.exists() {
+            let partial = path.with_extension(format!("{}.part", std::process::id()));
+            fs::write(&partial, &text)?;
+            fs::rename(&partial, &path)?;
+        }
+        Ok(path)
     }
 
     pub fn owners(&self, path: &str) -> Vec<&str> {
@@ -182,25 +168,11 @@ impl Manifest {
     }
 }
 
-fn valid_name(name: &str) -> bool {
+pub fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit())
         && chars
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
-}
-
-fn strings(value: Option<&toml::Value>) -> Result<Vec<String>> {
-    let Some(toml::Value::Array(items)) = value else {
-        bail!("expected a list")
-    };
-    items
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .map(str::to_owned)
-                .context("expected a string")
-        })
-        .collect()
 }
 
 /// Whether `pattern` (a manifest glob) matches at least one of `files`.
@@ -310,19 +282,7 @@ pub fn fingerprint(
     toolchain: &[String],
 ) -> Result<Fingerprint> {
     let mut digest = Sha256::new();
-    let header = format!(
-        "{{\"extra_inputs\": {}, \"inputs\": {}, \"target\": {}}}",
-        py_json_list(&target.extra_inputs),
-        py_json_list(&target.inputs),
-        py_json_str(&target.name)
-    );
-    digest.update(header.as_bytes());
-    // What a declared check runs is part of what its PASS proves.
-    if !target.steps.is_empty() {
-        let work: Vec<&crate::lang::compile::Work> =
-            target.steps.iter().map(|step| &step.work).collect();
-        digest.update(serde_json::to_string(&work)?.as_bytes());
-    }
+    digest.update(py_json(&target.declaration()).as_bytes());
     let mut covered = Vec::new();
     let paths = files
         .iter()
@@ -377,15 +337,29 @@ fn py_json_str(value: &str) -> String {
     out
 }
 
-fn py_json_list(values: &[String]) -> String {
-    format!(
-        "[{}]",
-        values
-            .iter()
-            .map(|value| py_json_str(value))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+/// `json.dumps(value, sort_keys=True)` of Python: `", "` and `": "`
+/// separators, non-ASCII escaped.
+fn py_json(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => py_json_str(text),
+        Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(py_json).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            format!(
+                "{{{}}}",
+                keys.iter()
+                    .map(|key| format!("{}: {}", py_json_str(key), py_json(&map[*key])))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        other => other.to_string(),
+    }
 }
 
 /// PASS receipts: one file per target and input fingerprint (`docs/manifest.md`).
@@ -466,27 +440,14 @@ mod tests {
     }
 
     #[test]
-    fn manifest_keeps_project_keys_and_rejects_bad_entries() {
-        let extended =
-            Manifest::parse("[targets.ok]\ninputs=[\"a\"]\nlinux=true\nsnapshot=[\"assets\"]\n")
-                .unwrap();
-        assert_eq!(
-            extended.targets["ok"].extensions["linux"],
-            toml::Value::Boolean(true)
-        );
-        assert!(Manifest::parse("[targets.ok]\ninputs=[\"a\"]\ncache=\"yes\"\n").is_err());
-        assert!(Manifest::parse("[targets.Bad]\ninputs=[\"a\"]\n").is_err());
-        assert!(Manifest::parse("[targets.ok]\ninputs=[]\n").is_err());
-        let manifest = Manifest::parse("[targets.ok]\ninputs=[\"a/*\"]\ncache=true\n").unwrap();
-        assert_eq!(manifest.owners("a/b"), vec!["ok"]);
-    }
-
-    #[test]
     fn python_json_escaping() {
         assert_eq!(
-            py_json_list(&["a\"b".into(), "\u{e9}".into()]),
+            py_json(&serde_json::json!(["a\"b", "\u{e9}"])),
             "[\"a\\\"b\", \"\\u00e9\"]"
         );
-        assert_eq!(py_json_list(&[]), "[]");
+        assert_eq!(
+            py_json(&serde_json::json!({"b": [], "a": {"x": true}})),
+            "{\"a\": {\"x\": true}, \"b\": []}"
+        );
     }
 }

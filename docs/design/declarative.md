@@ -29,53 +29,40 @@ Those invariants turn out to be generic options with parameters (below).
 
 ## Model
 
-Three kinds of declarations, next to the existing `ci/targets.toml`:
+Artifacts and environments, next to the checks in `citrus.ci`
+(fields as implemented; `strategy` and verify-by-check are still planned):
 
-```toml
-# ci/artifacts.toml — what is built, from what
-[artifacts.api]
-inputs = ["crates/api/**", "Cargo.lock", "Dockerfile.api"]     # key = hash of inputs + build definition
-build = { provider = "docker", dockerfile = "Dockerfile.api", target = "runtime" }
-publish = { registry = "registry.example.com/shop/api" }       # identity = pushed digest
-
-[artifacts.api-migrations]
-inputs = ["migrations/api/**", "Dockerfile.migrations"]
-build = { provider = "docker", dockerfile = "Dockerfile.migrations" }
-publish = { registry = "registry.example.com/shop/api-migrations" }
 ```
+# What is built, from what. Key = hash of the inputs + this declaration.
+artifact "api" {
+  inputs = ["crates/api/**", "Cargo.lock", "Dockerfile.api"]
+  build = { provider: "docker", dockerfile: "Dockerfile.api", target: "runtime" }
+  publish = { registry: "registry.example.com/shop/api" }    # identity = pushed digest
+}
 
-```toml
-# ci/environments.toml — what runs where
-[environments.shop-production]
-provider = "kubernetes"
-connection = { kubeconfig = "secrets/prod/kubeconfig", namespace = "shop" }   # referenced, never stored
-approval = "required"                       # apply needs --approve
-checks = "proven"                           # planned checks must be proven for the commit
+artifact "api-migrations" {
+  inputs = ["migrations/api/**", "Dockerfile.migrations"]
+  build = { provider: "docker", dockerfile: "Dockerfile.migrations" }
+  publish = { registry: "registry.example.com/shop/api-migrations" }
+}
 
-[environments.shop-production.migrations]
-artifact = "api-migrations"
-run = "job"                                 # provider runs it to completion before workloads change
-compatible_with_previous = true             # the previous workload version must keep working (checked by a target)
+# What runs where. Credentials are referenced, never stored.
+environment "shop-production" {
+  on = kubernetes(context: "prod", namespace: "shop")
+  approval = required             # apply needs --approve
+  checks = proven                 # planned checks must be proven for the commit
+  # Runs to completion before workloads change.
+  migrations = { artifact: "api-migrations", job: "deploy/migrate.yaml", timeout: 5m }
+  record = { annotation: "example.com/release" }
 
-[environments.shop-production.workloads.api]
-artifact = "api"
-kind = "deployment"
-strategy = "rolling"
+  deploy "api" { artifact = "api" }
+  # Never two at once: wait until the old one released its lease.
+  deploy "bot" { artifact = "bot", fence = "bot-session" }
+  # Suspended while the environment changes, restored after.
+  deploy "backup" { artifact = "backup", kind = cronjob, quiesce = true }
 
-[environments.shop-production.workloads.bot]
-artifact = "bot"
-kind = "deployment"
-strategy = "recreate"                       # never two at once
-fence = { lease = "bot-session" }           # and wait until the old one released its lease
-
-[environments.shop-production.workloads.backup]
-artifact = "backup"
-kind = "cronjob"
-quiesce = true                              # suspended while the environment changes, restored after
-
-[environments.shop-production.verify]
-http = ["https://shop.example.com/health"]
-targets = ["smoke-shop"]                    # postcheck = declared checks run against the environment
+  verify = { http: ["https://shop.example.com/health"] }
+}
 ```
 
 Values never hold secrets; they name where the provider finds them.
@@ -123,8 +110,8 @@ Everything platform-specific is a provider:
 The **provider protocol** is a process boundary: the provider is a program
 receiving a JSON request on stdin (`observe`, `apply`, `verify`, `quiesce`,
 `resume`) and answering JSON on stdout. Project-specific behaviour — a data
-cutover, a network controller — is a small provider or a hook in the
-project's language, not a change in Citrus and not logic in TOML.
+cutover, a network controller — is a small provider or a hook, not a change
+in Citrus.
 
 Argo CD and Flux already reconcile Kubernetes well. Where a team uses them,
 an `argocd` provider sets the desired revision and waits for sync; Citrus is
@@ -145,8 +132,8 @@ special cases in the core.
 
 ## Non-goals
 
-- A templating or programming language in TOML. When a declaration needs
-  logic, it needs a provider or a hook.
+- General-purpose logic in declarations. When one needs more than the `.ci`
+  language offers, it needs a provider or a hook.
 - Secret management. Environments reference credentials; they never contain them.
 - Replacing in-cluster GitOps controllers.
 - Building arbitrary software. Builds are provider calls (`docker`, `command`);

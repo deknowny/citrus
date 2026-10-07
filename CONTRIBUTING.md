@@ -39,5 +39,7 @@ green `main` commit and build it with
 
 ## Compatibility
 
-`citrus/v1` JSON output, the receipt format (`docs/manifest.md`) and
-`citrus.toml` keys are public contracts: add, do not change meaning.
+Before 1.0 the `.ci` language and the CLI may change incompatibly: no
+compatibility shims for old formats. Record every breaking change in
+`CHANGELOG.md`. The receipt and `CITRUS_CHECKS` formats are documented in
+`docs/manifest.md`; change them together with that page.

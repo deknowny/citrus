@@ -367,11 +367,11 @@ fn execute(command: Option<Command>, json: bool) -> Result<i32> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &json!({"schema": SCHEMA, "manifest": context.repo.config.manifest, "added": block, "next": next})
+                        &json!({"schema": SCHEMA, "file": "citrus.ci", "added": block, "next": next})
                     )?
                 );
             } else {
-                println!("added to {}:\n\n{block}", context.repo.config.manifest);
+                println!("added to citrus.ci:\n\n{block}");
                 print_next(&next);
             }
             Ok(0)
@@ -1098,10 +1098,9 @@ fn why(context: &Context, target: &str, base: Option<&str>, json: bool) -> Resul
         Some(_) => {
             println!("  declared without cache: reused only for the identical source snapshot")
         }
-        None => println!(
-            "  not declared in {}: reused only for the identical source snapshot",
-            context.repo.config.manifest
-        ),
+        None => {
+            println!("  not declared in citrus.ci: reused only for the identical source snapshot")
+        }
     }
     println!("  {} {}", symbol(&decision.result), describe(&decision));
     if !changed.is_empty() {
@@ -1501,29 +1500,29 @@ fn targets_command(context: &Context, json: bool) -> Result<i32> {
         rows.push((target, last));
     }
     if json {
-        let value: Vec<Value> = rows
-            .iter()
-            .map(|(target, last)| {
-                json!({
-                    "target": target.name, "description": target.description, "cache": target.cache,
-                    "inputs": target.inputs, "extra_inputs": target.extra_inputs, "resources": target.resources,
-                    "last_pass": last.as_ref().map(|evidence| json!({"run": evidence.run, "seconds_ago": now() as i64 - evidence.created})),
-                })
+        let export = context
+            .manifest
+            .export(&context.repo.config.toolchain_files);
+        let value: Vec<Value> = export["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .zip(&rows)
+            .map(|(check, (_, last))| {
+                let mut check = check.clone();
+                check["last_pass"] = json!(last.as_ref().map(|evidence| json!({"run": evidence.run, "seconds_ago": now() as i64 - evidence.created})));
+                check
             })
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(
-                &json!({"schema": SCHEMA, "manifest": context.repo.config.manifest, "targets": value})
-            )?
+            serde_json::to_string_pretty(&json!({
+                "schema": SCHEMA, "files": export["files"], "toolchain": export["toolchain"], "targets": value
+            }))?
         );
         return Ok(0);
     }
-    println!(
-        "{} declared checks in {}",
-        rows.len(),
-        context.repo.config.manifest
-    );
+    println!("{} declared checks in citrus.ci", rows.len());
     for (target, last) in rows {
         let when = last
             .map(|evidence| format!("passed {} ago", age(now() as i64 - evidence.created)))
@@ -1570,7 +1569,7 @@ fn release_command(context: &Context, action: ReleaseAction, json: bool) -> Resu
                 return Ok(0);
             }
             if rows.is_empty() {
-                println!("no release units in {}", context.repo.config.releases);
+                println!("no release blocks in citrus.ci");
             }
             for (name, unit, last, holder) in rows {
                 let steps: Vec<String> = unit

@@ -2,21 +2,33 @@
 
 ## Unreleased
 
-- The `.ci` language, first part (docs/design/language.md): `citrus.ci` with
-  `citrus 1`, `let`, functions, `for`/`if`, comprehensions, string
-  interpolation, durations, `use`; `project`, `check` and `task` blocks;
-  steps `run`, `make`, `sh` (flagged non-portable), `cargo.*`, `compose.*`,
+Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
+`citrus.toml`, `ci/targets.toml`, `ci/releases.toml`, `ci/artifacts.toml` or
+`ci/environments.toml`; `doctor` warns when a `citrus.toml` is left over.
+
+- The `.ci` language (docs/design/language.md): `citrus 1`, `let`, functions,
+  `for`/`if`, comprehensions, string interpolation, durations, `use`.
+- Blocks: `project`, `check`, `task`, `release` (with `step` blocks),
+  `artifact`, `environment` (with `deploy` blocks), `planner`, `pool`,
+  `command` (docs/configuration.md). Values Citrus fills in while running —
+  `before`, `version`, `next`, `previous`, `artifact`, `key`, … — are names,
+  written `{version}` inside strings.
+- Steps `run`, `make`, `sh` (flagged non-portable), `cargo.*`, `compose.*`,
   and built-in `wait.tcp|http|file` and `copy` that need no shell.
 - `citrus check` validates `citrus.ci` before anything runs; errors show the
   file, line, an excerpt with a caret and a "did you mean" hint.
 - `citrus do [task]` runs a task's steps with their source lines.
-- When `citrus.ci` exists it is the configuration; `citrus add` appends a
-  `check` block to it and `doctor` flags leftover TOML. A declared check's
-  steps are part of its input fingerprint.
-- Citrus describes its own checks in `citrus.ci` (citrus.toml and
-  ci/targets.toml are gone).
-
-- `apply` records a release on a workload that already runs the built image without touching its pod template, so nothing restarts for an identical build (found when a shared Dockerfile changed only another stage).
+- Checks take `meta = { … }`: data for the project's own tools.
+- The planner and the pool get `CITRUS_CHECKS`, a JSON file with the
+  declared checks; `citrus targets --json` prints the same (docs/manifest.md).
+- The input fingerprint hashes a check's `declaration` (globs, steps,
+  environment) as documented JSON, so other tools can compute it; receipts
+  of earlier versions no longer match.
+- Editing a check in `citrus.ci` selects it on the next plan; other edits of
+  `citrus.ci` map to `config`.
+- `citrus add` appends a `check` block to `citrus.ci` (and creates the file).
+- `apply` records a release on a workload that already runs the built image
+  without touching its pod template, so nothing restarts for an identical build.
 
 ## 0.3.0 — 2026-10-07
 

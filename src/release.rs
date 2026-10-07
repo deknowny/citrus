@@ -6,7 +6,7 @@
 //! gates, the state and what happens after an interruption.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
@@ -69,39 +69,38 @@ pub struct Step {
     pub recover: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default)]
 pub struct Releases {
-    #[serde(default)]
     pub releases: BTreeMap<String, Unit>,
 }
 
+impl Unit {
+    pub fn validate(&self, name: &str) -> Result<()> {
+        if self.steps.is_empty() {
+            bail!("release {name}: no steps");
+        }
+        let mut names: Vec<&str> = self.steps.iter().map(|step| step.name.as_str()).collect();
+        names.sort_unstable();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("release {name}: step names must be unique");
+        }
+        if !matches!(self.checks.as_str(), "proven" | "none") {
+            bail!("release {name}: checks must be proven or none");
+        }
+        Ok(())
+    }
+}
+
 impl Releases {
+    /// Release units declared in `citrus.ci`.
     pub fn load(context: &Context) -> Result<Releases> {
-        let path = context.repo.releases_path();
-        if !path.exists() {
-            return Ok(Releases::default());
-        }
-        let text = fs::read_to_string(&path)?;
-        let releases: Releases =
-            toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
-        for (name, unit) in &releases.releases {
-            if unit.steps.is_empty() {
-                bail!("release {name}: no steps");
-            }
-            let mut names: Vec<&str> = unit.steps.iter().map(|step| step.name.as_str()).collect();
-            if names.iter().any(|name| name.is_empty()) {
-                bail!("release {name}: every step needs a name");
-            }
-            names.sort_unstable();
-            if names.windows(2).any(|pair| pair[0] == pair[1]) {
-                bail!("release {name}: step names must be unique");
-            }
-            if !matches!(unit.checks.as_str(), "proven" | "none") {
-                bail!("release {name}: checks must be \"proven\" or \"none\"");
-            }
-        }
-        Ok(releases)
+        Ok(Releases {
+            releases: context
+                .project
+                .as_ref()
+                .map(|project| project.releases.clone())
+                .unwrap_or_default(),
+        })
     }
 
     pub fn unit(&self, name: &str) -> Result<&Unit> {
