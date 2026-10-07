@@ -35,6 +35,10 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
 - `cargo.closure("package")`: the files a Cargo package is built from
   (path-dependency closure, included files, manifests and workspace
   settings), so Rust checks can be cached without listing crates by hand.
+- A pool gets `CITRUS_TARGETS` (the checks to run). When it reports checks
+  one by one, a planned check it is silent about is `not_run` and the run
+  fails — before, it was "passed with the suite" (found in Garvis: the
+  suite planned on its own and skipped three checks).
 - `citrus run` picks local or pool by history: local only when every needed
   check passed within a minute recently (declared caching no longer implies
   "light").

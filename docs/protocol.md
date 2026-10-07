@@ -42,7 +42,11 @@ Optional markers, all configured by prefix:
 | `log_after` | the path of a fuller log, read after the run | `… full log: logs/run-42.log` |
 
 The pool command runs with `CITRUS_CHECKS` (docs/manifest.md), so it can
-send the declared checks wherever it runs them.
+send the declared checks wherever it runs them, and `CITRUS_TARGETS`: a file
+naming the checks this run needs, one per line. A pool that reports checks
+one by one must report each of them: a check it stays silent about is
+`not_run` and the run fails, even when the pool exits 0. A pool that reports
+no checks at all passes or fails them together with its exit code.
 
 ## Resources (`status` of a pool)
 

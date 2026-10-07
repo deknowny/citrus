@@ -594,6 +594,21 @@ impl Context {
         {
             argv.push(config.plan.base_arg.replace("{base}", base));
         }
+        // The checks this run needs, one per line: the pool runs these.
+        let wanted = self
+            .repo
+            .state_dir()
+            .join("tmp")
+            .join(format!("targets-{}", run.id));
+        crate::repo::private_dir(&self.repo.state_dir().join("tmp"))?;
+        fs::write(
+            &wanted,
+            targets
+                .iter()
+                .filter(|target| target.result == "pending")
+                .map(|target| format!("{}\n", target.target))
+                .collect::<String>(),
+        )?;
         // One pipe for stdout and stderr keeps the log in order.
         let mut command = Command::new("sh");
         command
@@ -603,6 +618,7 @@ impl Context {
             .args(&argv)
             .current_dir(&self.repo.root)
             .env("CITRUS_CHECKS", self.manifest.export_file(&self.repo)?)
+            .env("CITRUS_TARGETS", &wanted)
             .stdin(Stdio::null())
             .stdout(Stdio::piped());
         let mut child = command.spawn()?;
@@ -657,12 +673,23 @@ impl Context {
                 }
             }
         }
+        let _ = fs::remove_file(&wanted);
         let rows = self.store.targets(&run.id)?;
+        // A pool that reports checks one by one and is silent about one did not run it.
+        let reports_targets = rows
+            .iter()
+            .any(|row| matches!(row.result.as_str(), "passed" | "failed"));
+        let mut code = code;
+        let mut silent = Vec::new();
         for mut row in rows
             .into_iter()
             .filter(|row| matches!(row.result.as_str(), "pending" | "running"))
         {
-            if code == 0 {
+            if code == 0 && reports_targets {
+                row.result = "not_run".into();
+                row.reason = "not_reported".into();
+                silent.push(row.target.clone());
+            } else if code == 0 {
                 row.result = "passed".into();
                 row.reason = "suite_passed".into();
                 passed.push(row.target.clone());
@@ -671,6 +698,25 @@ impl Context {
                 row.reason = "suite_failed".into();
             }
             self.store.update_target(&run.id, &row)?;
+        }
+        if !silent.is_empty() {
+            code = 1;
+            self.store.update_target(
+                &run.id,
+                &RunTarget {
+                    target: "suite".into(),
+                    result: "failed".into(),
+                    reason: "suite_error".into(),
+                    fingerprint: None,
+                    evidence_run: None,
+                    seconds: None,
+                    exit: Some(code),
+                    first_error: Some(format!(
+                        "the pool passed without running {} (CITRUS_TARGETS lists what to run)",
+                        silent.join(", ")
+                    )),
+                },
+            )?;
         }
         if code != 0
             && !self

@@ -1971,3 +1971,37 @@ fn checks_that_passed_quickly_run_locally_others_in_the_pool() {
     let (second, _) = project.json(&["run"]);
     assert_eq!(second["run"]["mode"], "local", "{second}");
 }
+
+#[test]
+fn a_pool_that_skips_a_planned_check_does_not_pass_it() {
+    let config = r#"
+planner { run = run("sh", "plan.sh") }
+pool "builders" { run = run("sh", "remote.sh"), progress = ["LANE"] }
+"#;
+    let project = Project::new(config);
+    project.write(
+        "plan.sh",
+        "printf 'TARGET\\tmake:alpha\\nTARGET\\tmake:beta\\n'\n",
+    );
+    // The pool sees which checks to run, but runs only the first one.
+    project.write(
+        "remote.sh",
+        "cp \"$CITRUS_TARGETS\" .citrus/wanted\necho 'LANE target=alpha status=PASS exit=0'\n",
+    );
+    project.commit("pool");
+    let (run, code) = project.json(&["run"]);
+    assert_eq!(code, 1, "{run}");
+    assert_eq!(target(&run, "alpha")["result"], "passed");
+    assert_eq!(target(&run, "beta")["result"], "not_run", "{run}");
+    assert!(
+        target(&run, "suite")["first_error"]
+            .as_str()
+            .unwrap()
+            .contains("beta"),
+        "{run}"
+    );
+    assert_eq!(
+        fs::read_to_string(project.root().join(".citrus/wanted")).unwrap(),
+        "alpha\nbeta\n"
+    );
+}
