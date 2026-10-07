@@ -291,8 +291,10 @@ pub fn pattern_matches_any(pattern: &str, files: &[String]) -> Result<bool> {
 }
 
 /// Path glob: `**/` spans whole directories, `**` anything, `*` and `?` stay in one segment.
+/// `dir/**` is the directory with everything in it: it also matches `dir`
+/// itself, as a gitlink or a removed directory appears in a diff.
 #[derive(Debug, Clone)]
-struct Glob(Vec<Token>);
+struct Glob(Vec<Token>, Option<Box<Glob>>);
 
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
@@ -308,6 +310,10 @@ impl Glob {
         if pattern.starts_with('/') || pattern.split('/').any(|part| part == "..") {
             bail!("input glob must be repository-relative: {pattern}");
         }
+        let whole = match pattern.strip_suffix("/**") {
+            Some(dir) if !dir.is_empty() => Some(Box::new(Glob::new(dir)?)),
+            _ => None,
+        };
         let chars: Vec<char> = pattern.chars().collect();
         let mut tokens = Vec::new();
         let mut index = 0;
@@ -328,12 +334,12 @@ impl Glob {
                 index += 1;
             }
         }
-        Ok(Glob(tokens))
+        Ok(Glob(tokens, whole))
     }
 
     fn matches(&self, path: &str) -> bool {
         let chars: Vec<char> = path.chars().collect();
-        matches_at(&self.0, &chars)
+        matches_at(&self.0, &chars) || self.1.as_ref().is_some_and(|whole| whole.matches(path))
     }
 }
 
@@ -544,6 +550,10 @@ mod tests {
         assert!(!glob("deploy/**/c.yaml", "deploy/a/b/d.yaml"));
         assert!(glob("a?c", "abc"));
         assert!(!glob("a?c", "a/c"));
+        // A directory with everything in it, and the directory (a gitlink) itself.
+        assert!(glob("vendor/xray/**", "vendor/xray"));
+        assert!(glob("crates/*/**", "crates/api"));
+        assert!(!glob("vendor/xray/**", "vendor/xray-core"));
         assert!(Glob::new("/abs").is_err());
         assert!(Glob::new("a/../b").is_err());
     }

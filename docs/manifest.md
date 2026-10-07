@@ -9,6 +9,8 @@ the input fingerprint and receipts.
 - Check names: `[a-z0-9][a-z0-9._-]*`; a check in a group is `group.name`.
 - Globs are repository-relative: `*` and `?` stay inside one path segment,
   `**` matches anything, `**/` matches zero or more whole directories.
+  `dir/**` also matches `dir` itself (a gitlink, or a directory removed in a
+  diff).
   Absolute paths and `..` are rejected; a glob matching no file is reported.
 - `!glob` excludes: in each of `paths` and `reads`, the last glob that
   matches a path decides, as in `.gitignore`
