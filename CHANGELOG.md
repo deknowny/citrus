@@ -40,7 +40,9 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
   unrelated edits — before, only local passes were, and most runs are remote.
 - Plan-time choice: `group` blocks (named path sets, optional `note`),
   `when` on checks with `touched`, `selected`, `signal`, `and/or/not`, a
-  project `signals` command; plans list touched groups and signals, keep
+  project `signals` command (`SIGNAL x`, `CLAIM <path> <group>`);
+  `CITRUS_PLANNER=builtin` for comparing planners; plans list touched
+  groups and signals, keep
   declaration order, and `citrus plan --paths-file` plans an explicit list.
 - Profiles: `project { profiles = [...] }`, `check { profiles = [...] }`,
   `--profile` (also `CITRUS_PROFILE`), passed to the planner (`profile_var`)

@@ -252,6 +252,7 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> R
         }
         plan.targets.extend(changed);
     }
+    let found = signals(repo, manifest, &paths)?;
     // Which groups and checks the changed paths touch.
     let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for path in &paths {
@@ -262,7 +263,13 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> R
         let groups: Vec<&str> = manifest
             .groups
             .iter()
-            .filter(|group| group.owns(path))
+            .filter(|group| {
+                group.owns(path)
+                    || found
+                        .claims
+                        .iter()
+                        .any(|(claimed, name)| claimed == path && *name == group.name)
+            })
             .map(|group| group.name.as_str())
             .collect();
         if owners.is_empty() && groups.is_empty() {
@@ -281,7 +288,7 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> R
                 .join(","),
         ));
     }
-    let signals = signals(repo, manifest, &paths)?;
+    let signals = found.names;
     // Owners whose condition holds, and checks selected by condition alone;
     // repeated until stable because conditions may name selected checks.
     let mut selected: Vec<String> = plan.targets.clone();
@@ -339,10 +346,19 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> R
     Ok(plan)
 }
 
-/// Signals of the project's signal command for these paths (`SIGNAL <name>` lines).
-fn signals(repo: &Repo, manifest: &Manifest, paths: &[String]) -> Result<Vec<String>> {
+/// What the project's signal command says about these paths: `SIGNAL <name>`
+/// lines, and `CLAIM <path> <group>` lines that put a path into a group.
+struct Signals {
+    names: Vec<String>,
+    claims: Vec<(String, String)>,
+}
+
+fn signals(repo: &Repo, manifest: &Manifest, paths: &[String]) -> Result<Signals> {
     let Some((program, args)) = manifest.signals.split_first() else {
-        return Ok(Vec::new());
+        return Ok(Signals {
+            names: Vec::new(),
+            claims: Vec::new(),
+        });
     };
     let dir = repo.state_dir().join("tmp");
     crate::repo::private_dir(&dir)?;
@@ -372,11 +388,20 @@ fn signals(repo: &Repo, manifest: &Manifest, paths: &[String]) -> Result<Vec<Str
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix("SIGNAL "))
-        .map(|name| name.trim().to_owned())
-        .collect())
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(Signals {
+        names: stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("SIGNAL "))
+            .map(|name| name.trim().to_owned())
+            .collect(),
+        claims: stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("CLAIM "))
+            .filter_map(|rest| rest.trim().rsplit_once(' '))
+            .map(|(path, group)| (path.to_owned(), group.to_owned()))
+            .collect(),
+    })
 }
 
 pub fn parse(output: &str) -> Plan {

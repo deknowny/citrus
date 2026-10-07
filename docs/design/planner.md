@@ -84,13 +84,17 @@ check "test-clyer-pipeline-contract" {
 - `signal("x")`: the project's signal command printed `SIGNAL x`. It runs
   with `CITRUS_PATHS` (a file of the changed paths) and is the place for
   classification a glob cannot express (Garvis reads file contents to tell
-  which product a change affects): `project { signals = run(...) }`.
+  which product a change affects): `project { signals = run(...) }`. It may
+  also print `CLAIM <path> <group>` to put one path into a group (a file
+  that existed at the base and is gone now).
 - `and`, `or`, `not` combine them. A check with `owns` and `when` needs
   both; a check with only `when` is chosen by the condition.
 - A touched group's `note` is listed with the plan's targets.
 
 `citrus plan --paths-file FILE` plans an explicit list of paths; the plan
 lists the touched groups and signals for tools that adapt it.
+`CITRUS_PLANNER=builtin` plans from `citrus.ci` even when a project planner
+is declared, to compare both before switching.
 
 ## Migration path
 

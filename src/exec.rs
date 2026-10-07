@@ -90,6 +90,11 @@ impl Context {
                         .map(|var| format!("{var}={{profile}}"))
                         .unwrap_or_default();
                 }
+                // CITRUS_PLANNER=builtin plans from citrus.ci alone, for comparing
+                // a project's planner with the declared checks before switching.
+                if std::env::var("CITRUS_PLANNER").as_deref() == Ok("builtin") {
+                    config.plan.command.clear();
+                }
                 let requested = profile.or_else(|| {
                     std::env::var("CITRUS_PROFILE")
                         .ok()
