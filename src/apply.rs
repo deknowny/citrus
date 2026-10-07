@@ -508,11 +508,17 @@ fn run_step(
             );
         }
         let containers = serde_json::json!([{"name": roll.container, "image": image}]);
-        let patch = if roll.kind == "cronjob" {
+        let patch = if already {
+            // Same image: record only. Touching the pod template would restart it for nothing.
+            serde_json::json!({"metadata": {"annotations": annotations}})
+        } else if roll.kind == "cronjob" {
             serde_json::json!({"metadata": {"annotations": annotations}, "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": containers}}}}}})
         } else {
             serde_json::json!({"metadata": {"annotations": annotations}, "spec": {"template": {"metadata": {"annotations": annotations}, "spec": {"containers": containers}}}})
         };
+        if already {
+            println!("{name} already runs {image}: recording the release without restarting it");
+        }
         run(kubectl(environment, extra_env).args([
             "patch",
             &roll.kind,

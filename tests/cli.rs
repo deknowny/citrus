@@ -1531,3 +1531,36 @@ fn a_worker_that_dies_without_a_result_does_not_hang_wait() {
         "wait hung: {waited}"
     );
 }
+
+#[test]
+fn an_identical_image_is_recorded_without_touching_the_pod_template() {
+    let project = apply_project();
+    // A change in the artifact's inputs whose build yields the image already running.
+    project.write("src/a.txt", "v2\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "feature",
+    ]);
+    let key = project.json(&["diff", "prod"]).0["diff"]["workloads"][0]["desired_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut state = kube_state(&project);
+    state["deployments"]["api"]["image"] =
+        Value::String(format!("registry.example/api@sha256:{key}"));
+    project.write(".kube/state.json", &state.to_string());
+    let (applied, code) = project.json(&["apply", "prod", "--approve", "--unchecked"]);
+    assert_eq!(code, 0, "{applied}");
+    let calls = fs::read_to_string(project.root().join(".kube/calls")).unwrap();
+    let patch = calls
+        .lines()
+        .find(|line| line.starts_with("patch deployment api"))
+        .unwrap();
+    assert!(!patch.contains("template"), "{patch}");
+}

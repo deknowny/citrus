@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `apply` records a release on a workload that already runs the built image without touching its pod template, so nothing restarts for an identical build (found when a shared Dockerfile changed only another stage).
+
 ## 0.3.0 — 2026-10-07
 
 - `citrus apply <env> --approve [--plan HASH]`: builds artifacts whose input
