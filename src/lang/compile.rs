@@ -645,6 +645,42 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
             }
         }
     }
+    // Globs that match nothing are almost always typos: each is reported once,
+    // where it is written (a group's paths, a check's own paths and reads).
+    let files = crate::repo::Repo::discover_at(root)
+        .and_then(|repo| repo.paths())
+        .unwrap_or_default();
+    if !files.is_empty() {
+        let dead = |pattern: &String| {
+            !pattern.starts_with('!')
+                && !crate::manifest::pattern_matches_any(pattern, &files).unwrap_or(true)
+        };
+        for group in &project.groups {
+            for pattern in group.owns.iter().filter(|pattern| dead(pattern)) {
+                project.warnings.push(Error::at(
+                    group.span,
+                    format!("group {}: `{pattern}` matches no file", group.name),
+                ));
+            }
+        }
+        for check in &project.checks {
+            let own = if check.narrows || check.group.is_none() {
+                check.owns.as_slice()
+            } else {
+                &[]
+            };
+            for pattern in own
+                .iter()
+                .chain(&check.reads)
+                .filter(|pattern| dead(pattern))
+            {
+                project.warnings.push(Error::at(
+                    check.span,
+                    format!("check {}: `{pattern}` matches no file", check.name),
+                ));
+            }
+        }
+    }
     // A group a check names in its paths is part of its inputs; a check with
     // no known inputs is never reused by them.
     let group_paths: BTreeMap<String, Vec<String>> = project
@@ -685,22 +721,6 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     name,
                     project.checks.iter().map(|other| other.name.as_str()),
                 ));
-            }
-        }
-    }
-    // Globs that match nothing are almost always typos.
-    let files = crate::repo::Repo::discover_at(root)
-        .and_then(|repo| repo.paths())
-        .unwrap_or_default();
-    if !files.is_empty() {
-        for check in &project.checks {
-            for pattern in check.owns.iter().chain(&check.reads) {
-                if !crate::manifest::pattern_matches_any(pattern, &files).unwrap_or(true) {
-                    project.warnings.push(Error::at(
-                        check.span,
-                        format!("check {}: `{pattern}` matches no file", check.name),
-                    ));
-                }
             }
         }
     }
