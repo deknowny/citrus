@@ -33,7 +33,11 @@ commands in `next`.
    proven, re-check the rest); `citrus integrate --push` to publish when green.
 8. **Other tasks** — `citrus tasks` shows every worktree; `citrus note <text>`
    tells the others what you are doing or waiting for (instead of a message).
-9. **Is it helping** — `citrus stats`. `citrus` alone lists what can be done here.
+9. **Release** — `citrus release` lists units; `citrus release start <unit>
+   --dry-run` shows the exact commands; `citrus release start <unit> --approve`
+   runs them. After a failure or a lost session: `citrus release resume <id>
+   --approve` (never start a second release over an `unknown` one).
+10. **Is it helping** — `citrus stats`. `citrus` alone lists what can be done here.
 
 Exit codes: 0 passed or still running (`--detach`), 1 a check failed,
 2 usage or environment error, 3 cancelled or unknown result.

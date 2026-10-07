@@ -716,7 +716,7 @@ pub fn segment(lines: &[String], target: &str, prefixes: &[String]) -> Vec<Strin
     lines[start + 1..end].to_vec()
 }
 
-fn alive(pid: i64) -> bool {
+pub fn alive(pid: i64) -> bool {
     // SAFETY: signal 0 only checks for existence.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -732,7 +732,7 @@ pub fn agent() -> String {
     std::env::var("CITRUS_AGENT").unwrap_or_else(|_| "human".into())
 }
 
-fn random16() -> u16 {
+pub fn random16() -> u16 {
     let mut bytes = [0u8; 2];
     if fs::File::open("/dev/urandom")
         .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes))

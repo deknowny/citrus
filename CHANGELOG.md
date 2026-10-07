@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Releases (`ci/releases.toml`, `citrus release …`): ordered steps with a
+  version reservation, gates (committed source, proven checks, `--approve` for
+  production), one release per environment, `unknown` after an interrupted
+  step with `recover` on resume, rollback, history, `--dry-run`.
+
 - `citrus integrate [--push]`: merge the base, carry passes of checks the
   incoming changes do not select (`plan.paths_arg` for external planners),
   re-check the rest, fast-forward the base when green.

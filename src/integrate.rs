@@ -134,6 +134,15 @@ pub fn carry(
     let snapshot_after = context.repo.snapshot()?;
     let current = plan::compute(&context.repo, &context.manifest, None)?;
     for target in &current.targets {
+        // Declared cached checks follow their input fingerprint; nothing to carry.
+        if context
+            .manifest
+            .targets
+            .get(target)
+            .is_some_and(|entry| entry.cache)
+        {
+            continue;
+        }
         if selected.contains(target) {
             result.reselected.push(target.clone());
             continue;

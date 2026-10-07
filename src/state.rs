@@ -57,6 +57,38 @@ CREATE TABLE IF NOT EXISTS task_notes (
     agent TEXT NOT NULL,
     updated INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS releases (
+    id TEXT PRIMARY KEY,
+    unit TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '',
+    previous TEXT NOT NULL DEFAULT '',
+    commit_id TEXT NOT NULL,
+    worktree TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    state TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    pid INTEGER,
+    started INTEGER NOT NULL,
+    ended INTEGER,
+    log TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS release_steps (
+    release TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    state TEXT NOT NULL,
+    seconds INTEGER,
+    exit INTEGER,
+    first_error TEXT,
+    PRIMARY KEY (release, name)
+);
+CREATE TABLE IF NOT EXISTS environment_locks (
+    environment TEXT PRIMARY KEY,
+    release TEXT NOT NULL,
+    acquired INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS facts (
     name TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -104,6 +136,47 @@ pub struct RunTarget {
     pub fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_run: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Release {
+    pub id: String,
+    pub unit: String,
+    /// `release` or `rollback`.
+    pub kind: String,
+    pub environment: String,
+    pub version: String,
+    pub previous: String,
+    pub commit: String,
+    pub worktree: String,
+    pub agent: String,
+    pub state: String,
+    pub note: String,
+    pub pid: Option<i64>,
+    pub started: i64,
+    pub ended: Option<i64>,
+    pub log: String,
+}
+
+impl Release {
+    pub fn finished(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "passed" | "failed" | "cancelled" | "abandoned" | "unknown"
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseStep {
+    pub name: String,
+    pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,6 +256,185 @@ impl Store {
         self.conn.execute(
             "UPDATE runs SET state = ?2 WHERE id = ?1",
             params![run, state],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_release(&self, release: &Release, steps: &[String]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO releases (id, unit, kind, environment, version, previous, commit_id, worktree, agent, state, note, pid, started, ended, log)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![release.id, release.unit, release.kind, release.environment, release.version, release.previous,
+                    release.commit, release.worktree, release.agent, release.state, release.note, release.pid,
+                    release.started, release.ended, release.log],
+        )?;
+        for (position, name) in steps.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO release_steps (release, position, name, state) VALUES (?1, ?2, ?3, 'pending')",
+                params![release.id, position as i64, name],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Take the environment for `release` unless an unfinished (or unknown) release holds it.
+    /// Returns the holder when the lock is taken by someone else.
+    pub fn lock_environment(&self, environment: &str, release: &str) -> Result<Option<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let holder: Option<(String, String)> = tx
+            .query_row(
+                "SELECT l.release, COALESCE(r.state, 'gone') FROM environment_locks l LEFT JOIN releases r ON r.id = l.release
+                 WHERE l.environment = ?1",
+                params![environment],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((holder, state)) = holder
+            && holder != release
+            && matches!(state.as_str(), "queued" | "running" | "unknown")
+        {
+            return Ok(Some(holder));
+        }
+        tx.execute(
+            "INSERT INTO environment_locks (environment, release, acquired) VALUES (?1, ?2, ?3)
+             ON CONFLICT (environment) DO UPDATE SET release = ?2, acquired = ?3",
+            params![environment, release, now() as i64],
+        )?;
+        tx.commit()?;
+        Ok(None)
+    }
+
+    pub fn unlock_environment(&self, environment: &str, release: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM environment_locks WHERE environment = ?1 AND release = ?2",
+            params![environment, release],
+        )?;
+        Ok(())
+    }
+
+    pub fn environment_holder(&self, environment: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT release FROM environment_locks WHERE environment = ?1",
+                params![environment],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn release(&self, id: &str) -> Result<Option<Release>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("{RELEASE_SELECT} WHERE id = ?1"),
+                params![id],
+                release_row,
+            )
+            .optional()?)
+    }
+
+    /// Full id, unique prefix, or `last` (latest release started from this worktree).
+    pub fn resolve_release(&self, reference: &str, worktree: &str) -> Result<Release> {
+        if reference == "last" {
+            return self
+                .conn
+                .query_row(&format!("{RELEASE_SELECT} WHERE worktree = ?1 ORDER BY started DESC, id DESC LIMIT 1"), params![worktree], release_row)
+                .optional()?
+                .context("no releases from this worktree yet");
+        }
+        if let Some(release) = self.release(reference)? {
+            return Ok(release);
+        }
+        let mut statement = self
+            .conn
+            .prepare(&format!("{RELEASE_SELECT} WHERE id LIKE ?1 || '%' LIMIT 2"))?;
+        let found = statement
+            .query_map(params![reference], release_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match found.len() {
+            1 => Ok(found.into_iter().next().unwrap_or_else(|| unreachable!())),
+            0 => bail!("no release {reference}"),
+            _ => bail!("release prefix {reference} is ambiguous"),
+        }
+    }
+
+    pub fn releases_of(&self, unit: &str, limit: i64) -> Result<Vec<Release>> {
+        let mut statement = self.conn.prepare(&format!(
+            "{RELEASE_SELECT} WHERE unit = ?1 ORDER BY started DESC, id DESC LIMIT ?2"
+        ))?;
+        Ok(statement
+            .query_map(params![unit, limit], release_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The latest passed release (not rollback) of a unit.
+    pub fn last_passed_release(&self, unit: &str) -> Result<Option<Release>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("{RELEASE_SELECT} WHERE unit = ?1 AND state = 'passed' AND kind = 'release' ORDER BY started DESC LIMIT 1"),
+                params![unit],
+                release_row,
+            )
+            .optional()?)
+    }
+
+    pub fn set_release(&self, id: &str, state: &str, note: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE releases SET state = ?2, note = ?3 WHERE id = ?1",
+            params![id, state, note],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_release_version(&self, id: &str, version: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE releases SET version = ?2 WHERE id = ?1",
+            params![id, version],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_release_pid(&self, id: &str, pid: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE releases SET pid = ?2 WHERE id = ?1",
+            params![id, pid],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_release(&self, id: &str, state: &str, note: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE releases SET state = ?2, note = ?3, ended = ?4 WHERE id = ?1",
+            params![id, state, note, now() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn release_steps(&self, id: &str) -> Result<Vec<ReleaseStep>> {
+        let mut statement = self.conn.prepare(
+            "SELECT name, state, seconds, exit, first_error FROM release_steps WHERE release = ?1 ORDER BY position",
+        )?;
+        Ok(statement
+            .query_map(params![id], |row| {
+                Ok(ReleaseStep {
+                    name: row.get(0)?,
+                    state: row.get(1)?,
+                    seconds: row.get(2)?,
+                    exit: row.get(3)?,
+                    first_error: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn update_step(&self, id: &str, step: &ReleaseStep) -> Result<()> {
+        self.conn.execute(
+            "UPDATE release_steps SET state = ?3, seconds = ?4, exit = ?5, first_error = ?6 WHERE release = ?1 AND name = ?2",
+            params![id, step.name, step.state, step.seconds, step.exit, step.first_error],
         )?;
         Ok(())
     }
@@ -462,6 +714,28 @@ impl Store {
             )
             .optional()?)
     }
+}
+
+const RELEASE_SELECT: &str = "SELECT id, unit, kind, environment, version, previous, commit_id, worktree, agent, state, note, pid, started, ended, log FROM releases";
+
+fn release_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Release> {
+    Ok(Release {
+        id: row.get(0)?,
+        unit: row.get(1)?,
+        kind: row.get(2)?,
+        environment: row.get(3)?,
+        version: row.get(4)?,
+        previous: row.get(5)?,
+        commit: row.get(6)?,
+        worktree: row.get(7)?,
+        agent: row.get(8)?,
+        state: row.get(9)?,
+        note: row.get(10)?,
+        pid: row.get(11)?,
+        started: row.get(12)?,
+        ended: row.get(13)?,
+        log: row.get(14)?,
+    })
 }
 
 const RUN_SELECT: &str = "SELECT id, key, worktree, branch, agent, mode, state, note, snapshot, base, pid, started, ended, exit, log, linked_log FROM runs";

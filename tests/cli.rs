@@ -767,3 +767,203 @@ fn overview_lists_commands_and_the_project_catalog() {
     let (targets, _) = project.json(&["targets"]);
     assert_eq!(targets["targets"].as_array().unwrap().len(), 2);
 }
+
+const RELEASES: &str = r#"
+[releases.app]
+description = "test app"
+environment = "prod"
+
+[releases.app.version]
+reserve = ["sh", "-c", "echo reserving {next}; echo RELEASE={next}"]
+initial = "1.0.0-app"
+
+[[releases.app.steps]]
+name = "build"
+run = ["sh", "-c", "echo built {version}"]
+
+[[releases.app.steps]]
+name = "deploy"
+production = true
+run = ["sh", "deploy.sh", "{version}"]
+recover = ["sh", "-c", "echo recovered {version}"]
+
+[releases.app.rollback]
+production = true
+run = ["sh", "-c", "echo rolled back to {version} from {previous}"]
+"#;
+
+fn release_project() -> Project {
+    let project = Project::new("[plan]\nbase = \"main\"\n");
+    project.write("ci/releases.toml", RELEASES);
+    project.write("deploy.sh", "if [ -f .fail ]; then echo 'Error: cluster unreachable'; exit 1; fi\nif [ -f .slow ]; then sleep 30; fi\necho deployed $1\n");
+    project.write(".gitignore", ".citrus/\n.fail\n.slow\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "releases",
+    ]);
+    project
+}
+
+fn step<'a>(release: &'a Value, name: &str) -> &'a Value {
+    release["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == name)
+        .unwrap_or_else(|| panic!("no step {name} in {release}"))
+}
+
+#[test]
+fn release_runs_steps_with_versions_and_gates() {
+    let project = release_project();
+    let refused = project.json(&["release", "start", "app"]).0;
+    assert!(
+        refused["error"].as_str().unwrap().contains("--approve"),
+        "{refused}"
+    );
+
+    let (first, code) = project.json(&["release", "start", "app", "--approve"]);
+    assert_eq!(code, 0, "{first}");
+    assert_eq!(first["release"]["state"], "passed");
+    assert_eq!(first["release"]["version"], "1.0.0-app");
+    assert_eq!(step(&first, "deploy")["state"], "passed");
+    let (second, _) = project.json(&["release", "start", "app", "--approve"]);
+    assert_eq!(second["release"]["version"], "1.0.1-app");
+    assert_eq!(second["release"]["previous"], "1.0.0-app");
+
+    let (back, code) = project.json(&["release", "rollback", "app", "--approve"]);
+    assert_eq!(code, 0, "{back}");
+    assert_eq!(back["release"]["kind"], "rollback");
+    assert_eq!(back["release"]["version"], "1.0.0-app");
+    let log = project.citrus(&[
+        "release",
+        "log",
+        back["release"]["id"].as_str().unwrap(),
+        "--full",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("rolled back to 1.0.0-app from 1.0.1-app")
+    );
+
+    // Checks gate: a change the plan selects must be proven first.
+    project.git(&["checkout", "-q", "-b", "feature"]);
+    project.write("src/a.txt", "changed\n");
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "change",
+    ]);
+    let gated = project.json(&["release", "start", "app", "--approve"]).0;
+    assert!(
+        gated["error"]
+            .as_str()
+            .unwrap()
+            .contains("checks not proven"),
+        "{gated}"
+    );
+    assert_eq!(project.json(&["run"]).1, 0);
+    assert_eq!(
+        project.json(&["release", "start", "app", "--approve"]).0["release"]["state"],
+        "passed"
+    );
+    project.write("src/a.txt", "dirty\n");
+    assert!(
+        project.json(&["release", "start", "app", "--approve"]).0["error"]
+            .as_str()
+            .unwrap()
+            .contains("commit")
+    );
+}
+
+#[test]
+fn failed_release_resumes_from_the_failed_step() {
+    let project = release_project();
+    project.write(".fail", "");
+    let (failed, code) = project.json(&["release", "start", "app", "--approve"]);
+    assert_eq!(code, 1, "{failed}");
+    assert_eq!(step(&failed, "build")["state"], "passed");
+    assert!(
+        step(&failed, "deploy")["first_error"]
+            .as_str()
+            .unwrap()
+            .contains("cluster unreachable")
+    );
+    fs::remove_file(project.root().join(".fail")).unwrap();
+    let id = failed["release"]["id"].as_str().unwrap().to_owned();
+    let (resumed, code) = project.json(&["release", "resume", &id, "--approve"]);
+    assert_eq!(code, 0, "{resumed}");
+    assert_eq!(resumed["release"]["version"], "1.0.0-app");
+    let log = String::from_utf8_lossy(&project.citrus(&["release", "log", &id, "--full"]).stdout)
+        .into_owned();
+    assert_eq!(
+        log.matches("built 1.0.0-app").count(),
+        1,
+        "build must not repeat: {log}"
+    );
+}
+
+#[test]
+fn interrupted_release_keeps_the_environment_and_recovers() {
+    let project = release_project();
+    project.write(".slow", "");
+    let (started, _) = project.json(&["release", "start", "app", "--approve", "--detach"]);
+    let id = started["release"]["id"].as_str().unwrap().to_owned();
+    // Wait until deploy runs, then kill the worker's whole process group.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let pid = loop {
+        let (shown, _) = project.json(&["release", "show", &id]);
+        if step(&shown, "deploy")["state"] == "running" {
+            break shown["release"]["pid"].as_i64().unwrap();
+        }
+        assert!(Instant::now() < deadline, "deploy never started: {shown}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    // SAFETY: test-only signal to the release worker's process group.
+    unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    std::thread::sleep(Duration::from_millis(300));
+    let (shown, code) = project.json(&["release", "show", &id]);
+    assert_eq!(shown["release"]["state"], "unknown", "{shown}");
+    assert_eq!(code, 3);
+    let blocked = project.json(&["release", "start", "app", "--approve"]).0;
+    assert!(
+        blocked["error"].as_str().unwrap().contains("is held by"),
+        "{blocked}"
+    );
+
+    fs::remove_file(project.root().join(".slow")).unwrap();
+    let (resumed, code) = project.json(&["release", "resume", &id, "--approve"]);
+    assert_eq!(code, 0, "{resumed}");
+    assert_eq!(step(&resumed, "deploy")["state"], "recovered");
+    let log = String::from_utf8_lossy(&project.citrus(&["release", "log", &id, "--full"]).stdout)
+        .into_owned();
+    assert!(
+        log.contains("recovered 1.0.0-app") && !log.contains("deployed 1.0.0-app"),
+        "{log}"
+    );
+
+    // Abandon frees the environment of a release given up by hand.
+    project.write(".slow", "");
+    let (started, _) = project.json(&["release", "start", "app", "--approve", "--detach"]);
+    let other = started["release"]["id"].as_str().unwrap().to_owned();
+    let pid = project.json(&["release", "show", &other]).0["release"]["pid"]
+        .as_i64()
+        .unwrap();
+    unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    std::thread::sleep(Duration::from_millis(300));
+    let (abandoned, _) =
+        project.json(&["release", "abandon", &other, "--reason", "checked by hand"]);
+    assert_eq!(abandoned["release"]["state"], "abandoned", "{abandoned}");
+    fs::remove_file(project.root().join(".slow")).unwrap();
+    let (after, _) = project.json(&["release", "start", "app", "--approve"]);
+    assert_eq!(after["release"]["state"], "passed", "{after}");
+}

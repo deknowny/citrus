@@ -13,6 +13,7 @@ mod exec;
 mod integrate;
 mod manifest;
 mod plan;
+mod release;
 mod repo;
 mod report;
 mod resources;
@@ -153,6 +154,11 @@ enum Command {
     },
     /// Declared checks with their inputs and last result.
     Targets,
+    /// Releases: declared units, running them with gates and recorded steps.
+    Release {
+        #[command(subcommand)]
+        action: Option<ReleaseAction>,
+    },
     /// Check that this repository is set up so Citrus can be trusted.
     Doctor,
     /// How Citrus has been used: runs, reuse, time saved.
@@ -163,7 +169,69 @@ enum Command {
     #[command(hide = true)]
     Worker { run: String },
     #[command(hide = true)]
+    ReleaseWorker { release: String },
+    #[command(hide = true)]
     RefreshResources,
+}
+
+#[derive(Subcommand, Debug)]
+enum ReleaseAction {
+    /// Release units and their last release (also `citrus release`).
+    List,
+    /// Release a unit from the current commit.
+    Start {
+        unit: String,
+        /// Allow steps that change production.
+        #[arg(long)]
+        approve: bool,
+        /// Release even if checks are not proven for this commit (recorded).
+        #[arg(long)]
+        unchecked: bool,
+        #[arg(long)]
+        detach: bool,
+        /// Show the gates and exact commands without running anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Wait for a release (id, prefix or `last`) and print its result.
+    Wait {
+        release: String,
+    },
+    Show {
+        release: String,
+    },
+    /// First error of the failed step; `--step` for one step, `--full` for everything.
+    Log {
+        release: String,
+        #[arg(long)]
+        step: Option<String>,
+        #[arg(long)]
+        full: bool,
+    },
+    /// Continue a failed or unknown release (an unknown step runs its recovery first).
+    Resume {
+        release: String,
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Give up an unfinished release after checking the environment by hand.
+    Abandon {
+        release: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Roll a unit back to the release before its last passed one.
+    Rollback {
+        unit: String,
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Past releases of a unit.
+    History {
+        unit: String,
+        #[arg(long, default_value_t = 10)]
+        limit: i64,
+    },
 }
 
 fn main() {
@@ -307,6 +375,13 @@ fn execute(command: Option<Command>, json: bool) -> Result<i32> {
             Ok(0)
         }
         Command::Targets => targets_command(&context, json),
+        Command::Release { action } => {
+            release_command(&context, action.unwrap_or(ReleaseAction::List), json)
+        }
+        Command::ReleaseWorker { release } => {
+            release::work(&context, &release)?;
+            Ok(0)
+        }
         Command::Doctor => {
             let findings = doctor::diagnose(&context);
             let failed = findings.iter().any(|finding| finding.status == "fail");
@@ -886,7 +961,7 @@ fn run_brief(run: &Run) -> Value {
 
 fn symbol(result: &str) -> &'static str {
     match result {
-        "passed" => "✓",
+        "passed" | "recovered" => "✓",
         "reused" => "≡",
         "failed" => "✗",
         "running" | "queued" | "waiting" => "…",
@@ -1291,4 +1366,374 @@ fn targets_command(context: &Context, json: bool) -> Result<i32> {
         );
     }
     Ok(0)
+}
+
+fn release_command(context: &Context, action: ReleaseAction, json: bool) -> Result<i32> {
+    let here = context.worktree();
+    match action {
+        ReleaseAction::List => {
+            let units = release::Releases::load(context)?;
+            let mut rows = Vec::new();
+            for (name, unit) in &units.releases {
+                let last = context.store.releases_of(name, 1)?.into_iter().next();
+                let last = last
+                    .map(|item| release::reconcile(context, item))
+                    .transpose()?;
+                let holder = context.store.environment_holder(&unit.environment)?;
+                rows.push((name, unit, last, holder));
+            }
+            if json {
+                let value: Vec<Value> = rows
+                    .iter()
+                    .map(|(name, unit, last, holder)| {
+                        json!({
+                            "unit": name, "description": unit.description, "environment": unit.environment,
+                            "steps": unit.steps.iter().map(|step| json!({"name": step.name, "production": step.production})).collect::<Vec<_>>(),
+                            "last": last, "environment_holder": holder,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"schema": SCHEMA, "releases": value}))?
+                );
+                return Ok(0);
+            }
+            if rows.is_empty() {
+                println!("no release units in {}", context.repo.config.releases);
+            }
+            for (name, unit, last, holder) in rows {
+                let steps: Vec<String> = unit
+                    .steps
+                    .iter()
+                    .map(|step| {
+                        if step.production {
+                            format!("{}*", step.name)
+                        } else {
+                            step.name.clone()
+                        }
+                    })
+                    .collect();
+                println!("{name:<16} {}", unit.description);
+                println!("  steps: {}   (* changes production)", steps.join(" → "));
+                match last {
+                    Some(last) => println!(
+                        "  last: {} {} {} · {} ago{}",
+                        last.id,
+                        last.version,
+                        last.state,
+                        age(now() as i64 - last.ended.unwrap_or(last.started)),
+                        holder
+                            .map(|holder| format!(" · {} held by {holder}", unit.environment))
+                            .unwrap_or_default()
+                    ),
+                    None => println!("  no releases recorded yet"),
+                }
+            }
+            print_next(&["citrus release start <unit> --approve".into()]);
+            Ok(0)
+        }
+        ReleaseAction::Start {
+            unit,
+            approve,
+            unchecked,
+            detach,
+            dry_run,
+        } => {
+            if dry_run {
+                let plan = release::dry_run(context, &unit)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({"schema": SCHEMA, "dry_run": plan}))?
+                    );
+                    return Ok(0);
+                }
+                println!(
+                    "release {unit} → {} (dry run, nothing runs)",
+                    plan["environment"].as_str().unwrap_or_default()
+                );
+                println!(
+                    "  source: {}",
+                    if plan["clean"] == true {
+                        "committed"
+                    } else {
+                        "has uncommitted changes — commit first"
+                    }
+                );
+                if let Some(holder) = plan["environment_holder"].as_str() {
+                    println!("  environment held by {holder}");
+                }
+                let needed = plan["checks_needed"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if plan["checks_gate"] == "proven" && !needed.is_empty() {
+                    println!(
+                        "  checks not proven yet: {}",
+                        needed
+                            .iter()
+                            .filter_map(|item| item.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                println!(
+                    "  previous: {} · next: {}",
+                    plan["previous"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("none recorded"),
+                    plan["next_version"].as_str().unwrap_or_default()
+                );
+                for step in plan["steps"].as_array().cloned().unwrap_or_default() {
+                    let mark = if step["production"] == true { "*" } else { " " };
+                    println!(
+                        "  {mark} {:<12} {}",
+                        step["step"].as_str().unwrap_or_default(),
+                        step["run"].as_str().unwrap_or_default()
+                    );
+                    if let Some(recover) = step["recover"].as_str() {
+                        println!("    {:<12} recover: {recover}", "");
+                    }
+                }
+                return Ok(0);
+            }
+            let started = release::start(
+                context,
+                &release::Start {
+                    unit,
+                    approve,
+                    unchecked,
+                    rollback: false,
+                },
+            )?;
+            if detach {
+                return emit_release(context, &started, json);
+            }
+            eprintln!(
+                "citrus: {} — Ctrl-C leaves it running; `citrus release wait {}` to follow",
+                started.id, started.id
+            );
+            let finished = wait_release(context, &started.id, json)?;
+            emit_release(context, &finished, json)
+        }
+        ReleaseAction::Rollback { unit, approve } => {
+            let started = release::start(
+                context,
+                &release::Start {
+                    unit,
+                    approve,
+                    unchecked: true,
+                    rollback: true,
+                },
+            )?;
+            let finished = wait_release(context, &started.id, json)?;
+            emit_release(context, &finished, json)
+        }
+        ReleaseAction::Wait { release } => {
+            let found = context.store.resolve_release(&release, &here)?;
+            let finished = wait_release(context, &found.id, json)?;
+            emit_release(context, &finished, json)
+        }
+        ReleaseAction::Show { release } => {
+            let found =
+                release::reconcile(context, context.store.resolve_release(&release, &here)?)?;
+            emit_release(context, &found, json)
+        }
+        ReleaseAction::Resume { release, approve } => {
+            let found = context.store.resolve_release(&release, &here)?;
+            let resumed = release::resume(context, &found, approve)?;
+            let finished = wait_release(context, &resumed.id, json)?;
+            emit_release(context, &finished, json)
+        }
+        ReleaseAction::Abandon { release, reason } => {
+            let found =
+                release::reconcile(context, context.store.resolve_release(&release, &here)?)?;
+            release::abandon(context, &found, &reason)?;
+            let found = context
+                .store
+                .release(&found.id)?
+                .context("release disappeared")?;
+            emit_release(context, &found, json)
+        }
+        ReleaseAction::Log {
+            release,
+            step,
+            full,
+        } => {
+            let found = context.store.resolve_release(&release, &here)?;
+            let lines = exec::read_log(&found.log);
+            if full {
+                for line in &lines {
+                    println!("{line}");
+                }
+                return Ok(0);
+            }
+            let prefixes = vec!["CITRUS_STEP".to_owned()];
+            if let Some(step) = step {
+                for line in exec::segment(&lines, &step, &prefixes) {
+                    println!("{line}");
+                }
+                return Ok(0);
+            }
+            let steps = release::steps_of(context, &found.id)?;
+            let failed: Vec<_> = steps
+                .iter()
+                .filter(|step| matches!(step.state.as_str(), "failed" | "unknown"))
+                .collect();
+            if failed.is_empty() {
+                println!("{} {}: no failed steps", found.id, found.state);
+            }
+            for step in failed {
+                println!("── {} ({})", step.name, step.state);
+                let excerpt = step
+                    .first_error
+                    .clone()
+                    .or_else(|| report::first_error(&exec::segment(&lines, &step.name, &prefixes)));
+                println!(
+                    "{}",
+                    excerpt.unwrap_or_else(|| "(no output captured)".into())
+                );
+            }
+            println!("── full log: {} ({} lines)", found.log, lines.len());
+            Ok(0)
+        }
+        ReleaseAction::History { unit, limit } => {
+            let history = context.store.releases_of(&unit, limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "unit": unit, "releases": history})
+                    )?
+                );
+                return Ok(0);
+            }
+            for item in history {
+                println!(
+                    "{} {:<10} {:<9} {:<18} {} · {} · {} ago{}",
+                    symbol(match item.state.as_str() {
+                        "abandoned" => "cancelled",
+                        other => other,
+                    }),
+                    item.kind,
+                    item.state,
+                    item.version,
+                    &item.commit[..item.commit.len().min(10)],
+                    item.agent,
+                    age(now() as i64 - item.started),
+                    if item.note.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", item.note)
+                    }
+                );
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn wait_release(context: &Context, id: &str, json: bool) -> Result<crate::state::Release> {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    loop {
+        let current = release::reconcile(
+            context,
+            context.store.release(id)?.context("unknown release")?,
+        )?;
+        for step in context.store.release_steps(id)? {
+            let key = (step.name.clone(), step.state.clone());
+            if step.state != "pending" && !seen.contains(&key) {
+                if !json || step.state != "running" {
+                    let extra = if step.name == "version" && !current.version.is_empty() {
+                        format!(" {}", current.version)
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "  {} {}{}{}",
+                        symbol(&step.state),
+                        step.name,
+                        extra,
+                        step.seconds
+                            .map(|seconds| format!(" {}", age(seconds)))
+                            .unwrap_or_default()
+                    );
+                }
+                seen.push(key);
+            }
+        }
+        if current.finished() {
+            return Ok(current);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn emit_release(context: &Context, item: &crate::state::Release, json: bool) -> Result<i32> {
+    let steps = context.store.release_steps(&item.id)?;
+    let next: Vec<String> = match item.state.as_str() {
+        "failed" => vec![
+            format!("citrus release log {}", item.id),
+            format!("citrus release resume {} --approve", item.id),
+        ],
+        "unknown" => vec![
+            format!("citrus release resume {} --approve", item.id),
+            format!("citrus release abandon {} --reason \"…\"", item.id),
+        ],
+        "passed" => vec![format!("citrus release history {}", item.unit)],
+        "queued" | "running" => vec![format!("citrus release wait {}", item.id)],
+        _ => Vec::new(),
+    };
+    let code = match item.state.as_str() {
+        "passed" | "queued" | "running" => 0,
+        "failed" => 1,
+        _ => 3,
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({"schema": SCHEMA, "release": item, "steps": steps, "next": next})
+            )?
+        );
+        return Ok(code);
+    }
+    let elapsed = item.ended.unwrap_or(now() as i64) - item.started;
+    println!(
+        "{} {} {} {} {} · {} · commit {}",
+        symbol(&item.state),
+        item.kind,
+        item.unit,
+        if item.version.is_empty() {
+            "(no version yet)"
+        } else {
+            &item.version
+        },
+        item.state,
+        age(elapsed),
+        &item.commit[..item.commit.len().min(10)]
+    );
+    if !item.note.is_empty() {
+        println!("  {}", item.note);
+    }
+    for step in &steps {
+        println!(
+            "  {} {:<14} {}{}",
+            symbol(&step.state),
+            step.name,
+            step.state,
+            step.seconds
+                .map(|seconds| format!(" · {}", age(seconds)))
+                .unwrap_or_default()
+        );
+        if let Some(error) = &step.first_error {
+            for line in error.lines().take(12) {
+                println!("      {line}");
+            }
+        }
+    }
+    print_next(&next);
+    Ok(code)
 }

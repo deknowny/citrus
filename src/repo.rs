@@ -54,6 +54,10 @@ impl Repo {
         self.root.join(&self.config.log_dir)
     }
 
+    pub fn releases_path(&self) -> PathBuf {
+        self.root.join(&self.config.releases)
+    }
+
     pub fn manifest_path(&self) -> PathBuf {
         self.root.join(&self.config.manifest)
     }

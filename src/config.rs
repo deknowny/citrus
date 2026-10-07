@@ -17,6 +17,8 @@ use serde::Deserialize;
 pub struct Config {
     /// Declared targets, repository-relative.
     pub manifest: String,
+    /// Release units, repository-relative (docs/releases.md).
+    pub releases: String,
     /// Files every declared target's fingerprint depends on (toolchain pins).
     pub toolchain_files: Vec<String>,
     /// Where run logs go, repository-relative; should be ignored by Git.
@@ -118,6 +120,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             manifest: "ci/targets.toml".into(),
+            releases: "ci/releases.toml".into(),
             toolchain_files: Vec::new(),
             log_dir: ".citrus/logs".into(),
             target_definitions: vec!["Makefile".into(), "*.mk".into(), "make/*.mk".into()],
