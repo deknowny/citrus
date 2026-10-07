@@ -660,7 +660,7 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
             reads.extend(group_paths.get(name).into_iter().flatten().cloned());
         }
         if !reads.is_empty() {
-            reads.extend(check.reads.drain(..));
+            reads.append(&mut check.reads);
             check.reads = reads;
         }
         check.cache = check.cache_set.unwrap_or(default_cache)
