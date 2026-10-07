@@ -229,6 +229,20 @@ impl Context {
             {
                 self.refuse_empty_plan(request.base.as_deref())?;
             }
+            // The planner itself says it cannot tell what these changes need.
+            if plan.status == "incomplete" && !plan.unmapped.is_empty() {
+                let shown: Vec<&str> = plan.unmapped.iter().take(5).map(String::as_str).collect();
+                bail!(
+                    "the plan is incomplete: {} changed paths no check claims ({}{}); claim them in citrus.ci (`owns`) or in the planner, or run named checks",
+                    plan.unmapped.len(),
+                    shown.join(", "),
+                    if plan.unmapped.len() > shown.len() {
+                        ", …"
+                    } else {
+                        ""
+                    }
+                );
+            }
             plan.targets
         };
         let files = self.repo.files()?;

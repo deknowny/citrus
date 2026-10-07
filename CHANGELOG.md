@@ -26,6 +26,8 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
   of earlier versions no longer match.
 - Editing a check in `citrus.ci` selects it on the next plan; other edits of
   `citrus.ci` map to `config`.
+- `citrus run` refuses a plan its planner reports as `incomplete` with
+  unclaimed paths, before anything runs, and names the paths.
 - `citrus add` appends a `check` block to `citrus.ci` (and creates the file).
 - `apply` records a release on a workload that already runs the built image
   without touching its pod template, so nothing restarts for an identical build.

@@ -1809,3 +1809,20 @@ fn project_tools_read_the_declared_checks() {
         "{targets}"
     );
 }
+
+#[test]
+fn an_incomplete_plan_is_refused_before_anything_runs() {
+    let project = Project::new("planner { run = run(\"sh\", \"plan.sh\") }\n");
+    project.write(
+        "plan.sh",
+        "printf 'PLAN\\tstatus=incomplete\\tfiles=2\\nUNMAPPED\\tweird/path\\nTARGET\\tmake:ok\\n'\n",
+    );
+    project.commit("planner");
+    let (refused, code) = project.json(&["run"]);
+    assert_eq!(code, 2, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains("weird/path"),
+        "{refused}"
+    );
+    assert_eq!(project.json(&["run", "ok"]).1, 0);
+}
