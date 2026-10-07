@@ -181,7 +181,7 @@ pub fn dry_run(context: &Context, unit_name: &str) -> Result<serde_json::Value> 
             if next.is_empty() {
                 "{version}".to_owned()
             } else {
-                format!("{next} (if reserved as suggested)")
+                next.clone()
             },
         ),
         ("previous", previous.clone()),

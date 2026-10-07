@@ -1479,7 +1479,7 @@ fn release_command(context: &Context, action: ReleaseAction, json: bool) -> Resu
                     );
                 }
                 println!(
-                    "  previous: {} · next: {}",
+                    "  previous: {} · next: {} (the reservation may pick a later free version)",
                     plan["previous"]
                         .as_str()
                         .filter(|value| !value.is_empty())
