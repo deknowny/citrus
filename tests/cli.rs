@@ -1068,3 +1068,175 @@ fn an_external_planner_that_saw_nothing_cannot_pass_unmerged_commits() {
     project.git(&["checkout", "-q", "main"]);
     assert_eq!(project.json(&["run"]).0["run"]["state"], "passed");
 }
+
+const KUBECTL: &str = r#"#!/bin/sh
+release=$(cat .citrus-release 2>/dev/null || echo 1.0.0)
+ready=$(cat .citrus-ready 2>/dev/null || echo 1)
+cat <<JSON
+{"metadata": {"generation": 3, "annotations": {"example.com/release": "$release"}},
+ "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "api", "image": "registry.example/api@sha256:aaaa"}]}}},
+ "status": {"observedGeneration": 3, "readyReplicas": $ready}}
+JSON
+"#;
+
+#[test]
+fn diff_compares_what_runs_with_what_head_would_build() {
+    let project = Project::new("");
+    project.write(
+        "ci/artifacts.toml",
+        "[artifacts.api]\ninputs = [\"src/**\"]\n",
+    );
+    project.write(
+        "ci/environments.toml",
+        "[environments.prod]\nprovider = \"kubernetes\"\nconnection = { kubectl = \"./kubectl.sh\", namespace = \"shop\" }\nrecord = { annotation = \"example.com/release\", tag_prefix = \"v\" }\n[environments.prod.workloads.api]\nartifact = \"api\"\n",
+    );
+    project.write("kubectl.sh", KUBECTL);
+    let mut perms = fs::metadata(project.root().join("kubectl.sh"))
+        .unwrap()
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(project.root().join("kubectl.sh"), perms).unwrap();
+    project.write(".gitignore", ".citrus/\n.citrus-release\n.citrus-ready\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "deploy config",
+    ]);
+    project.git(&["tag", "v1.0.0"]);
+
+    let (same, code) = project.json(&["diff", "prod"]);
+    assert_eq!(code, 0, "{same}");
+    assert_eq!(same["diff"]["found_by"], "tag v1.0.0");
+    assert_eq!(same["diff"]["workloads"][0]["change"], "unchanged");
+    assert_eq!(
+        same["diff"]["workloads"][0]["running_digest"],
+        "sha256:aaaa"
+    );
+    assert_eq!(same["diff"]["actions"], serde_json::json!([]));
+
+    project.write("docs.md", "outside the artifact\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "docs",
+    ]);
+    assert_eq!(
+        project.json(&["diff", "prod"]).0["diff"]["workloads"][0]["change"],
+        "unchanged"
+    );
+
+    project.write("src/a.txt", "new behaviour\n");
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "change",
+    ]);
+    let (changed, _) = project.json(&["diff", "prod"]);
+    assert_eq!(changed["diff"]["workloads"][0]["change"], "changed");
+    assert_eq!(
+        changed["diff"]["workloads"][0]["changed_inputs"],
+        serde_json::json!(["src/a.txt"])
+    );
+    assert_eq!(changed["diff"]["actions"].as_array().unwrap().len(), 2);
+    let (artifacts, _) = project.json(&["artifacts", "--at", "v1.0.0"]);
+    assert_ne!(
+        artifacts["artifacts"][0]["key"],
+        changed["diff"]["workloads"][0]["desired_key"]
+    );
+
+    project.write(".citrus-release", "9.9.9");
+    project.write(".citrus-ready", "0");
+    let (unknown, _) = project.json(&["diff", "prod"]);
+    assert_eq!(unknown["diff"]["workloads"][0]["change"], "unknown");
+    assert!(
+        unknown["diff"]["actions"][0]
+            .as_str()
+            .unwrap()
+            .contains("not ready"),
+        "{unknown}"
+    );
+}
+
+#[test]
+fn artifact_inputs_can_come_from_a_command() {
+    let project = Project::new("");
+    project.write(
+        "ci/artifacts.toml",
+        "[artifacts.api]\ninputs_command = [\"sh\", \"-c\", \"echo src/a.txt; echo Makefile\"]\n",
+    );
+    project.write(
+        "ci/environments.toml",
+        "[environments.prod]\nprovider = \"kubernetes\"\nconnection = { kubectl = \"./kubectl.sh\" }\nrecord = { annotation = \"example.com/release\", tag_prefix = \"v\" }\n[environments.prod.workloads.api]\nartifact = \"api\"\n",
+    );
+    project.write("kubectl.sh", KUBECTL);
+    let mut perms = fs::metadata(project.root().join("kubectl.sh"))
+        .unwrap()
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(project.root().join("kubectl.sh"), perms).unwrap();
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "config",
+    ]);
+    project.git(&["tag", "v1.0.0"]);
+    project.write("other/x", "not an input\n");
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "other",
+    ]);
+    assert_eq!(
+        project.json(&["diff", "prod"]).0["diff"]["workloads"][0]["change"],
+        "unchanged"
+    );
+    project.write("Makefile", "ok:\n\t@echo changed\n");
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "make",
+    ]);
+    let (changed, _) = project.json(&["diff", "prod"]);
+    assert_eq!(
+        changed["diff"]["workloads"][0]["changed_inputs"],
+        serde_json::json!(["Makefile"]),
+        "{changed}"
+    );
+    project.write(
+        "ci/artifacts.toml",
+        "[artifacts.api]\ninputs = [\"a\"]\ninputs_command = [\"true\"]\n",
+    );
+    assert!(
+        project.json(&["artifacts"]).0["error"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one")
+    );
+}

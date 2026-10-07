@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Declarative releases, read side: `ci/artifacts.toml` (inputs as globs or an
+  `inputs_command`; keys from Git objects at any commit), `ci/environments.toml`
+  (provider `kubernetes`, workloads, release record by annotation / tag / resolve
+  hook), `citrus artifacts [--at REV]` and `citrus diff <env>` — what runs versus
+  what HEAD would build, per workload, with the inputs that changed.
+
 - Log, state and receipt directories are created owner-only (0700); a group-readable state dir broke a consumer's builder pool in fresh worktrees.
 - `run` refuses a "nothing to check" from an external planner that saw no changed files while HEAD has commits the base lacks (it compared against another base) instead of passing.
 

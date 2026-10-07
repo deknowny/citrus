@@ -8,6 +8,7 @@
 
 mod add;
 mod config;
+mod deploy;
 mod doctor;
 mod exec;
 mod integrate;
@@ -154,6 +155,13 @@ enum Command {
     },
     /// Declared checks with their inputs and last result.
     Targets,
+    /// Artifacts and their input keys (at HEAD, or `--at` another revision).
+    Artifacts {
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// What an environment runs versus what HEAD would run (read-only).
+    Diff { environment: String },
     /// Releases: declared units, running them with gates and recorded steps.
     Release {
         #[command(subcommand)]
@@ -375,6 +383,92 @@ fn execute(command: Option<Command>, json: bool) -> Result<i32> {
             Ok(0)
         }
         Command::Targets => targets_command(&context, json),
+        Command::Artifacts { at } => {
+            let revision = context
+                .repo
+                .git(&["rev-parse", at.as_deref().unwrap_or("HEAD")])?;
+            let mut rows = Vec::new();
+            for (name, artifact) in deploy::artifacts(&context)? {
+                let paths = deploy::command_paths(&context, &artifact)?;
+                let (key, files) =
+                    deploy::key_at(&context, &name, &artifact, &revision, paths.as_deref())?;
+                rows.push(json!({"artifact": name, "key": key, "files": files.len(), "description": artifact.description}));
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "revision": revision, "artifacts": rows})
+                    )?
+                );
+            } else {
+                println!("artifacts at {}", &revision[..12]);
+                for row in rows {
+                    println!(
+                        "  {:<28} {} · {} input files",
+                        row["artifact"].as_str().unwrap_or_default(),
+                        &row["key"].as_str().unwrap_or_default()[..12],
+                        row["files"]
+                    );
+                }
+            }
+            Ok(0)
+        }
+        Command::Diff { environment } => {
+            let diff = deploy::diff(&context, &environment)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"schema": SCHEMA, "diff": diff}))?
+                );
+                return Ok(0);
+            }
+            println!(
+                "{} · running {} ({}) · HEAD {}",
+                diff.environment,
+                diff.running_release.as_deref().unwrap_or("?"),
+                diff.running_commit
+                    .as_deref()
+                    .map(|commit| &commit[..commit.len().min(12)])
+                    .unwrap_or("commit unknown"),
+                &diff.head[..12]
+            );
+            println!("  running commit found by: {}", diff.found_by);
+            for item in &diff.workloads {
+                let mark = match item.change.as_str() {
+                    "unchanged" => "≡",
+                    "changed" => "○",
+                    _ => "?",
+                };
+                println!(
+                    "  {mark} {:<24} {} · {} · {}",
+                    item.workload,
+                    item.artifact,
+                    item.detail,
+                    item.running_digest
+                        .as_deref()
+                        .map(|digest| &digest[..digest.len().min(19)])
+                        .unwrap_or("no digest")
+                );
+                if !item.changed_inputs.is_empty() {
+                    println!(
+                        "      {} inputs changed: {}",
+                        item.changed_inputs.len(),
+                        preview(&item.changed_inputs)
+                    );
+                }
+            }
+            if diff.actions.is_empty() {
+                println!("nothing to apply: the environment runs what HEAD would build");
+            } else {
+                println!("apply would:");
+                for action in &diff.actions {
+                    println!("  · {action}");
+                }
+            }
+            println!("plan {}", &diff.plan_hash[..12]);
+            Ok(0)
+        }
         Command::Release { action } => {
             release_command(&context, action.unwrap_or(ReleaseAction::List), json)
         }

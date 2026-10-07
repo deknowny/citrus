@@ -19,6 +19,9 @@ pub struct Config {
     pub manifest: String,
     /// Release units, repository-relative (docs/releases.md).
     pub releases: String,
+    /// Artifacts and environments for `citrus diff` (docs/design/declarative.md).
+    pub artifacts: String,
+    pub environments: String,
     /// Files every declared target's fingerprint depends on (toolchain pins).
     pub toolchain_files: Vec<String>,
     /// Where run logs go, repository-relative; should be ignored by Git.
@@ -131,6 +134,8 @@ impl Default for Config {
         Config {
             manifest: "ci/targets.toml".into(),
             releases: "ci/releases.toml".into(),
+            artifacts: "ci/artifacts.toml".into(),
+            environments: "ci/environments.toml".into(),
             toolchain_files: Vec::new(),
             log_dir: ".citrus/logs".into(),
             target_definitions: vec!["Makefile".into(), "*.mk".into(), "make/*.mk".into()],
