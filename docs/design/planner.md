@@ -24,7 +24,13 @@ group clyer {
 
 A path is matched by a list when the last glob that matches it is a
 positive one (like `.gitignore`). A path no group or check claims is
-unmapped. A group without checks (documentation) claims its paths and runs
+unmapped.
+
+A path a check names in its own `paths` is that check's: groups elsewhere,
+and their checks, do not see it (the specific owner wins, as in
+CODEOWNERS). A tool's own test runs when the tool changes, not the broad
+contract of everything under `scripts/`. Inputs a check shares with others
+go to its `reads`, or stay with a group. A group without checks (documentation) claims its paths and runs
 nothing.
 
 ## 2. Profiles

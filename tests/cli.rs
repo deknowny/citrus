@@ -2378,3 +2378,34 @@ check clyer-only = make("ok") {
     assert_eq!(targets, serde_json::json!(["infra.contract", "clyer-only"]));
     assert_eq!(arms, serde_json::json!({}));
 }
+
+#[test]
+fn a_path_a_check_names_is_that_checks_alone() {
+    let project = Project::new(
+        r#"
+group infra {
+  paths = ["scripts/**"]
+  check contract = make("ok")
+}
+
+# The tool's own tests: editing the tool does not run the infra contract.
+check tool = make("ok") {
+  paths = ["scripts/tool.py"]
+  reads = ["scripts/lib.py"]
+}
+"#,
+    );
+    let plan_for = |paths: &str| {
+        project.write("paths.txt", paths);
+        project.json(&["plan", "--paths-file", "paths.txt"]).0["plan"]["targets"].clone()
+    };
+    assert_eq!(plan_for("scripts/tool.py\n"), serde_json::json!(["tool"]));
+    assert_eq!(
+        plan_for("scripts/lib.py\n"),
+        serde_json::json!(["infra.contract"])
+    );
+    assert_eq!(
+        plan_for("scripts/tool.py\nscripts/run.sh\n"),
+        serde_json::json!(["infra.contract", "tool"])
+    );
+}

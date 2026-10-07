@@ -180,7 +180,7 @@ fn select(
     let mut owned_paths: Vec<(String, Vec<String>)> = Vec::new();
     for path in &paths {
         // A path a signal claims for a group belongs to it like its own paths.
-        let groups: Vec<&str> = manifest
+        let mut groups: Vec<&str> = manifest
             .groups
             .iter()
             .filter(|group| {
@@ -204,6 +204,29 @@ fn select(
             if claimed && !owners.contains(&target.name.as_str()) {
                 owners.push(&target.name);
             }
+        }
+        // A path a check names in its own `paths` is that check's: groups
+        // elsewhere, and their checks, do not see it.
+        let named = |name: &str| {
+            manifest
+                .targets
+                .get(name)
+                .is_some_and(|target| target.narrows || target.group.is_none())
+        };
+        let homes: Vec<&str> = owners
+            .iter()
+            .filter(|name| named(name))
+            .filter_map(|name| manifest.targets[*name].group.as_deref())
+            .collect();
+        if owners.iter().any(|name| named(name)) {
+            owners.retain(|name| {
+                named(name)
+                    || manifest.targets[*name]
+                        .group
+                        .as_deref()
+                        .is_some_and(|group| homes.contains(&group))
+            });
+            groups.retain(|group| homes.contains(group));
         }
         touched.extend(owners.iter().map(|name| (*name).to_owned()));
         touched.extend(groups.iter().map(|name| (*name).to_owned()));

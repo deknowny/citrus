@@ -100,7 +100,7 @@ environment production = kubernetes(context: "prod", namespace: "api") { … }
 
 | Field | |
 |---|---|
-| `paths` | changed paths that select the check; inside a group they narrow the group's paths |
+| `paths` | changed paths that select the check; inside a group they narrow the group's paths. A path named here is this check's alone: groups elsewhere do not see it |
 | `reads` | more inputs: they invalidate a pass but do not select the check |
 | `profile` | the profile it belongs to (without one: every profile) |
 | `needs = [service, …]` | services it needs |
