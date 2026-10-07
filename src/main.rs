@@ -10,6 +10,7 @@ mod add;
 mod apply;
 mod config;
 mod deploy;
+mod dockerfile;
 mod doctor;
 mod exec;
 mod integrate;

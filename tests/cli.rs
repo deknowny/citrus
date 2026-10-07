@@ -1826,3 +1826,35 @@ fn an_incomplete_plan_is_refused_before_anything_runs() {
     );
     assert_eq!(project.json(&["run", "ok"]).1, 0);
 }
+
+#[test]
+fn an_artifact_ignores_dockerfile_stages_it_is_not_built_from() {
+    let project = Project::new(
+        "artifact \"api\" { inputs = [\"Dockerfile\"], dockerfile = { file: \"Dockerfile\", target: \"api\" } }\n",
+    );
+    let dockerfile = "ARG V=1\nFROM a AS build\nRUN make\nFROM b AS other\nRUN other\nFROM c AS api\nCOPY --from=build /x /x\n";
+    project.write("Dockerfile", dockerfile);
+    project.commit("dockerfile");
+    let key = |project: &Project| project.json(&["artifacts"]).0["artifacts"][0]["key"].clone();
+    let before = key(&project);
+    project.write(
+        "Dockerfile",
+        &dockerfile.replace("RUN other", "RUN changed"),
+    );
+    project.commit("other stage");
+    assert_eq!(
+        key(&project),
+        before,
+        "another stage must not change the key"
+    );
+    project.write(
+        "Dockerfile",
+        &dockerfile.replace("RUN make", "RUN make all"),
+    );
+    project.commit("build stage");
+    assert_ne!(
+        key(&project),
+        before,
+        "a stage the target copies from must change the key"
+    );
+}

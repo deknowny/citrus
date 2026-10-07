@@ -35,8 +35,10 @@ Artifacts and environments, next to the checks in `citrus.ci`
 ```
 # What is built, from what. Key = hash of the inputs + this declaration.
 artifact "api" {
-  inputs = ["crates/api/**", "Cargo.lock", "Dockerfile.api"]
-  build = { provider: "docker", dockerfile: "Dockerfile.api", target: "runtime" }
+  inputs = ["crates/api/**", "Cargo.lock", "Dockerfile"]
+  # A shared Dockerfile counts only with the stages `runtime` is built from.
+  dockerfile = { file: "Dockerfile", target: "runtime" }
+  build = { provider: "docker", dockerfile: "Dockerfile", target: "runtime" }
   publish = { registry: "registry.example.com/shop/api" }    # identity = pushed digest
 }
 

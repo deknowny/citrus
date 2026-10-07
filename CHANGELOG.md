@@ -28,6 +28,10 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
   `citrus.ci` map to `config`.
 - `citrus run` refuses a plan its planner reports as `incomplete` with
   unclaimed paths, before anything runs, and names the paths.
+- Artifacts take `dockerfile = { file:, target: }`: a shared multi-stage
+  Dockerfile counts in the key only with the stages the target is built from
+  (`FROM <stage>`, `COPY --from=`, `--mount=…,from=`), so another product's
+  stage no longer asks for a rebuild.
 - `citrus add` appends a `check` block to `citrus.ci` (and creates the file).
 - `apply` records a release on a workload that already runs the built image
   without touching its pod template, so nothing restarts for an identical build.

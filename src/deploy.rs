@@ -27,11 +27,22 @@ pub struct Artifact {
     pub inputs_command: Vec<String>,
     #[serde(default)]
     pub description: String,
+    /// A multi-stage Dockerfile among the inputs counts only with the stages
+    /// this target is built from.
+    #[serde(default)]
+    pub dockerfile: Option<DockerfileScope>,
     /// Provider-specific build settings (opaque to the core, part of the key).
     #[serde(default)]
     pub build: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub publish: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DockerfileScope {
+    pub file: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -251,6 +262,16 @@ pub fn key_at(
             .collect(),
     };
     files.sort();
+    if let Some(scope) = &artifact.dockerfile {
+        for (path, identity) in files.iter_mut() {
+            if *path == scope.file && identity != "missing" {
+                let text = context.repo.git(&["show", &format!("{commit}:{path}")])?;
+                let scoped = crate::dockerfile::scope(&text, &scope.target)
+                    .with_context(|| format!("artifact {name}: {path}"))?;
+                *identity = format!("stages {}", hex::encode(Sha256::digest(scoped)));
+            }
+        }
+    }
     let mut digest = Sha256::new();
     digest.update(serde_json::to_string(&(name, artifact))?.as_bytes());
     for (path, identity) in &files {
