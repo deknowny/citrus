@@ -38,6 +38,8 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
 - A declared cached check that a pool reported passing now counts locally
   too (evidence and receipt by inputs), so a remote PASS is reused after
   unrelated edits — before, only local passes were, and most runs are remote.
+- `cargo.run(args…)`; `citrus check` warns when `run("cargo", "fmt"|"test"|
+  "build"|"clippy"|"run", …)` is written by hand and names the built-in.
 - Plan-time choice: `group` blocks (named path sets, optional `note`),
   `when` on checks with `touched`, `selected`, `signal`, `and/or/not`, a
   project `signals` command (`SIGNAL x`, `CLAIM <path> <group>`);

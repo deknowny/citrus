@@ -2297,3 +2297,11 @@ check "vpn-tests" { when = touched("vpn"), run = make("ok") }
         "{plan}"
     );
 }
+
+#[test]
+fn a_cargo_command_written_by_hand_points_at_the_built_in() {
+    let project = Project::new("task \"fmt\" { steps = [run(\"cargo\", \"fmt\")] }\n");
+    let (checked, _) = project.json(&["check"]);
+    let warning = checked["warnings"][0]["message"].as_str().unwrap();
+    assert!(warning.contains("cargo.fmt(…)"), "{checked}");
+}

@@ -197,7 +197,7 @@ Actions without a mark work today; *planned* ones are reserved names.
 |---|---|
 | `run(program, args…)` | run a program without a shell |
 | `make(target, vars…)` | `make <target>` |
-| `cargo.test(pkg)`, `cargo.build(…)` | Cargo commands |
+| `cargo.test(pkg)`, `cargo.build(…)`, `cargo.fmt(check:)`, `cargo.clippy(deny:)`, `cargo.run(args…)` | Cargo commands; `citrus check` points a hand-written `run("cargo", …)` at them |
 | `sh("…")` | a shell command — explicit, flagged non-portable by `citrus check` |
 | `docker(…)` | *planned*; today `build = { provider: "docker", … }` |
 | `kubernetes(context:, namespace:, kubectl:)` | the provider of an environment (`on = …`) |

@@ -746,6 +746,15 @@ fn steps(
                         .help("prefer run(...) or a built-in action"),
                     );
                 }
+                if let Some(builtin) = builtin_for(action) {
+                    warnings.push(
+                        Error::at(
+                            action.span,
+                            format!("`run(\"cargo\", …)` has a built-in: use {builtin}"),
+                        )
+                        .help("built-in steps know their flags and read the same everywhere"),
+                    );
+                }
                 Ok(step)
             }
             other => Err(Error::at(
@@ -757,6 +766,17 @@ fn steps(
             )),
         })
         .collect()
+}
+
+/// The built-in action a `run("cargo", "<sub>", …)` step should be.
+fn builtin_for(action: &Action) -> Option<String> {
+    if action.kind != "run" || action.args.first().and_then(Value::as_str) != Some("cargo") {
+        return None;
+    }
+    let sub = action.args.get(1).and_then(Value::as_str)?;
+    ["fmt", "test", "build", "clippy", "run"]
+        .contains(&sub)
+        .then(|| format!("cargo.{sub}(…)"))
 }
 
 fn text(action: &Action, index: usize) -> Result<String, Error> {
@@ -848,6 +868,18 @@ fn step(action: &Action, env: &[(String, String)]) -> Result<Step, Error> {
             if matches!(named(action, "check"), Some(Value::Bool(true))) {
                 argv.push("--check".into());
             }
+            process(argv, true)
+        }
+        "cargo.run" => {
+            // `cargo run` of this package with the given arguments.
+            let mut argv = vec![
+                "cargo".to_owned(),
+                "run".to_owned(),
+                "--quiet".to_owned(),
+                "--locked".to_owned(),
+                "--".to_owned(),
+            ];
+            argv.extend(all_text(action)?);
             process(argv, true)
         }
         "cargo.clippy" => {

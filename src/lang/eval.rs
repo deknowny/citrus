@@ -235,6 +235,7 @@ pub const ACTIONS: &[&str] = &[
     "cargo.build",
     "cargo.fmt",
     "cargo.clippy",
+    "cargo.run",
     "compose.up",
     "compose.down",
     "wait.tcp",

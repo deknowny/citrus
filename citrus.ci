@@ -37,16 +37,13 @@ check "doctor" {
   about = "This repository's own Citrus configuration is valid and formatted"
   owns = ["citrus.ci"]
   reads = rust + cargo_files
-  run = [
-    run("cargo", "run", "--quiet", "--locked", "--", "doctor", "--text"),
-    run("cargo", "run", "--quiet", "--locked", "--", "fmt", "--check", "--text"),
-  ]
+  run = [cargo.run("doctor", "--text"), cargo.run("fmt", "--check", "--text")]
   cache = true
 }
 
 task "fmt" {
   about = "Format the code"
-  steps = [run("cargo", "fmt")]
+  steps = [cargo.fmt()]
 }
 
 # `citrus release start github --version X.Y.Z --approve`: tag a proven main
