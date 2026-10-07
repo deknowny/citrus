@@ -137,6 +137,8 @@ pub enum Cond {
     Selected(String),
     /// The project's signal command printed this signal.
     Signal(String),
+    /// The plan is for this profile.
+    Profile(String),
     And(Box<Cond>, Box<Cond>),
     Or(Box<Cond>, Box<Cond>),
     Not(Box<Cond>),
@@ -162,6 +164,7 @@ fn cond(value: &Value, span: Span) -> Result<Cond, Error> {
             "touched" => Cond::Touched(name(action)?),
             "selected" => Cond::Selected(name(action)?),
             "signal" => Cond::Signal(name(action)?),
+            "profile" => Cond::Profile(name(action)?),
             "and" | "or" => {
                 let left = Box::new(cond(&action.args[0], span)?);
                 let right = Box::new(cond(&action.args[1], span)?);

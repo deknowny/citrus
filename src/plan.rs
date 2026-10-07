@@ -322,6 +322,9 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> R
                     crate::lang::compile::Cond::Touched(name) => touched.contains(name),
                     crate::lang::compile::Cond::Selected(name) => selected.contains(name),
                     crate::lang::compile::Cond::Signal(name) => signals.contains(name),
+                    crate::lang::compile::Cond::Profile(name) => {
+                        repo.config.plan.profile.as_deref() == Some(name.as_str())
+                    }
                     _ => false,
                 })
             });
@@ -349,6 +352,9 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> R
                 crate::lang::compile::Cond::Touched(name) => touched.contains(name),
                 crate::lang::compile::Cond::Selected(name) => plan.targets.contains(name),
                 crate::lang::compile::Cond::Signal(name) => signals.contains(name),
+                crate::lang::compile::Cond::Profile(name) => {
+                    repo.config.plan.profile.as_deref() == Some(name.as_str())
+                }
                 _ => false,
             })
         })

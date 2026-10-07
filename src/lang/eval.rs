@@ -253,11 +253,14 @@ pub const ACTIONS: &[&str] = &[
     "touched",
     "selected",
     "signal",
+    "profile",
 ];
 
 /// Plan-time conditions (`when = touched("x") and not selected("y")`):
 /// evaluated when the changed paths are known, not when the file is read.
-const CONDITIONS: &[&str] = &["touched", "selected", "signal", "and", "or", "not"];
+const CONDITIONS: &[&str] = &[
+    "touched", "selected", "signal", "profile", "and", "or", "not",
+];
 
 fn condition(value: &Value) -> bool {
     matches!(value, Value::Action(action) if CONDITIONS.contains(&action.kind.as_str()))

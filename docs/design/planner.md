@@ -81,6 +81,7 @@ check "test-clyer-pipeline-contract" {
 - `touched("x")`: a changed path is owned by group or check `x`.
 - `selected("x")`: check `x` is in the plan (conditions are applied until
   the plan stops changing).
+- `profile("e2e")`: the plan is for that profile.
 - `signal("x")`: the project's signal command printed `SIGNAL x`. It runs
   with `CITRUS_PATHS` (a file of the changed paths) and is the place for
   classification a glob cannot express (Garvis reads file contents to tell

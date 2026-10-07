@@ -2103,6 +2103,7 @@ fn profiles_and_covered_checks_shape_the_plan() {
 project { base = "main", profiles = ["fast", "e2e"] }
 check "unit" { owns = ["lib/**"], run = make("ok"), profiles = ["fast"] }
 check "e2e" { owns = ["lib/**"], run = make("plain"), profiles = ["e2e"] }
+check "slow-only" { when = touched("e2e") and profile("e2e"), run = make("ok") }
 check "part" { owns = ["lib/**"], run = make("ok"), covered_by = ["whole"] }
 check "whole" { owns = ["lib/**"], run = make("ok") }
 "#,
@@ -2115,7 +2116,7 @@ check "whole" { owns = ["lib/**"], run = make("ok") }
     assert_eq!(targets(&[]), serde_json::json!(["unit", "whole"]));
     assert_eq!(
         targets(&["--profile", "e2e"]),
-        serde_json::json!(["e2e", "whole"])
+        serde_json::json!(["e2e", "slow-only", "whole"])
     );
     let unknown = project.json(&["plan", "--profile", "nightly"]).0;
     assert!(
