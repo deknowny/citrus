@@ -346,7 +346,7 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                         format!("check \"{name}\" is declared twice"),
                     ));
                 }
-                let owns = strings(decl, "owns")?;
+                let owns = unique(strings(decl, "owns")?);
                 if owns.is_empty() {
                     return Err(
                         Error::at(decl.span, format!("check \"{name}\" owns no files")).help(
@@ -367,7 +367,7 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
                     name,
                     description: optional_string(decl, "about")?,
                     owns,
-                    reads: strings(decl, "reads")?,
+                    reads: unique(strings(decl, "reads")?),
                     cache: matches!(decl.field("cache"), Some(Value::Bool(true))),
                     resources: strings(decl, "resources")?,
                     meta: match decl.field("meta") {
@@ -451,6 +451,15 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
         }
     }
     Ok(project)
+}
+
+/// First occurrence of each entry, in order (input lists are often joined).
+fn unique(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    items
+        .into_iter()
+        .filter(|item| seen.insert(item.clone()))
+        .collect()
 }
 
 fn known_fields(decl: &Decl, known: &[&str]) -> Result<(), Error> {
