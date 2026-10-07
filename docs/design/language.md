@@ -1,338 +1,265 @@
 # The `.ci` language
 
-Status: `citrus 1` is Citrus's only configuration. Implemented: values, `let`, functions, `for`/`if`, comprehensions, interpolation, durations, `use`; blocks `project`, `check`, `task`, `release`, `artifact`, `environment`, `planner`, `pool`, `command` (reference: docs/configuration.md); `citrus check`, `citrus do`. Execution events, `citrus fmt` and the actions marked *planned* below follow. Issue #11.
+Status: `citrus 1`, being reshaped to this document (issue #11). It is
+Citrus's only configuration; before 1.0 it changes without compatibility
+shims.
 
-A `.ci` file describes a project's CI/CD — checks, artifacts, environments,
-tasks — in a form a person reads at a glance and an agent writes correctly
-on the first try. Citrus evaluates the files into a graph and executes the
-graph. Every executed step knows the line it came from, so the CLI, the
-dashboard and agents all see *where in the recipe* things are.
-
-## Why a language, and why our own
-
-Citrus first grew a set of TOML files. Each new case added a field or a
-template inside a string: `inputs_command`, `after_merge = [... "{before}"]`,
-`resolve = [... "{release}"]`, Job manifests with `{image}`. Logic leaked into
-strings and into external shell and Python scripts, which only run on some
-machines and which nobody reads. The model behind it (a graph of checks,
-artifacts, environments; keys by inputs; plans; recorded steps) was right;
-static data was the wrong way to describe it.
-
-The language is ours because the runtime is ours: evaluation, execution,
-events, the dashboard and agent output are designed together, and the
-language can be exactly as small as the job requires.
+A `.ci` file says what a project's code is made of, which checks protect it
+and how it is released. A person new to the project reads it and knows what
+runs when they change a file; an agent writes it correctly on the first try.
+Citrus evaluates the files into a graph and executes the graph; every step
+knows the line it came from.
 
 ## Principles
 
-1. **Describe, don't execute.** Evaluating `.ci` files has no side effects.
-   It produces a graph; Citrus executes the graph. Nothing runs while a file
-   is being read.
-2. **Readable first.** A file reads like a description of the pipeline.
-   Blocks name things; expressions compute values.
-3. **Portable by construction.** Actions are built into Citrus (`run`,
-   `docker`, `kubectl`, `wait`, `copy`, `http` …) and behave the same on
-   macOS, Linux and Windows. `sh(...)` exists and is visibly non-portable.
-4. **Deterministic.** The same files and the same repository give the same
-   graph. Reading files (`glob`, `read`) is allowed only through builtins that
-   record what was read; those files become inputs.
-5. **Small.** No classes, exceptions, mutation of shared state, network or
-   clock at evaluation time. Every feature must pay for itself in real files.
-6. **Every step has a source.** Spans (file, line, column), the declaring
-   block and the loop instance travel with each node into execution events.
+1. **Every element does something.** No keyword, field or symbol exists for
+   decoration. One concept has one construct; two names for the same
+   behaviour are one name too many.
+2. **Names and comments explain.** A comment is `#`. A comment directly
+   above a declaration is its description: `citrus`, `why` and the dashboard
+   show it. There is no `about` field and no special doc-comment syntax.
+3. **Symbols carry meaning.** Declared names and references to them are
+   bare (`check bot`, `profile = e2e`, `needs = [database]`). Data is quoted:
+   paths, package names, values (`"crates/**"`, `rust("clyer")`). `=` gives a
+   field its value, `{ }` is a block, `( )` is a call.
+4. **A bare name always refers to a declaration.** `citrus check` rejects
+   an unknown one and suggests the closest.
+5. **Paths are derived, not listed.** `rust("clyer")` is the crate and every
+   workspace crate it depends on; `web("clyer")` is the app and its workspace
+   packages. A change in a shared library reaches every product built from
+   it without anyone listing it.
+6. **Mechanics stay in Citrus.** A file holds what is particular to the
+   project, never how Citrus talks to its tools.
+7. **Describe, don't execute.** Reading the files runs nothing. The same
+   files and repository give the same graph.
+8. **Small.** No classes, exceptions, mutation, network or clock at
+   evaluation time. `let`, `fn`, `for` and `if` exist for the rare file that
+   needs them.
 
 ## Files
 
-- `citrus.ci` at the repository root; it may `use` other files
-  (`use "ci/mt3s.ci"`). Paths are repository-relative.
-- The first line declares the language version: `citrus 1`. A file without it
-  is rejected; a newer major version is rejected with a clear message.
-- `#` starts a comment.
+- A small project: `citrus.ci` at the repository root.
+- A larger one: the `.citrus/` directory. Citrus reads every `.citrus/*.ci`;
+  their order does not matter, because every declaration has a name. By
+  convention `.citrus/project.ci` holds the shared settings and each product
+  has its own file. Having both a root `citrus.ci` and `.citrus/` is an
+  error.
+- Every file starts with `citrus 1`, the language version.
+- Declarations are visible in the whole project; declaring a name twice is
+  an error that shows both places. `let` and `fn` are local to their file,
+  except those in `.citrus/project.ci` (or the root `citrus.ci`), which every
+  file sees.
+- Citrus keeps no state in the working tree: runs, logs and receipts live in
+  the Git directory (`.git/citrus/`).
 
-## Values and expressions
-
-```
-let name = "api"  # string; "{expr}" interpolates, "{{" is a literal brace
-let count = 3  # integer
-let enabled = true  # bool
-let nothing = none  # absence
-let items = ["a", "b"]  # list
-let opts = { file: "Dockerfile", target: name }  # map with identifier or string keys
-
-let doubled = [x * 2 for x in [1, 2, 3] if x > 1]  # comprehension
-let label = if enabled { "on" } else { "off" }  # if is an expression
-let joined = items.join(", ")  # methods on built-in types
-let line = """
-  multi-line string, common indentation removed
-"""
-```
-
-Operators: `+ - * / %`, `== != < <= > >=`, `and or not`, `in`, `??` (default
-for `none`), field access `opts.file`, indexing `items[0]`.
-
-## Functions
+## Values
 
 ```
-fn image(product, suffix = "") {
-  "registry.example.com/{product}{suffix}"
-}
+"text"                       # string; "{expr}" interpolates, "{{" is a literal brace
+3, 30s, 5m, 2h               # integers and durations
+true, false, none
+["a", "b"]                   # list
+{ key: "value" }             # map
+rust("clyer") + ["x/**"]     # lists join with +
 ```
 
-Functions are pure; the last expression is the result. Named arguments at the
-call site: `docker(file: "deploy/Dockerfile", target: name)`.
+Operators: `+ - * / %`, `== != < <= > >=`, `and or not`, `in`, `??`.
 
 ## Declarations
 
-Declarations are blocks: `kind "name" { field = expr … nested blocks }`.
-Repeating a declaration in a `for` creates one node per iteration; the
-dashboard shows each instance separately with the same source line.
+A declaration is `kind name`, optionally `= value`, optionally `{ fields }`.
+Names are identifiers (`backend`, `web-host`); a name built from a loop
+variable is a string (`group "{vpn}"`).
 
 ### `project`
 
 ```
 project {
-  base = "origin/main"  # what "changed" is measured against
-  logs = ".citrus/logs"  # must be ignored by Git
-  toolchain = ["rust-toolchain.toml", ".python-version"]  # inputs of every cached check
+  main = "origin/main"   # what "changed" is measured against
+  runner = builders      # where checks run unless they say otherwise
 }
 ```
 
-### `check`
+### `profile`
 
 ```
-check "test-api" {
-  owns = ["crates/api/**"]  # changing these selects the check
-  reads = ["Cargo.lock"]  # these invalidate reuse but do not select it
-  run = cargo.test("api")  # an action
-  cache = true  # reuse a PASS while owns, reads and run are unchanged
-  env = { SQLX_OFFLINE: "true" }
-  meta = { linux: true }  # data for the project's own tools
-}
-```
-
-### `artifact`
-
-```
-artifact "api" {
-  inputs = ["crates/api/**", "Cargo.lock", "Dockerfile"]  # key = content of inputs + this declaration
-  build = { provider: "docker", dockerfile: "Dockerfile", target: "api" }
-  publish = { registry: "registry.example.com/shop/api" }
-}
-```
-
-### `environment` and `deploy`
-
-```
-environment "shop-production" {
-  on = kubernetes(context: "prod", namespace: "shop")
-  approval = required
-  checks = proven
-  migrations = { artifact: "api-migrations", job: "deploy/migrate.yaml", timeout: 5m }
-
-  deploy "api" { artifact = "api" }
-  deploy "bot" { artifact = "bot", fence = "bot-session" }
-  deploy "backup" { artifact = "backup", kind = cronjob, quiesce = true }
-
-  record = { annotation: "example.com/release" }
-  verify = { http: ["https://shop.example.com/health"] }
-}
-```
-
-### `release` and `step`
-
-Ordered steps of the project's own commands (docs/releases.md):
-
-```
-release "web" {
-  environment = "web-production"
-  version = { reserve: make("version-reserve", START: next), initial: "1.4.0" }
-  step "build" { run = make("image", VERSION: version) }
-  step "deploy" { production = true, run = make("deploy", VERSION: version) }
-}
-```
-
-### `task`
-
-Named procedures people and agents run with `citrus do <task>`, replacing
-one-off scripts.
-
-```
-task "seed-dev-db" {
-  about = "Start the dev database and apply migrations"
-  steps = [
-    compose.up("db"),
-    wait.tcp("localhost:5432", timeout: 60s),
-    make("migrate-dev"),
-  ]
-}
-```
-
-### `planner`, `pool`, `command`, `use`
-
-```
-use "ci/mt3s.ci"
-
-planner { run = make("ci-plan"), base_var = "BASE_REF", paths_var = "PATHS_FILE" }
-
-pool "builders" {
-  run = make("check-remote-suite")  # the project's own remote runner, for now
-  progress = ["CI_PARALLEL_LANE"]
-  log_after = ["full log: "]
-}
-
-command "make deploy" { about = "Roll out the verified release", group = "release" }
-```
-
-Values known only while Citrus runs are names: `before` (in
-`project.after_merge`), `version`, `next`, `previous`, `unit`, `commit`
-(releases), `artifact`, `key`, `release`, `short`, `tag` (artifacts and
-environments). Inside a string they are written `{version}`.
-
-## Standard library
-
-**Actions** (values describing work; Citrus executes them, each carries its span):
-
-Actions without a mark work today; *planned* ones are reserved names.
-
-| Action | Meaning |
-|---|---|
-| `run(program, args…)` | run a program without a shell |
-| `make(target, vars…)` | `make <target>` |
-| `cargo.test(pkg)`, `cargo.build(…)`, `cargo.fmt(check:)`, `cargo.clippy(deny:)`, `cargo.run(args…)` | Cargo commands; `citrus check` points a hand-written `run("cargo", …)` at them |
-| `sh("…")` | a shell command — explicit, flagged non-portable by `citrus check` |
-| `docker(…)` | *planned*; today `build = { provider: "docker", … }` |
-| `kubernetes(context:, namespace:, kubectl:)` | the provider of an environment (`on = …`) |
-| `compose.up(service)`, `compose.down()` | Docker Compose |
-| `job(…)` | *planned*; today `migrations = { artifact:, job:, timeout: }` |
-| `wait.tcp(addr)`, `wait.http(url)`, `wait.file(path)` | readiness |
-| `http(url)` | *planned*; today `verify = { http: [...] }` |
-| `copy(from, to)` | copy a file; `archive` *planned* |
-| `check(name)` | *planned*: run a declared check as a step |
-| `lease(…)`, `annotation(…)` | *planned*; today `fence = "lease"`, `record = { annotation: … }` |
-
-**Lists:** `len`, `keys`, `values`, `range`, `flatten` (a list of lists as
-one list), `str`.
-
-**Inputs:** `glob(pattern)`; `cargo.closure(package)` — the globs a Cargo
-package is built from in this repository (its crate, workspace crates it
-reaches through path dependencies, files outside them used by
-`include_str!`/`include_bytes!`/`sqlx::migrate!`, `Cargo.toml`, `Cargo.lock`
-and workspace settings), read from manifests without running Cargo;
-`inputs_of(command)` (a command printing paths, for artifact inputs a glob
-cannot express). `read(path)` is planned.
-
-**Values:** `secret(name)` — resolved only during execution from the
-environment or a configured store; never printed, logged, shown in the
-dashboard or returned to agents. `env(name)` — a non-secret variable.
-
-**Durations:** `30s`, `5m`, `2h` are literals.
-
-## Evaluation and execution
-
-1. Citrus parses `citrus.ci` and its `use`d files, evaluates them and builds
-   the graph: nodes (checks, artifacts, environments, deploys, tasks, steps)
-   with their spans, inputs and dependencies.
-2. `citrus check` validates the graph before anything runs: unknown names,
-   dependency cycles, globs matching nothing, cached checks whose declared
-   inputs miss files they read (when detectable), non-portable actions.
-3. Commands (`status`, `run`, `diff`, `apply`, `do`) select a part of the
-   graph and execute it. The runtime records every transition as an event.
-4. `citrus fmt` writes the canonical layout (`--check` only reports), so
-   files written by different agents look the same.
-
-## Layout
-
-One space around `=`, two-space indentation, one block per declaration. No
-vertical alignment of `=` or comments: aligned columns cost tokens on every
-line an agent reads or writes, and adding one longer field re-aligns its
-neighbours — noisy diffs and merge conflicts between agents working in
-parallel. `citrus fmt` enforces this layout.
-
-## Execution events
-
-One stream, one schema, read by the CLI, the dashboard, agents (`--json`) and history:
-
-```json
-{"seq": 812, "time": "2026-10-07T18:04:11Z", "run": "apply-shop-production-…",
- "node": "deploy shop-production/bot", "instance": null,
- "source": {"file": "citrus.ci", "line": 14, "column": 3},
- "state": "running", "phase": "fence", "detail": "waiting for lease bot-session",
- "inputs_key": "4bebc33…", "log": {"path": "…", "offset": 18234}}
-```
-
-- `node` is stable across runs; `instance` names the loop iteration
-  (`{"name": "alerts"}`) when the node came from a `for`.
-- States: `pending`, `waiting`, `running`, `passed`, `reused`, `failed`,
-  `unknown`, `cancelled`, `skipped`.
-- Secrets never appear in events; values derived from `secret(...)` are
-  redacted at the source.
-
-## How it looks while running
-
-CLI:
-
-```
-apply shop-production                         ● running · 2m10s
-  build api            ≡ reused   key 4bebc33           citrus.ci:21
-  migrate              ✓ 41s      job shop-migrate-…    citrus.ci:30
-  deploy bot           ● fence    waiting lease bot-session   citrus.ci:34
-  verify               ○
-```
-
-Dashboard: the same graph, with the recipe beside it and the running line
-highlighted; loop instances as separate rows; each node opens its log, its
-inputs and why it was selected or reused.
-
-## What it replaces — measured
-
-| Today | Lines | In `.ci` (sketch below, to be measured on the implementation) |
-|---|---|---|
-| Citrus's own setup: Makefile, citrus.toml, ci/targets.toml, two scripts | 96 | 75 (measured: checks, a task and the GitHub release) |
-| Garvis Citrus config: citrus.toml + 4 TOML files | 284 | ~110 |
-| 15 MT3S component release scripts | 4,761 | one loop over components + shared provider code |
-
-Citrus's own CI as a sketch:
-
-```
-citrus 1
-
-project { base = "origin/main", toolchain = ["Cargo.lock"] }
-
-check "test" { owns = ["src/**", "tests/**", "examples/**"], reads = ["Cargo.*"], run = cargo.test(), cache = true }
-check "lint" { owns = ["src/**", "tests/**"], reads = ["Cargo.*"], run = [cargo.fmt(check: true), cargo.clippy(deny: "warnings")], cache = true }
-check "docs" { owns = ["*.md", "docs/**", "skills/**"], run = links.check("**/*.md"), cache = true }
-
-for target in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-  artifact "citrus-{target}" {
-    inputs = ["src/**", "Cargo.*"]
-    build = cargo.build(release: true, target: target)
+# Fast checks never touch a database: SQLx reads the committed metadata.
+profile fast {
+  env {
+    SQLX_OFFLINE = "true"
+    DATABASE_URL = ""
   }
 }
 
-environment "github" {
-  on = github.release(repository: "deknowny/citrus", tag: "v{version}")
-  checks = proven
-  verify = [checksums()]
+# Slow checks against real services.
+profile e2e
+```
+
+The first profile is the default; `citrus run --profile e2e` picks another.
+A check without `profile` belongs to every profile.
+
+### `group` and `check`
+
+```
+# Clyer bot, its Mini App and TON contracts.
+group clyer {
+  paths = rust("clyer") + web("clyer") + ["migrations/clyer/**"]
+
+  check bot = cargo.test("clyer")
+  check web = pnpm.test("clyer")
+
+  # Runs against a real database, so only in the slow profile.
+  check database = make("test-clyerbot-db-e2e") {
+    profile = e2e
+    needs = [database]
+  }
+}
+
+# Reviewed security paths are exact files, so a new sibling is noticed.
+check host-firewall = make("test-host-management-firewall") {
+  paths = ["deploy/k3s/hosts/*management-firewall*"]
 }
 ```
 
+- A **group** is a set of paths and the checks that protect it. A check in a
+  group runs when a changed path is in the group's paths, or in its own
+  `paths` when it narrows them. It is called `clyer.bot`.
+- A **check** is `check name = action`. Fields go in `{ }` only when there
+  are any; a check outside a group needs `paths`.
+- A path no group or check claims is reported as unclaimed; strict plans
+  stop on it. A group without checks (documentation) claims its paths and
+  runs nothing.
+- `paths` take globs: `*` and `?` stay in one directory, `**` crosses them,
+  `!glob` excludes (the last matching glob decides).
+
+Check fields:
+
+| Field | Meaning |
+|---|---|
+| `paths` | narrows the group's paths, or gives a lone check its paths |
+| `reads` | more inputs: they invalidate a cached pass but do not select the check |
+| `profile` | the profile it belongs to |
+| `needs` | services it needs (below) |
+| `env { }` | environment of its steps |
+| `covers = [x, y]` | it runs `x` and `y` itself: they are not planned beside it |
+| `replaces = [x, y]` | when the change goes beyond what one of them owns, it runs instead of them |
+| `cache = false` | never reuse a pass (checks that depend on the outside world) |
+
+A check whose inputs are known (derived paths, globs, `reads`) reuses a
+pass while they are unchanged; that is the default.
+
+### `match changed`
+
+When a check's command depends on the whole change, `match` picks it:
+
+```
+check pipeline = match changed {
+  only(clyer) => make("test-clyer-pipeline-contract")
+  without(clyer) => make("test-main-pipeline-contract")
+  _ => make("test-pipeline-contract")
+}
+```
+
+`only(g)`: every changed product path is in `g`; `without(g)`: none is;
+`touched(g)`: some is. The first arm that holds is the check's command for
+this plan.
+
+### `service`
+
+```
+# PostgreSQL for the e2e checks; one per run, shared by the checks that need it.
+service database = compose.up("postgres") {
+  ready = wait.tcp("localhost:5432")
+}
+
+# Headless Chromium; at most two at a time.
+service browser {
+  limit = 2
+}
+```
+
+With an action, Citrus starts the service before the first check that needs
+it, waits for `ready` and stops it after the run. Without one, it is a
+resource the runner provides, and `limit` caps how many checks hold it.
+
+### `runner`
+
+```
+# The shared Linux builders.
+runner builders = make("check-remote-suite") {
+  status = make("workflow-status")
+}
+```
+
+A runner executes the planned checks elsewhere. It is given the checks to
+run (`CITRUS_TARGETS`) and their declarations (`CITRUS_CHECKS`) and reports
+each one in the Citrus protocol (docs/protocol.md).
+
+### `release`
+
+In a group, `release` says how the product reaches an environment:
+
+```
+release = kubernetes("clyer") {
+  migrate = job("deploy/k3s/clyer/migrate.yaml")
+  # One userbot at a time: the old pod holds this lease until it stops.
+  fence userbot = lease("userbot-session")
+  quiesce = [backuper]
+}
+```
+
+### `task` and `commands`
+
+```
+# Start the database and apply migrations.
+task seed-db = [compose.up("db"), wait.tcp("localhost:5432", timeout: 60s), make("migrate-dev")]
+
+commands {
+  "make verify" = "Validate a release candidate"
+}
+```
+
+`citrus do seed-db` runs a task. `commands` lists the project's own commands
+for people (`citrus` shows them).
+
+## Actions
+
+Values describing work; Citrus executes them, each with its source line.
+
+| Action | Meaning |
+|---|---|
+| `run(program, args…)` | a program, without a shell |
+| `make(target, VAR: value…)` | `make target` |
+| `cargo.test(pkg)`, `cargo.build(…)`, `cargo.fmt(check:)`, `cargo.clippy(deny:)`, `cargo.run(args…)` | Cargo; `citrus check` points a hand-written `run("cargo", …)` at them |
+| `pnpm.test(app)`, `pnpm.build(app)` | pnpm workspace scripts |
+| `sh("…")` | a shell command; flagged as not portable |
+| `compose.up(service)`, `compose.down()` | Docker Compose |
+| `wait.tcp(addr)`, `wait.http(url)`, `wait.file(path)` | readiness |
+| `copy(from, to)`, `links.check(glob)` | files |
+| `kubernetes(namespace, context:)`, `job(manifest)`, `lease(name)` | releases |
+
+## Paths
+
+| Function | Paths |
+|---|---|
+| `rust("pkg", …)` | the crates and every workspace crate they reach through path dependencies, files they include (`include_str!`, `sqlx::migrate!`), `Cargo.toml`, `Cargo.lock` and workspace settings; `"platform-*"` names several |
+| `web("app", …)` | the app's directory, the workspace packages it depends on, the lockfile and workspace manifests |
+| `glob("pattern")` | the matching files, for comprehensions |
+
+## Evaluation and execution
+
+1. Citrus reads the files, evaluates them and builds the graph: groups,
+   checks, services, runners, releases, each with its source span.
+2. `citrus check` validates it before anything runs: unknown names, globs
+   that match nothing, hand-written commands that have a built-in.
+3. `citrus plan` maps the changed paths to checks; `run`, `do`, `release`
+   and `apply` execute parts of the graph and record each step.
+4. `citrus fmt` writes the canonical layout: two-space indent, one space
+   around `=`, no aligned columns.
+
 ## Non-goals
 
-- General-purpose programming. If a recipe needs more, it is a provider or
-  an action written in Rust inside Citrus, with tests.
-- Running commands during evaluation.
-- Templating other formats with string concatenation (Kubernetes manifests
-  stay manifests; `job()` and `kubernetes()` substitute declared fields).
-- Compatibility before 1.0. The TOML configuration is gone; language
-  changes before 1.0 are breaking and listed in CHANGELOG.md.
-
-## Plan
-
-1. This document, reviewed against real files (Citrus, Garvis config,
-   MT3S releases, a few shell scripts).
-2. Lexer, parser with spans, evaluator into the existing graph types;
-   `citrus check`, `citrus fmt`; errors with source excerpts.
-3. Citrus describes itself in `citrus.ci`; `citrus.ci` becomes the only
-   configuration (done).
-4. Execution events with spans; the CLI live view; `citrus do <task>`.
-5. Garvis moves product by product, deleting scripts as it goes.
-6. Dashboard on events; syntax highlighting; LSP.
+- General-purpose programming: what needs more than this is an action or a
+  provider written in Citrus, with tests.
+- Running anything while files are read.
+- Compatibility before 1.0.
