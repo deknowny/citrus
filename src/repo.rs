@@ -69,6 +69,19 @@ impl Repo {
     }
 
     /// Tracked and untracked, non-ignored files that exist on disk, sorted.
+    /// Files plus submodule paths (gitlinks): what a declared glob may name.
+    pub fn paths(&self) -> Result<Vec<String>> {
+        let mut paths = self.files()?;
+        let listing = self.git(&["ls-files", "--stage"])?;
+        paths.extend(listing.lines().filter_map(|line| {
+            let (meta, path) = line.split_once('\t')?;
+            meta.starts_with("160000 ").then(|| path.to_owned())
+        }));
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     pub fn files(&self) -> Result<Vec<String>> {
         let output = Command::new("git")
             .arg("-C")

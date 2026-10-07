@@ -27,7 +27,7 @@ pub fn add(context: &Context, declaration: &Declaration) -> Result<String> {
     if declaration.inputs.is_empty() {
         bail!("--inputs: name the files this check owns (globs)");
     }
-    let files = context.repo.files()?;
+    let files = context.repo.paths()?;
     for pattern in declaration.inputs.iter().chain(&declaration.extra_inputs) {
         if !pattern_matches_any(pattern, &files)? {
             bail!("{pattern} matches no file in this checkout");

@@ -38,7 +38,10 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
 - A declared cached check that a pool reported passing now counts locally
   too (evidence and receipt by inputs), so a remote PASS is reused after
   unrelated edits — before, only local passes were, and most runs are remote.
-- `citrus fmt [--check]`: the canonical `.ci` layout — two-space nesting,
+- Submodule paths (gitlinks) are valid globs for `owns`/`reads` in `check`,
+  `doctor` and `add`.
+- `citrus fmt [--check]`: the canonical `.ci` layout — one indent level per
+  line however many brackets it opens, two-space nesting,
   one space around `=` and after `,`/`:`, no aligned columns; comments,
   line breaks and strings stay as written.
 - A pool gets `CITRUS_TARGETS` (the checks to run). When it reports checks

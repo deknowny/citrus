@@ -2039,3 +2039,34 @@ pool "builders" { run = run("sh", "remote.sh"), progress = ["LANE"] }
     let (again, _) = project.json(&["run", "--remote"]);
     assert_eq!(target(&again, "ok")["result"], "reused", "{again}");
 }
+
+#[test]
+fn a_submodule_path_is_a_valid_input() {
+    let project = Project::new("check \"sub\" { owns = [\"vendor/lib\"], run = make(\"ok\") }\n");
+    project.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "160000,1111111111111111111111111111111111111111,vendor/lib",
+    ]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "gitlink",
+    ]);
+    let (checked, _) = project.json(&["check"]);
+    assert_eq!(checked["warnings"], serde_json::json!([]), "{checked}");
+    let (doctor, _) = project.json(&["doctor"]);
+    assert!(
+        !doctor["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["check"] == "target sub" && f["status"] == "fail"),
+        "{doctor}"
+    );
+}

@@ -436,7 +436,7 @@ pub fn compile(graph: &Graph, root: &Path) -> Result<Project, Error> {
     }
     // Globs that match nothing are almost always typos.
     let files = crate::repo::Repo::discover_at(root)
-        .and_then(|repo| repo.files())
+        .and_then(|repo| repo.paths())
         .unwrap_or_default();
     if !files.is_empty() {
         for check in &project.checks {

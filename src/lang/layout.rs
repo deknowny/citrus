@@ -7,7 +7,9 @@
 /// The formatted text; equal to the input when it is already canonical.
 pub fn format(source: &str) -> String {
     let mut out = String::new();
-    let mut depth: i64 = 0;
+    // One entry per line that left brackets open: how many it still holds.
+    // A line opening `flatten([` indents what follows by one level, not two.
+    let mut open: Vec<usize> = Vec::new();
     let mut blank = 0;
     let mut in_triple = false;
     for raw in source.lines() {
@@ -34,8 +36,21 @@ pub fn format(source: &str) -> String {
         let closes = code
             .chars()
             .take_while(|c| matches!(c, '}' | ']' | ')'))
-            .count() as i64;
-        let indent = (depth - closes).max(0) as usize;
+            .count();
+        let indent = {
+            let mut levels = open.clone();
+            let mut remaining = closes;
+            while remaining > 0 {
+                let Some(top) = levels.last_mut() else { break };
+                let used = remaining.min(*top);
+                *top -= used;
+                remaining -= used;
+                if *top == 0 {
+                    levels.pop();
+                }
+            }
+            levels.len()
+        };
         out.push_str(&"  ".repeat(indent));
         out.push_str(&code);
         if let Some(comment) = comment {
@@ -45,7 +60,7 @@ pub fn format(source: &str) -> String {
             out.push_str(comment.trim_end());
         }
         out.push('\n');
-        depth += nesting(&code);
+        track(&code, &mut open);
         if code.matches("\"\"\"").count() % 2 == 1 {
             in_triple = true;
         }
@@ -72,9 +87,9 @@ fn split_comment(line: &str) -> (&str, Option<&str>) {
     (line, None)
 }
 
-/// Brackets opened minus closed outside strings.
-fn nesting(code: &str) -> i64 {
-    let mut depth = 0;
+/// Applies the brackets of `code` (outside strings) to the open-line stack.
+fn track(code: &str, open: &mut Vec<usize>) {
+    let mut opened = 0;
     let mut in_string = false;
     let mut escaped = false;
     for c in code.chars() {
@@ -82,12 +97,23 @@ fn nesting(code: &str) -> i64 {
             _ if escaped => escaped = false,
             '\\' if in_string => escaped = true,
             '"' => in_string = !in_string,
-            '{' | '[' | '(' if !in_string => depth += 1,
-            '}' | ']' | ')' if !in_string => depth -= 1,
+            '{' | '[' | '(' if !in_string => opened += 1,
+            '}' | ']' | ')' if !in_string => {
+                if opened > 0 {
+                    opened -= 1;
+                } else if let Some(top) = open.last_mut() {
+                    *top -= 1;
+                    if *top == 0 {
+                        open.pop();
+                    }
+                }
+            }
             _ => {}
         }
     }
-    depth
+    if opened > 0 {
+        open.push(opened);
+    }
 }
 
 /// Spacing outside strings: runs of spaces become one; one space around `=`
@@ -163,6 +189,15 @@ mod tests {
         let expected = "citrus 1\n\nproject {\n  base = \"origin/main\"  # where   changes start\n  toolchain = [\"a\", \"b\"]\n}\ncheck \"x\" {\n  owns = [\"src/**\"]\n  run = run(\"sh\", \"-c\", \"a  =  b\")\n  env = { A: \"1\" }\n  if a == b { }\n}\n";
         assert_eq!(format(source), expected);
         assert_eq!(format(expected), expected);
+    }
+
+    #[test]
+    fn a_line_opening_two_brackets_indents_once() {
+        let source = "owns = flatten([\n[\"a\"],\n[\"b\"],\n])\nx = 1\n";
+        assert_eq!(
+            format(source),
+            "owns = flatten([\n  [\"a\"],\n  [\"b\"],\n])\nx = 1\n"
+        );
     }
 
     #[test]

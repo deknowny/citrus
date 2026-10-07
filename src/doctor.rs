@@ -59,7 +59,7 @@ pub fn diagnose(context: &Context) -> Vec<Finding> {
             "Citrus no longer reads citrus.toml; describe the project in citrus.ci".into(),
         );
     }
-    match context.repo.files() {
+    match context.repo.paths() {
         Ok(files) => {
             for target in context.manifest.targets.values() {
                 let unmatched: Vec<&String> = target
