@@ -39,6 +39,9 @@ resources_command = []           # slow command describing shared builders/runne
 resource_prefix = ""             # its lines that describe one resource each (key=value fields)
 refresh_seconds = 0              # snapshot age before a background refresh (min 10)
 
+[integrate]
+after_merge = []                 # command after a successful merge; {before} = commit before it
+
 [[catalog]]                      # repeatable: commands shown by `citrus` with no arguments
 command = "make deploy"
 description = "Roll out the verified release"

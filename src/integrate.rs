@@ -90,6 +90,19 @@ pub fn integrate(context: &Context, base: &str) -> Result<Integration> {
         return Ok(result);
     }
     result.outcome = "merged".into();
+    let hook = crate::config::substitute(&repo.config.integrate.after_merge, "{before}", &before);
+    if let Some((program, args)) = hook.split_first() {
+        let status = std::process::Command::new(program)
+            .args(args)
+            .current_dir(&repo.root)
+            .status()?;
+        if !status.success() {
+            bail!(
+                "integrate.after_merge failed ({}); the merge is done, nothing was checked or pushed",
+                hook.join(" ")
+            );
+        }
+    }
     result.incoming_paths = repo
         .git(&["diff", "--name-only", &before, "HEAD"])?
         .lines()

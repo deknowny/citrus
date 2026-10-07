@@ -967,3 +967,48 @@ fn interrupted_release_keeps_the_environment_and_recovers() {
     let (after, _) = project.json(&["release", "start", "app", "--approve"]);
     assert_eq!(after["release"]["state"], "passed", "{after}");
 }
+
+#[test]
+fn integrate_runs_the_after_merge_hook() {
+    let config = "[integrate]\nafter_merge = [\"sh\", \"-c\", \"mkdir -p .citrus && echo $0 > .citrus/hook\", \"{before}\"]\n";
+    let project = Project::new(config);
+    let origin = with_origin(&project);
+    let before = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(project.root())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    commit_upstream(&origin, "docs/new.md", "x\n");
+    let (merged, code) = project.json(&["integrate", "--no-run"]);
+    assert_eq!(code, 0, "{merged}");
+    assert_eq!(
+        fs::read_to_string(project.root().join(".citrus/hook"))
+            .unwrap()
+            .trim(),
+        before.trim()
+    );
+
+    project.write("citrus.toml", "[integrate]\nafter_merge = [\"false\"]\n");
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "failing hook",
+    ]);
+    commit_upstream(&origin, "docs/other.md", "y\n");
+    let failed = project.json(&["integrate"]).0;
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("after_merge failed"),
+        "{failed}"
+    );
+}

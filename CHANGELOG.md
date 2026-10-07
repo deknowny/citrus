@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `[integrate] after_merge` hook (`{before}`); `--push` never forces, follows tags or recurses into submodules.
+
 - Releases (`ci/releases.toml`, `citrus release …`): ordered steps with a
   version reservation, gates (committed source, proven checks, `--approve` for
   production), one release per environment, `unknown` after an interrupted

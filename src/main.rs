@@ -1234,7 +1234,15 @@ fn integrate_command(
         let pushed = std::process::Command::new("git")
             .arg("-C")
             .arg(&context.repo.root)
-            .args(["push", "--quiet", &remote, &format!("HEAD:{branch}")])
+            .args([
+                "push",
+                "--quiet",
+                "--no-force",
+                "--no-follow-tags",
+                "--recurse-submodules=no",
+                &remote,
+                &format!("HEAD:{branch}"),
+            ])
             .output()?;
         if pushed.status.success() {
             if json {

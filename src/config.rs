@@ -30,8 +30,18 @@ pub struct Config {
     pub receipts: ReceiptsConfig,
     pub state: StateConfig,
     pub status: StatusConfig,
+    pub integrate: IntegrateConfig,
     /// Commands people and agents use in this repository, shown by `citrus`.
     pub catalog: Vec<CatalogEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct IntegrateConfig {
+    /// Runs after a successful merge, before checks; `{before}` is the commit
+    /// before the merge. For project housekeeping such as retiring removed
+    /// submodule checkouts. A failure stops the integration.
+    pub after_merge: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -129,6 +139,7 @@ impl Default for Config {
             receipts: ReceiptsConfig::default(),
             state: StateConfig::default(),
             status: StatusConfig::default(),
+            integrate: IntegrateConfig::default(),
             catalog: Vec::new(),
         }
     }
