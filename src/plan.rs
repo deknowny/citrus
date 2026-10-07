@@ -32,7 +32,78 @@ pub fn compute(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<P
     let extra = base
         .filter(|_| !config.base_arg.is_empty())
         .map(|base| config.base_arg.replace("{base}", base));
-    external(repo, manifest, extra)
+    let mut plan = external(repo, manifest, extra)?;
+    let fork = fork_point(repo, base.unwrap_or(&config.base));
+    add_edited(
+        &mut plan,
+        repo,
+        manifest,
+        &changed_paths(repo, &fork)?,
+        &fork,
+    );
+    Ok(plan)
+}
+
+/// Checks whose declaration in `citrus.ci` changed join any plan, also one
+/// made by the project's own planner, which does not read declarations.
+fn add_edited(plan: &mut Plan, repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) {
+    if !paths.iter().any(|path| manifest.files.contains(path)) {
+        return;
+    }
+    for name in edited_checks(repo, manifest, before) {
+        if !plan.targets.contains(&name) {
+            plan.targets.push(name);
+        }
+    }
+}
+
+fn fork_point(repo: &Repo, base: &str) -> String {
+    repo.git(&["merge-base", base, "HEAD"])
+        .or_else(|_| repo.git(&["rev-parse", "HEAD"]))
+        .unwrap_or_default()
+}
+
+/// Paths changed since `fork`, including untracked files.
+fn changed_paths(repo: &Repo, fork: &str) -> Result<Vec<String>> {
+    let mut paths: Vec<String> = Vec::new();
+    if !fork.is_empty() {
+        paths.extend(
+            repo.git(&["diff", "--name-only", fork])?
+                .lines()
+                .map(str::to_owned),
+        );
+    }
+    paths.extend(
+        repo.git(&["ls-files", "--others", "--exclude-standard"])?
+            .lines()
+            .map(str::to_owned),
+    );
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Declared checks that are new or declared differently than at `before`.
+fn edited_checks(repo: &Repo, manifest: &Manifest, before: &str) -> Vec<String> {
+    let old = (!before.is_empty())
+        .then(|| {
+            crate::lang::compile::load_at(&repo.root, Some(before))
+                .ok()
+                .flatten()
+        })
+        .flatten()
+        .and_then(|(project, sources)| Manifest::from_project(&project, &sources).ok())
+        .unwrap_or_default();
+    manifest
+        .targets
+        .values()
+        .filter(|target| {
+            old.targets
+                .get(&target.name)
+                .is_none_or(|previous| !previous.same_declaration(target))
+        })
+        .map(|target| target.name.clone())
+        .collect()
 }
 
 /// The checks that changes to exactly `paths` would select; `before` is the
@@ -69,7 +140,9 @@ pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &st
         ),
     );
     let _ = std::fs::remove_file(&file);
-    result
+    let mut plan = result?;
+    add_edited(&mut plan, repo, manifest, paths, before);
+    Ok(plan)
 }
 
 fn external(repo: &Repo, manifest: &Manifest, extra: Option<String>) -> Result<Plan> {
@@ -98,25 +171,8 @@ fn external(repo: &Repo, manifest: &Manifest, extra: Option<String>) -> Result<P
 
 /// Declared targets that own a path changed since the fork point with `base`.
 fn builtin(repo: &Repo, manifest: &Manifest, base: &str) -> Result<Plan> {
-    let fork = repo
-        .git(&["merge-base", base, "HEAD"])
-        .or_else(|_| repo.git(&["rev-parse", "HEAD"]))
-        .unwrap_or_default();
-    let mut paths: Vec<String> = Vec::new();
-    if !fork.is_empty() {
-        paths.extend(
-            repo.git(&["diff", "--name-only", &fork])?
-                .lines()
-                .map(str::to_owned),
-        );
-    }
-    paths.extend(
-        repo.git(&["ls-files", "--others", "--exclude-standard"])?
-            .lines()
-            .map(str::to_owned),
-    );
-    paths.sort();
-    paths.dedup();
+    let fork = fork_point(repo, base);
+    let paths = changed_paths(repo, &fork)?;
     Ok(select(repo, manifest, paths, &fork))
 }
 
@@ -133,26 +189,7 @@ fn select(repo: &Repo, manifest: &Manifest, paths: Vec<String>, fork: &str) -> P
         .collect();
     if !edited.is_empty() {
         // New or edited declarations are checked right away.
-        let before = (!fork.is_empty())
-            .then(|| {
-                crate::lang::compile::load_at(&repo.root, Some(fork))
-                    .ok()
-                    .flatten()
-            })
-            .flatten()
-            .and_then(|(project, sources)| Manifest::from_project(&project, &sources).ok())
-            .unwrap_or_default();
-        let changed: Vec<String> = manifest
-            .targets
-            .values()
-            .filter(|target| {
-                before
-                    .targets
-                    .get(&target.name)
-                    .is_none_or(|old| !old.same_declaration(target))
-            })
-            .map(|target| target.name.clone())
-            .collect();
+        let changed = edited_checks(repo, manifest, fork);
         let surfaces = if changed.is_empty() {
             "config".to_owned()
         } else {

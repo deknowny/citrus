@@ -24,8 +24,8 @@ Breaking: `citrus.ci` is the only configuration. Citrus no longer reads
 - The input fingerprint hashes a check's `declaration` (globs, steps,
   environment) as documented JSON, so other tools can compute it; receipts
   of earlier versions no longer match.
-- Editing a check in `citrus.ci` selects it on the next plan; other edits of
-  `citrus.ci` map to `config`.
+- Editing a check in `citrus.ci` selects it on the next plan — also when a
+  project planner makes the plan; other edits of `citrus.ci` map to `config`.
 - `citrus run` refuses a plan its planner reports as `incomplete` with
   unclaimed paths, before anything runs, and names the paths.
 - Artifacts take `dockerfile = { file:, target: }`: a shared multi-stage

@@ -1927,3 +1927,27 @@ fn a_cargo_closure_keeps_a_rust_check_reused_while_unrelated_crates_change() {
         "{changed}"
     );
 }
+
+#[test]
+fn an_edited_declaration_joins_the_plan_of_an_external_planner() {
+    let project =
+        Project::new("project { base = \"main\" }\nplanner { run = run(\"sh\", \"plan.sh\") }\n");
+    project.write(
+        "plan.sh",
+        "printf 'PLAN\\tstatus=complete\\tfiles=1\\nTARGET\\tmake:ok\\n'\n",
+    );
+    project.commit("planner");
+    project.git(&["checkout", "-q", "-b", "feature"]);
+    let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
+    project.write(
+        "citrus.ci",
+        &text.replace("run = make(\"fail\")", "run = make(\"plain\")"),
+    );
+    project.commit("fail runs plain");
+    let (plan, _) = project.json(&["plan"]);
+    assert_eq!(
+        plan["plan"]["targets"],
+        serde_json::json!(["ok", "fail"]),
+        "{plan}"
+    );
+}
