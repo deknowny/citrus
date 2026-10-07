@@ -136,7 +136,11 @@ impl Default for PlanConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         RunConfig {
-            local: vec!["make".into(), "--no-print-directory".into(), "{target}".into()],
+            local: vec![
+                "make".into(),
+                "--no-print-directory".into(),
+                "{target}".into(),
+            ],
             remote: Vec::new(),
             env: BTreeMap::new(),
             progress_prefixes: Vec::new(),
