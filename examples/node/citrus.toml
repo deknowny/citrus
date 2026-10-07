@@ -1,0 +1,6 @@
+# A JavaScript project without Make: each target is an npm script.
+toolchain_files = [".nvmrc", "package-lock.json"]
+target_definitions = []             # npm scripts are not Make rules; skip that check
+
+[run]
+local = ["npm", "run", "--silent", "{target}"]

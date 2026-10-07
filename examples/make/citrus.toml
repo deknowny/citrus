@@ -1,0 +1,10 @@
+# The smallest setup: checks are Make targets, declared in ci/targets.toml.
+# Every value below is the default and could be omitted.
+manifest = "ci/targets.toml"
+log_dir = ".citrus/logs"            # add ".citrus/" to .gitignore
+
+[plan]
+base = "origin/main"                # what "changed" is measured against
+
+[run]
+local = ["make", "{target}"]

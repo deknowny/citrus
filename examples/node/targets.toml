@@ -1,0 +1,10 @@
+[targets.test]
+description = "Vitest unit tests"
+cache = true
+inputs = ["src/**", "test/**"]
+extra_inputs = ["vitest.config.ts", "tsconfig.json"]
+
+[targets.typecheck]
+cache = true
+inputs = ["src/**/*.ts"]
+extra_inputs = ["tsconfig.json"]

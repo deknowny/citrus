@@ -1,0 +1,45 @@
+[package]
+name = "citrus"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Agent-first checks: plan, run, reuse proven results, explain failures."
+repository = "https://github.com/deknowny/citrus"
+readme = "README.md"
+keywords = ["ci", "agents", "testing", "cli", "monorepo"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/"]
+
+[[bin]]
+name = "citrus"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
+hex = "0.4"
+libc = "0.2"
+rusqlite = { version = "0.39", default-features = false, features = ["bundled"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", default-features = false }
+toml = { version = "1.0", default-features = false, features = ["display", "parse", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
