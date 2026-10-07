@@ -665,10 +665,9 @@ fn log(context: &Context, reference: &str, target: Option<&str>, full: bool) -> 
             target.target,
             target.exit.map_or("?".into(), |code| code.to_string())
         );
-        let excerpt = target
-            .first_error
-            .clone()
-            .or_else(|| report::first_error(&exec::segment(&lines, &target.target, prefixes)));
+        let excerpt = target.first_error.clone().or_else(|| {
+            report::first_error(&exec::failure_segment(&lines, &target.target, prefixes))
+        });
         println!(
             "{}",
             excerpt.unwrap_or_else(|| "(no output captured)".into())

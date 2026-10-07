@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — 2026-10-07
+
+- Failure excerpts: a suite's failure is explained by the innermost failed
+  target inside it, and by what the failing command printed just before Make
+  reported it — not by "error:" lines in the expected output of passing tests.
+
 ## 0.2.0 — 2026-10-07
 
 First public release.

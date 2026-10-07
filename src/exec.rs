@@ -590,7 +590,8 @@ impl Context {
                 row.result = "failed".into();
                 row.reason = "ran".into();
                 let prefixes = &self.repo.config.run.progress_prefixes;
-                row.first_error = report::first_error(&segment(lines, &lane.target, prefixes));
+                row.first_error =
+                    report::first_error(&failure_segment(lines, &lane.target, prefixes));
             }
         }
         row.seconds = lane.seconds.or(row.seconds);
@@ -665,6 +666,26 @@ pub fn read_log(path: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Log lines that explain a failed target: its own segment, or the segment of
+/// the innermost target that failed inside it (suites run nested targets).
+pub fn failure_segment(lines: &[String], target: &str, prefixes: &[String]) -> Vec<String> {
+    let mut current = segment(lines, target, prefixes);
+    let mut seen = vec![target.to_owned()];
+    loop {
+        let nested = current.iter().find_map(|line| {
+            parse_lane(line, prefixes)
+                .filter(|lane| lane.status == "FAIL" && !seen.contains(&lane.target))
+        });
+        let Some(lane) = nested else { return current };
+        let inner = segment(&current, &lane.target, prefixes);
+        if inner.is_empty() {
+            return current;
+        }
+        seen.push(lane.target);
+        current = inner;
+    }
 }
 
 /// Log lines of one target: from its START marker to its result marker.
@@ -742,6 +763,19 @@ mod tests {
         assert!(parse_lane("RUN lane=x", &prefixes).is_none());
         assert!(parse_lane("CI_PARALLEL_LANE target=x status=PASS", &[]).is_none());
         assert!(parse_lane("CITRUS_TARGET target=x status=PASS", &[]).is_some());
+    }
+
+    #[test]
+    fn failure_segment_descends_into_the_failed_nested_target() {
+        let prefixes = vec!["LANE".to_owned()];
+        let lines: Vec<String> = "LANE target=suite status=START\nLANE target=a status=START\nnoise error: expected\nLANE target=a status=PASS\nLANE target=b status=START\nreal failure\nLANE target=b status=FAIL exit=1\nLANE target=suite status=FAIL exit=2"
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            failure_segment(&lines, "suite", &prefixes),
+            vec!["real failure"]
+        );
     }
 
     #[test]

@@ -82,10 +82,39 @@ pub fn first_error_index(lines: &[String]) -> Option<usize> {
         })
 }
 
-/// A short excerpt around the first failure, or the tail when nothing matches.
+/// Lines Make prints when a recipe fails: `make: *** [...] Error N`.
+fn is_make_failure(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("make: *** ")
+        || trimmed
+            .strip_prefix("make[")
+            .and_then(|rest| rest.split_once("]: *** "))
+            .is_some_and(|(level, _)| level.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Output just before Make reports the failed recipe: what the failing command
+/// printed last. Test runners print their verdict there, while words like
+/// "error:" earlier are often expected output of passing tests.
+const BEFORE_MAKE_FAILURE: usize = 15;
+
+/// A short excerpt describing the failure, or the tail when nothing matches.
 pub fn first_error(lines: &[String]) -> Option<String> {
     if lines.is_empty() {
         return None;
+    }
+    if let Some(anchor) = lines.iter().position(|line| is_make_failure(line)) {
+        let end = lines[anchor..]
+            .iter()
+            .take_while(|line| is_make_failure(line))
+            .count()
+            + anchor;
+        let start = anchor.saturating_sub(BEFORE_MAKE_FAILURE);
+        let excerpt: Vec<String> = lines[start..end]
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| clip(line))
+            .collect();
+        return Some(excerpt.join("\n"));
     }
     let (start, end) = match first_error_index(lines) {
         Some(index) => (
@@ -153,6 +182,20 @@ mod tests {
         );
         assert_eq!(first_error_index(&log), Some(3));
         assert!(first_error(&log).unwrap().contains("AssertionError: boom"));
+    }
+
+    #[test]
+    fn prefers_what_ran_last_before_make_reports_the_failure() {
+        let mut log = vec![
+            "test git push ... ".to_owned(),
+            "error: failed to push some refs (expected)".to_owned(),
+        ];
+        log.extend((0..30).map(|index| format!("ok {index}")));
+        log.extend(lines("PASS end_to_end duration=38s\nSTALE suite=db-e2e before=a after=b\nmake[1]: *** [x.mk:51: db-e2e] Error 75\nmake: *** [y.mk:2: contract] Error 2"));
+        let excerpt = first_error(&log).unwrap();
+        assert!(excerpt.contains("STALE suite=db-e2e"), "{excerpt}");
+        assert!(excerpt.ends_with("make: *** [y.mk:2: contract] Error 2"));
+        assert!(!excerpt.contains("failed to push"));
     }
 
     #[test]
