@@ -2569,3 +2569,31 @@ check audit = make("ok") {
         "{plan}"
     );
 }
+
+#[test]
+fn an_edited_check_still_needs_its_condition() {
+    let project = Project::new(
+        "project {\n  main = \"main\"\n  signals = run(\"true\")\n}\n\ncheck gated = make(\"ok\") {\n  when = signal(\"release\")\n}\n",
+    );
+    project.git(&["checkout", "-q", "-b", "feature"]);
+    let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
+    project.write(
+        "citrus.ci",
+        &text.replace(
+            "check gated = make(\"ok\")",
+            "check gated = make(\"plain\")",
+        ),
+    );
+    project.commit("edit gated");
+    let (plan, _) = project.json(&["plan"]);
+    assert_eq!(plan["plan"]["targets"], serde_json::json!([]), "{plan}");
+    let (plan, _) = project.json(&["plan", "--base", "main"]);
+    assert!(
+        !plan["plan"]["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "gated"),
+        "{plan}"
+    );
+}

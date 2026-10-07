@@ -289,7 +289,10 @@ fn select(
     };
     // Owners whose condition holds, and checks selected by condition alone;
     // repeated until stable because conditions may name selected checks.
-    let mut selected: Vec<String> = plan.targets.clone();
+    // An edited declaration joins like a check whose path changed: its
+    // condition still decides.
+    let edited_checks: Vec<String> = std::mem::take(&mut plan.targets);
+    let mut selected: Vec<String> = Vec::new();
     let mut ordered: Vec<&crate::manifest::Target> = manifest.targets.values().collect();
     ordered.sort_by_key(|target| target.position);
     for _ in 0..manifest.targets.len() + 1 {
@@ -297,7 +300,8 @@ fn select(
         for target in &ordered {
             if selected.contains(&target.name)
                 || ((!target.inputs.is_empty() || !target.via.is_empty())
-                    && !touched.contains(&target.name))
+                    && !touched.contains(&target.name)
+                    && !edited_checks.contains(&target.name))
             {
                 continue;
             }
