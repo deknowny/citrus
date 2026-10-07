@@ -254,18 +254,7 @@ pub fn start(context: &Context, request: &Start) -> Result<Release> {
         );
     }
     if kind == "release" && unit.checks == "proven" && !request.unchecked {
-        let plan = crate::plan::compute(repo, &context.manifest, None)?;
-        let files = repo.files()?;
-        let snapshot = repo.snapshot()?;
-        let needed: Vec<String> = plan
-            .targets
-            .iter()
-            .map(|name| context.decide(&files, &snapshot, name, false))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|decision| decision.result != "reused")
-            .map(|decision| decision.target)
-            .collect();
+        let needed = unproven_checks(context)?;
         if !needed.is_empty() {
             bail!(
                 "checks not proven for this commit: {} — run `citrus run` first (or --unchecked to release anyway)",
@@ -349,12 +338,34 @@ pub fn start(context: &Context, request: &Start) -> Result<Release> {
     context.store.release(&id)?.context("release disappeared")
 }
 
-fn spawn(context: &Context, release: &Release) -> Result<()> {
+/// Checks the plan selects for HEAD that are not proven yet.
+pub fn unproven_checks(context: &Context) -> Result<Vec<String>> {
+    let repo = &context.repo;
+    let plan = crate::plan::compute(repo, &context.manifest, None)?;
+    let files = repo.files()?;
+    let snapshot = repo.snapshot()?;
+    Ok(plan
+        .targets
+        .iter()
+        .map(|name| context.decide(&files, &snapshot, name, false))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|decision| decision.result != "reused")
+        .map(|decision| decision.target)
+        .collect())
+}
+
+pub fn spawn(context: &Context, release: &Release) -> Result<()> {
     let output = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&release.log)?;
-    let pid = context.spawn_detached(&["release-worker", &release.id], output)?;
+    let worker = if release.kind == "apply" {
+        "apply-worker"
+    } else {
+        "release-worker"
+    };
+    let pid = context.spawn_detached(&[worker, &release.id], output)?;
     context.store.set_release_pid(&release.id, pid)?;
     context
         .store
@@ -371,8 +382,18 @@ pub fn resume(context: &Context, release: &Release, approve: bool) -> Result<Rel
             release.state
         );
     }
-    let unit = Releases::load(context)?.unit(&release.unit)?.clone();
-    if unit.steps.iter().any(|step| step.production) && !approve {
+    let needs_approval = if release.kind == "apply" {
+        crate::deploy::environments(context)?
+            .get(&release.unit)
+            .is_none_or(|environment| environment.approval != "none")
+    } else {
+        Releases::load(context)?
+            .unit(&release.unit)?
+            .steps
+            .iter()
+            .any(|step| step.production)
+    };
+    if needs_approval && !approve {
         bail!("this release changes production: pass --approve");
     }
     if context.repo.git(&["rev-parse", "HEAD"])? != release.commit {

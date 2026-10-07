@@ -1240,3 +1240,294 @@ fn artifact_inputs_can_come_from_a_command() {
             .contains("exactly one")
     );
 }
+
+const FAKE_KUBECTL: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+state_path = ".kube/state.json"
+state = json.load(open(state_path))
+args = [a for a in sys.argv[1:]]
+# drop global flags
+while args and args[0].startswith("--"):
+    args = args[2:]
+open(".kube/calls", "a").write(" ".join(args) + "\n")
+def save():
+    json.dump(state, open(state_path, "w"))
+verb = args[0]
+if verb == "get" and args[1] == "deployment":
+    d = state["deployments"][args[2]]
+    print(json.dumps({"metadata": {"generation": 1, "annotations": d["annotations"]},
+        "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": args[2], "image": d["image"]}]}}},
+        "status": {"observedGeneration": 1, "readyReplicas": 1}}))
+elif verb == "get" and args[1] == "cronjob" and "jsonpath={.spec.suspend}" in args:
+    print("true" if state["cronjobs"][args[2]]["suspend"] else "false")
+elif verb == "get" and args[1] == "cronjob":
+    c = state["cronjobs"][args[2]]
+    print(json.dumps({"metadata": {"annotations": c["annotations"]},
+        "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": args[2], "image": c["image"]}]}}}}}}))
+elif verb == "get" and args[1] == "lease":
+    print(state["lease"])
+elif verb == "patch":
+    kind, name, patch = args[1], args[2], json.loads(args[args.index("-p") + 1])
+    target = state["deployments" if kind == "deployment" else "cronjobs"][name]
+    if "suspend" in patch.get("spec", {}):
+        target["suspend"] = patch["spec"]["suspend"]
+    target["annotations"].update(patch.get("metadata", {}).get("annotations", {}))
+    spec = patch.get("spec", {})
+    pod = spec.get("template", {}).get("spec") or spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec")
+    if pod:
+        target["image"] = pod["containers"][0]["image"]
+        if kind == "deployment":
+            state["lease"] = name + "-new-" + target["image"][-6:]
+    save()
+elif verb == "rollout":
+    sys.exit(1 if os.path.exists(".kube/fail-rollout") else 0)
+elif verb == "apply":
+    manifest = sys.stdin.read()
+    state["jobs"].append(manifest)
+    save()
+elif verb == "wait":
+    sys.exit(0 if state["jobs"] else 1)
+else:
+    sys.exit("unsupported: " + " ".join(args))
+"#;
+
+fn apply_project() -> Project {
+    let project = Project::new("");
+    project.write(
+        "ci/artifacts.toml",
+        "[artifacts.api]\ninputs = [\"src/**\"]\nbuild = { provider = \"command\", run = [\"sh\", \"-c\", \"echo {artifact} >> .kube/builds; echo IMAGE=registry.example/{artifact}@sha256:{key}\"] }\n\n\
+         [artifacts.backup]\ninputs = [\"other/**\"]\nbuild = { provider = \"command\", run = [\"sh\", \"-c\", \"echo IMAGE=registry.example/{artifact}@sha256:{key}\"] }\n\n\
+         [artifacts.migrations]\ninputs = [\"migrations/**\"]\nbuild = { provider = \"command\", run = [\"sh\", \"-c\", \"echo {artifact} >> .kube/builds; echo IMAGE=registry.example/{artifact}@sha256:{key}\"] }\n",
+    );
+    project.write(
+        "ci/environments.toml",
+        "[environments.prod]\nprovider = \"kubernetes\"\nconnection = { kubectl = \"./kubectl.py\", namespace = \"shop\" }\nrecord = { annotation = \"example.com/release\", tag_prefix = \"v\" }\n\
+         migrations = { artifact = \"migrations\", job = \"job.yaml\" }\n\n\
+         [environments.prod.workloads.api]\nartifact = \"api\"\nfence = \"api-lease\"\ntimeout = 10\n\n\
+         [environments.prod.workloads.backup]\nartifact = \"backup\"\nkind = \"cronjob\"\nquiesce = true\n",
+    );
+    project.write(
+        "job.yaml",
+        "kind: Job\nmetadata: {name: \"{name}\"}\nimage: \"{image}\"\n",
+    );
+    project.write("migrations/1.sql", "create table t ();\n");
+    project.write("kubectl.py", FAKE_KUBECTL);
+    let mut perms = fs::metadata(project.root().join("kubectl.py"))
+        .unwrap()
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(project.root().join("kubectl.py"), perms).unwrap();
+    project.write(".gitignore", ".citrus/\n.kube/\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "deploy config",
+    ]);
+    project.git(&["tag", "v1.0.0"]);
+    let state = serde_json::json!({
+        "deployments": {"api": {"image": "registry.example/api@sha256:old", "annotations": {"example.com/release": "1.0.0"}}},
+        "cronjobs": {"backup": {"image": "registry.example/backup@sha256:old", "annotations": {}, "suspend": false}},
+        "lease": "api-old", "jobs": []
+    });
+    project.write(".kube/state.json", &state.to_string());
+    project
+}
+
+fn kube_state(project: &Project) -> Value {
+    serde_json::from_str(&fs::read_to_string(project.root().join(".kube/state.json")).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn apply_builds_by_key_rolls_by_digest_and_records_the_commit() {
+    let project = apply_project();
+    project.write("src/a.txt", "v2\n");
+    project.write("migrations/2.sql", "alter table t;\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "feature",
+    ]);
+    let head = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(project.root())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+
+    assert!(
+        project.json(&["apply", "prod"]).0["error"]
+            .as_str()
+            .unwrap()
+            .contains("--approve")
+    );
+    assert!(
+        project
+            .json(&["apply", "prod", "--approve", "--plan", "deadbeef"])
+            .0["error"]
+            .as_str()
+            .unwrap()
+            .contains("plan changed")
+    );
+    let plan = project.json(&["diff", "prod"]).0["diff"]["plan_hash"]
+        .as_str()
+        .unwrap()[..12]
+        .to_owned();
+    let (applied, code) = project.json(&["apply", "prod", "--approve", "--plan", &plan]);
+    assert_eq!(code, 0, "{applied}");
+    let steps: Vec<&str> = applied["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "build:api",
+            "build:migrations",
+            "quiesce",
+            "migrate",
+            "roll:api",
+            "resume",
+            "verify"
+        ],
+        "{applied}"
+    );
+
+    let state = kube_state(&project);
+    let api = &state["deployments"]["api"];
+    assert!(
+        api["image"]
+            .as_str()
+            .unwrap()
+            .starts_with("registry.example/api@sha256:")
+    );
+    assert_eq!(api["annotations"]["citrus.dev/commit"], head.as_str());
+    assert_eq!(state["cronjobs"]["backup"]["suspend"], false);
+    assert!(
+        state["jobs"][0]
+            .as_str()
+            .unwrap()
+            .contains("registry.example/migrations@sha256:")
+    );
+    let calls = fs::read_to_string(project.root().join(".kube/calls")).unwrap();
+    let suspend = calls.find(r#"{"spec":{"suspend":true}}"#).unwrap();
+    let roll = calls.find("patch deployment api").unwrap();
+    let resume = calls.find(r#"{"spec":{"suspend":false}}"#).unwrap();
+    assert!(suspend < roll && roll < resume, "{calls}");
+
+    let (diff, _) = project.json(&["diff", "prod"]);
+    assert_eq!(diff["diff"]["found_by"], "annotation citrus.dev/commit");
+    assert_eq!(diff["diff"]["workloads"][0]["change"], "unchanged");
+    assert_eq!(
+        project.json(&["apply", "prod", "--approve"]).0["state"],
+        "unchanged"
+    );
+
+    // Back to earlier inputs: the image built from them is reused, not rebuilt.
+    let builds = fs::read_to_string(project.root().join(".kube/builds"))
+        .unwrap()
+        .lines()
+        .count();
+    project.write("src/a.txt", "v3\n");
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "v3",
+    ]);
+    assert_eq!(project.json(&["apply", "prod", "--approve"]).1, 0);
+    project.write("src/a.txt", "v2\n");
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "back to v2",
+    ]);
+    assert_eq!(project.json(&["apply", "prod", "--approve"]).1, 0);
+    let after = fs::read_to_string(project.root().join(".kube/builds"))
+        .unwrap()
+        .lines()
+        .count();
+    assert_eq!(after, builds + 1, "only v3 was new");
+}
+
+#[test]
+fn a_failed_apply_resumes_quiesced_work_and_frees_the_environment() {
+    let project = apply_project();
+    project.write("src/a.txt", "v2\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "feature",
+    ]);
+    project.write(".kube/fail-rollout", "");
+    let (failed, code) = project.json(&["apply", "prod", "--approve"]);
+    assert_eq!(code, 1, "{failed}");
+    assert_eq!(step(&failed, "roll:api")["state"], "failed");
+    assert_eq!(
+        kube_state(&project)["cronjobs"]["backup"]["suspend"],
+        false,
+        "cronjob must not stay suspended"
+    );
+    fs::remove_file(project.root().join(".kube/fail-rollout")).unwrap();
+    let id = failed["release"]["id"].as_str().unwrap().to_owned();
+    let (resumed, code) = project.json(&["release", "resume", &id, "--approve"]);
+    assert_eq!(code, 0, "{resumed}");
+    assert_eq!(step(&resumed, "build:api")["state"], "passed");
+}
+
+#[test]
+fn a_worker_that_dies_without_a_result_does_not_hang_wait() {
+    // The worker of this release has no unit to run and exits at once.
+    let project = release_project();
+    project.write(
+        "ci/releases.toml",
+        &RELEASES.replace("[releases.app]", "[releases.app]\nchecks = \"none\""),
+    );
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "gate off",
+    ]);
+    let (started, _) = project.json(&["release", "start", "app", "--approve", "--detach"]);
+    let id = started["release"]["id"].as_str().unwrap().to_owned();
+    fs::write(project.root().join("ci/releases.toml"), "").unwrap();
+    let begun = Instant::now();
+    let (waited, _) = project.json(&["release", "wait", &id]);
+    assert!(
+        begun.elapsed() < Duration::from_secs(20),
+        "wait hung: {waited}"
+    );
+}

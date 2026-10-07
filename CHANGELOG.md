@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-07
+
+- `citrus apply <env> --approve [--plan HASH]`: builds artifacts whose input
+  key was never built (build providers `docker`, `command`; key → image cache),
+  suspends quiesced CronJobs, runs the migration Job, rolls workloads by digest
+  with `citrus.dev/commit` / `citrus.dev/key` records, waits for a Lease
+  takeover (`fence`), resumes CronJobs, verifies images, readiness, HTTP and
+  commands. Steps are recorded like releases (`release show/log/resume/abandon`);
+  a failure never leaves CronJobs suspended.
+- A worker that exits without a result no longer leaves `wait` hanging (its
+  zombie process is reaped before the liveness check).
 
 - Declarative releases, read side: `ci/artifacts.toml` (inputs as globs or an
   `inputs_command`; keys from Git objects at any commit), `ci/environments.toml`

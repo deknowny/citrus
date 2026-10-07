@@ -88,6 +88,13 @@ CREATE TABLE IF NOT EXISTS environment_locks (
     release TEXT NOT NULL,
     acquired INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS artifact_builds (
+    artifact TEXT NOT NULL,
+    key TEXT NOT NULL,
+    reference TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    PRIMARY KEY (artifact, key)
+);
 CREATE TABLE IF NOT EXISTS facts (
     name TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -434,6 +441,27 @@ impl Store {
         self.conn.execute(
             "UPDATE release_steps SET state = ?3, seconds = ?4, exit = ?5, first_error = ?6 WHERE release = ?1 AND name = ?2",
             params![id, step.name, step.state, step.seconds, step.exit, step.first_error],
+        )?;
+        Ok(())
+    }
+
+    /// Image built before from exactly these inputs.
+    pub fn artifact_reference(&self, artifact: &str, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT reference FROM artifact_builds WHERE artifact = ?1 AND key = ?2",
+                params![artifact, key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn put_artifact_reference(&self, artifact: &str, key: &str, reference: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO artifact_builds (artifact, key, reference, created) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (artifact, key) DO UPDATE SET reference = ?3, created = ?4",
+            params![artifact, key, reference, now() as i64],
         )?;
         Ok(())
     }

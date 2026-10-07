@@ -744,6 +744,14 @@ pub fn segment(lines: &[String], target: &str, prefixes: &[String]) -> Vec<Strin
 }
 
 pub fn alive(pid: i64) -> bool {
+    // A worker this process started stays a zombie until reaped, and a zombie
+    // still "exists" for kill(0): reap it first so its exit is noticed.
+    let mut status = 0;
+    // SAFETY: WNOHANG never blocks; for a pid that is not our child it returns -1.
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    if reaped == pid as libc::pid_t {
+        return false;
+    }
     // SAFETY: signal 0 only checks for existence.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)

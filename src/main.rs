@@ -7,6 +7,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)] // A CLI: stdout is the interface.
 
 mod add;
+mod apply;
 mod config;
 mod deploy;
 mod doctor;
@@ -162,6 +163,21 @@ enum Command {
     },
     /// What an environment runs versus what HEAD would run (read-only).
     Diff { environment: String },
+    /// Make an environment run what HEAD builds (build by input key, roll by digest, verify).
+    Apply {
+        environment: String,
+        /// Allow changing a protected environment.
+        #[arg(long)]
+        approve: bool,
+        /// Apply only if the plan still has this hash (from citrus diff).
+        #[arg(long)]
+        plan: Option<String>,
+        /// Apply even if checks are not proven for this commit (recorded).
+        #[arg(long)]
+        unchecked: bool,
+        #[arg(long)]
+        detach: bool,
+    },
     /// Releases: declared units, running them with gates and recorded steps.
     Release {
         #[command(subcommand)]
@@ -178,6 +194,8 @@ enum Command {
     Worker { run: String },
     #[command(hide = true)]
     ReleaseWorker { release: String },
+    #[command(hide = true)]
+    ApplyWorker { release: String },
     #[command(hide = true)]
     RefreshResources,
 }
@@ -471,6 +489,49 @@ fn execute(command: Option<Command>, json: bool) -> Result<i32> {
         }
         Command::Release { action } => {
             release_command(&context, action.unwrap_or(ReleaseAction::List), json)
+        }
+        Command::Apply {
+            environment,
+            approve,
+            plan,
+            unchecked,
+            detach,
+        } => {
+            let started = apply::start(
+                &context,
+                &apply::Request {
+                    environment: environment.clone(),
+                    approve,
+                    unchecked,
+                    plan,
+                },
+            )?;
+            let Some(started) = started else {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &json!({"schema": SCHEMA, "environment": environment, "state": "unchanged"})
+                        )?
+                    );
+                } else {
+                    println!("{environment} already runs what HEAD builds; nothing to apply");
+                }
+                return Ok(0);
+            };
+            if detach {
+                return emit_release(&context, &started, json);
+            }
+            eprintln!(
+                "citrus: {} — Ctrl-C leaves it running; `citrus release wait {}` to follow",
+                started.id, started.id
+            );
+            let finished = wait_release(&context, &started.id, json)?;
+            emit_release(&context, &finished, json)
+        }
+        Command::ApplyWorker { release } => {
+            apply::work(&context, &release)?;
+            Ok(0)
         }
         Command::ReleaseWorker { release } => {
             release::work(&context, &release)?;

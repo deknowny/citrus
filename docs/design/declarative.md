@@ -1,6 +1,6 @@
 # Design: declarative releases (`citrus diff` / `citrus apply`)
 
-Status: read side implemented (`citrus artifacts`, `citrus diff`, provider `kubernetes` observe); apply is next. Issue #2. Releases today are imperative steps — run these
+Status: implemented for the `kubernetes` provider — `citrus artifacts`, `citrus diff`, `citrus apply` (builds by input key with the `docker` and `command` build providers, quiesce, migration Job, roll by digest with records, lease fence, verify). Issue #2. Releases today are imperative steps — run these
 commands in order. This design replaces them with desired state: what each
 environment should run, observed against what it runs, reconciled by one
 generic mechanism.

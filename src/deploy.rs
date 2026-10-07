@@ -46,6 +46,58 @@ pub struct Environment {
     #[serde(default)]
     pub record: Record,
     pub workloads: BTreeMap<String, Workload>,
+    /// `required` (default): apply needs --approve. `none`: no approval.
+    #[serde(default = "required")]
+    pub approval: String,
+    /// `proven` (default): checks the plan selects must be proven for HEAD.
+    #[serde(default = "proven_checks")]
+    pub checks: String,
+    /// Name recorded for a release; `{short}`, `{commit}` substituted.
+    #[serde(default = "short_name")]
+    pub release_name: String,
+    /// Runs before builds and changes (credentials, logins); may print
+    /// `KEY=value` lines that become environment variables of later steps.
+    #[serde(default)]
+    pub prepare: Vec<String>,
+    #[serde(default)]
+    pub migrations: Option<Migrations>,
+    #[serde(default)]
+    pub verify: Verify,
+}
+
+fn required() -> String {
+    "required".into()
+}
+
+fn proven_checks() -> String {
+    "proven".into()
+}
+
+fn short_name() -> String {
+    "{short}".into()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Migrations {
+    pub artifact: String,
+    /// Kubernetes Job manifest template; `{image}` and `{name}` are substituted.
+    pub job: String,
+    #[serde(default = "five_minutes")]
+    pub timeout: u64,
+}
+
+fn five_minutes() -> u64 {
+    300
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Verify {
+    /// URLs that must answer 2xx.
+    pub http: Vec<String>,
+    /// Commands that must succeed (run in the repository).
+    pub commands: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -72,7 +124,19 @@ pub struct Workload {
     /// Container running the artifact (default: the workload name).
     #[serde(default)]
     pub container: String,
+    /// A Lease the old instance holds: after the change, wait until a new holder took it.
+    #[serde(default)]
+    pub fence: Option<String>,
+    /// CronJobs: suspended while the environment changes, restored after.
+    #[serde(default)]
+    pub quiesce: bool,
+    #[serde(default = "five_minutes")]
+    pub timeout: u64,
 }
+
+/// Annotations Citrus writes on every workload it changes.
+pub const COMMIT_ANNOTATION: &str = "citrus.dev/commit";
+pub const KEY_ANNOTATION: &str = "citrus.dev/key";
 
 fn deployment() -> String {
     "deployment".into()
@@ -231,7 +295,7 @@ pub fn observe(environment: &Environment) -> Result<Vec<Observed>> {
     }
 }
 
-fn kubectl(environment: &Environment) -> Command {
+pub fn kubectl(environment: &Environment) -> Command {
     let mut command = Command::new(
         environment
             .connection
@@ -336,6 +400,13 @@ fn running_commit(
     let Some(holder) = holder else {
         return Ok((None, None, "no workload observed".into()));
     };
+    if let Some(commit) = holder.annotations.get(COMMIT_ANNOTATION) {
+        return Ok((
+            holder.annotations.get(&record.annotation).cloned(),
+            Some(commit.clone()),
+            format!("annotation {COMMIT_ANNOTATION}"),
+        ));
+    }
     if !record.commit_annotation.is_empty()
         && let Some(commit) = holder.annotations.get(&record.commit_annotation)
     {
