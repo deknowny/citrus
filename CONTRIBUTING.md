@@ -11,7 +11,8 @@ cargo build
 ./target/debug/citrus log last   # first error if something failed
 ```
 
-Plain `make test` and `make lint` work too. CI runs both on Linux and macOS.
+The checks are declared in [`citrus.ci`](citrus.ci); `./target/debug/citrus do fmt`
+formats the code. CI runs the same cargo commands on Linux and macOS.
 
 ## Trying a change in a real repository
 

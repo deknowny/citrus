@@ -31,11 +31,43 @@ pub struct Target {
     pub resources: Vec<String>,
     /// Project-specific keys, kept as written.
     pub extensions: BTreeMap<String, toml::Value>,
+    /// Steps declared in `citrus.ci`; empty for TOML targets (run as `run.local`).
+    pub steps: Vec<crate::lang::compile::Step>,
+    /// `file:line` of the declaration in `citrus.ci`.
+    pub source: Option<String>,
     owned: Vec<Glob>,
     all: Vec<Glob>,
 }
 
 impl Target {
+    /// A check declared in `citrus.ci`.
+    pub fn declared(check: &crate::lang::compile::Check, source: String) -> Result<Target> {
+        let owned = check
+            .owns
+            .iter()
+            .map(|pattern| Glob::new(pattern))
+            .collect::<Result<Vec<_>>>()?;
+        let all = check
+            .owns
+            .iter()
+            .chain(&check.reads)
+            .map(|pattern| Glob::new(pattern))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Target {
+            name: check.name.clone(),
+            description: check.description.clone(),
+            inputs: check.owns.clone(),
+            extra_inputs: check.reads.clone(),
+            cache: check.cache,
+            resources: check.resources.clone(),
+            extensions: BTreeMap::new(),
+            steps: check.steps.clone(),
+            source: Some(source),
+            owned,
+            all,
+        })
+    }
+
     /// Same inputs, cache and resources: a reformatted entry is not a new check.
     pub fn same_declaration(&self, other: &Target) -> bool {
         self.inputs == other.inputs
@@ -131,6 +163,8 @@ impl Manifest {
                     cache,
                     resources,
                     extensions,
+                    steps: Vec::new(),
+                    source: None,
                     owned,
                     all,
                 },
@@ -283,6 +317,12 @@ pub fn fingerprint(
         py_json_str(&target.name)
     );
     digest.update(header.as_bytes());
+    // What a declared check runs is part of what its PASS proves.
+    if !target.steps.is_empty() {
+        let work: Vec<&crate::lang::compile::Work> =
+            target.steps.iter().map(|step| &step.work).collect();
+        digest.update(serde_json::to_string(&work)?.as_bytes());
+    }
     let mut covered = Vec::new();
     let paths = files
         .iter()

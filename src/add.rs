@@ -60,6 +60,28 @@ pub fn add(context: &Context, declaration: &Declaration) -> Result<String> {
             context.repo.config.target_definitions.join(", ")
         );
     }
+    if context.project.is_some() {
+        if !declaration.inputs.iter().all(|pattern| !pattern.is_empty()) {
+            bail!("--inputs: empty pattern");
+        }
+        let block = render_ci(declaration);
+        let path = context.repo.root.join("citrus.ci");
+        let mut text = fs::read_to_string(&path)?;
+        text = format!("{}\n\n{block}", text.trim_end());
+        fs::write(&path, &text)?;
+        if let Err(rendered) = crate::lang::compile::load(&context.repo.root) {
+            let original = text
+                .trim_end()
+                .strip_suffix(block.trim_end())
+                .unwrap_or(&text)
+                .trim_end()
+                .to_owned()
+                + "\n";
+            fs::write(&path, original)?;
+            bail!("the new check would make citrus.ci invalid:\n{rendered}");
+        }
+        return Ok(block);
+    }
     let block = render(declaration);
     let path = context.repo.manifest_path();
     let existing = fs::read_to_string(&path).unwrap_or_default();
@@ -147,4 +169,35 @@ fn render(declaration: &Declaration) -> String {
 
 fn quote(value: &str) -> String {
     toml::Value::String(value.to_owned()).to_string()
+}
+
+/// A `check` block for citrus.ci; the run step is `make <target>`.
+fn render_ci(declaration: &Declaration) -> String {
+    let list = |items: &[String]| {
+        format!(
+            "[{}]",
+            items
+                .iter()
+                .map(|item| format!("{item:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let mut block = format!("check {:?} {{\n", declaration.target);
+    if let Some(description) = &declaration.description {
+        block.push_str(&format!("  about = {description:?}\n"));
+    }
+    block.push_str(&format!("  owns  = {}\n", list(&declaration.inputs)));
+    if !declaration.extra_inputs.is_empty() {
+        block.push_str(&format!("  reads = {}\n", list(&declaration.extra_inputs)));
+    }
+    block.push_str(&format!("  run   = make({:?})\n", declaration.target));
+    if declaration.cache {
+        block.push_str("  cache = true\n");
+    }
+    if !declaration.resources.is_empty() {
+        block.push_str(&format!("  resources = {}\n", list(&declaration.resources)));
+    }
+    block.push_str("}\n");
+    block
 }

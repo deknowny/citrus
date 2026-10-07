@@ -84,17 +84,33 @@ See [docs/manifest.md](docs/manifest.md) for the exact format.
 cargo install --git https://github.com/deknowny/citrus --locked   # or a release binary
 cd your-repo
 echo ".citrus/" >> .gitignore
-citrus add test --inputs 'src/**' 'tests/**' --cache   # `test` is an existing Make target
-citrus doctor
+cat > citrus.ci <<'CI'
+citrus 1
+
+check "test" {
+  owns  = ["src/**", "tests/**"]
+  run   = make("test")
+  cache = true
+}
+
+task "dev-db" {
+  about = "Start the database and wait for it"
+  steps = [compose.up("db"), wait.tcp("localhost:5432", timeout: 60s)]
+}
+CI
+citrus check     # validates citrus.ci, points at the line if something is wrong
 citrus status
 citrus run
+citrus do dev-db
 ```
 
-Without `citrus.toml`, Citrus selects declared checks owning the changed files
-(against `origin/main`) and runs each as `make <target>`. Everything else —
-your own planner, a remote runner on shared builders, npm scripts, progress
-markers — is configured in [`citrus.toml`](docs/configuration.md); see
-[examples/](examples/).
+`citrus.ci` is a small language: blocks describe checks and tasks, expressions
+compute values (`let`, functions, `for`, `if`, `"{interpolation}"`), and steps
+are built into Citrus so they behave the same on macOS, Linux and Windows —
+see [docs/design/language.md](docs/design/language.md). This repository's own
+[`citrus.ci`](citrus.ci) is a short real example. The older TOML configuration
+([docs/configuration.md](docs/configuration.md), [examples/](examples/)) still
+works where `citrus.ci` is absent.
 
 ## Pinning Citrus in a repository
 

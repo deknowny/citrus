@@ -1564,3 +1564,134 @@ fn an_identical_image_is_recorded_without_touching_the_pod_template() {
         .unwrap();
     assert!(!patch.contains("template"), "{patch}");
 }
+
+fn ci_project(source: &str) -> Project {
+    let project = Project::new("");
+    fs::remove_file(project.root().join("ci/targets.toml")).unwrap();
+    project.write("citrus.ci", source);
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "citrus.ci",
+    ]);
+    project
+}
+
+const CI: &str = r#"citrus 1
+
+project { base = "main" }
+
+for name in ["a", "b"] {
+  check "check-{name}" {
+    owns  = ["src/{name}.txt"]
+    run   = run("sh", "-c", "grep -q ok src/{name}.txt || {{ echo 'Error: src/{name}.txt is not ok'; exit 1; }}")
+    cache = true
+  }
+}
+
+task "prepare" {
+  about = "copy a file once it exists"
+  steps = [wait.file("ready.txt", timeout: 5s), copy("ready.txt", "out/copied.txt")]
+}
+"#;
+
+#[test]
+fn checks_declared_in_citrus_ci_run_their_steps_and_are_reused() {
+    let project = ci_project(CI);
+    project.write("src/a.txt", "ok\n");
+    project.write("src/b.txt", "bad\n");
+    let (run, code) = project.json(&["run", "check-a", "check-b"]);
+    assert_eq!(code, 1, "{run}");
+    assert_eq!(target(&run, "check-a")["result"], "passed");
+    assert!(
+        target(&run, "check-b")["first_error"]
+            .as_str()
+            .unwrap()
+            .contains("src/b.txt is not ok"),
+        "{run}"
+    );
+    let (again, _) = project.json(&["run", "check-a"]);
+    assert_eq!(target(&again, "check-a")["result"], "reused");
+
+    // Changing what a check runs invalidates its earlier pass.
+    project.write("citrus.ci", &CI.replace("grep -q ok", "grep -q 'ok'"));
+    let (changed, _) = project.json(&["run", "check-a"]);
+    assert_eq!(target(&changed, "check-a")["result"], "passed", "{changed}");
+
+    let (checked, code) = project.json(&["check"]);
+    assert_eq!(code, 0, "{checked}");
+    assert_eq!(checked["checks"], 2);
+    assert_eq!(checked["tasks"], 1);
+}
+
+#[test]
+fn a_shell_brace_in_a_string_explains_interpolation() {
+    let project = ci_project(
+        "citrus 1\ncheck \"x\" {\n  owns = [\"src/**\"]\n  run = sh(\"a || { b; }\")\n}\n",
+    );
+    let message = project.json(&["status"]).0["error"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("write `{{`"), "{message}");
+}
+
+#[test]
+fn an_error_in_citrus_ci_points_at_the_line() {
+    let project =
+        ci_project("citrus 1\ncheck \"x\" {\n  owns = [\"src/**\"]\n  run  = mak(\"x\")\n}\n");
+    let (error, code) = project.json(&["status"]);
+    assert_eq!(code, 2);
+    let message = error["error"].as_str().unwrap();
+    assert!(
+        message.contains("citrus.ci:4:10") && message.contains("did you mean `make`?"),
+        "{message}"
+    );
+}
+
+#[test]
+fn tasks_run_built_in_steps_without_a_shell() {
+    let project = ci_project(CI);
+    project.write("ready.txt", "hello\n");
+    let (done, code) = project.json(&["do", "prepare"]);
+    assert_eq!(code, 0, "{done}");
+    assert_eq!(
+        fs::read_to_string(project.root().join("out/copied.txt")).unwrap(),
+        "hello\n"
+    );
+    fs::remove_file(project.root().join("ready.txt")).unwrap();
+    let (failed, code) = project.json(&["do", "prepare"]);
+    assert_eq!(code, 1);
+    assert_eq!(failed["source"], "citrus.ci:15");
+    assert!(
+        project.json(&["do", "prepar"]).0["error"]
+            .as_str()
+            .unwrap()
+            .contains("did you mean prepare")
+    );
+}
+
+#[test]
+fn add_and_doctor_follow_citrus_ci() {
+    let project = ci_project(CI);
+    let (added, code) = project.json(&["add", "plain", "--inputs", "Makefile", "--cache"]);
+    assert_eq!(code, 0, "{added}");
+    let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
+    assert!(text.contains("check \"plain\" {\n  owns  = [\"Makefile\"]\n  run   = make(\"plain\")\n  cache = true\n}"), "{text}");
+    assert_eq!(project.json(&["check"]).0["checks"], 3);
+
+    project.write("ci/targets.toml", MANIFEST);
+    let (doctor, _) = project.json(&["doctor"]);
+    let warn = doctor["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["check"] == "citrus.ci")
+        .unwrap();
+    assert_eq!(warn["status"], "warn", "{doctor}");
+}

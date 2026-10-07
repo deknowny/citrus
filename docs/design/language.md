@@ -1,6 +1,6 @@
 # The `.ci` language
 
-Status: specification draft, version `citrus 1`. Issue #11.
+Status: `citrus 1`, first part implemented — values, `let`, functions, `for`/`if`, comprehensions, interpolation, durations, `use`; `project`, `check`, `task`; `citrus check`, `citrus do`. Artifacts, environments, pools and events follow. Issue #11.
 
 A `.ci` file describes a project's CI/CD — checks, artifacts, environments,
 tasks — in a form a person reads at a glance and an agent writes correctly

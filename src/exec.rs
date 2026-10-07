@@ -36,17 +36,45 @@ pub struct Context {
     pub repo: Repo,
     pub store: Store,
     pub manifest: Manifest,
+    /// The compiled `citrus.ci`, when the repository has one.
+    pub project: Option<crate::lang::compile::Project>,
 }
 
 impl Context {
     pub fn open() -> Result<Context> {
-        let repo = Repo::discover()?;
+        let mut repo = Repo::discover()?;
+        let (manifest, project) = match crate::lang::compile::load(&repo.root)
+            .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
+        {
+            // `citrus.ci` is the source of truth when it exists.
+            Some((project, sources)) => {
+                if let Some(base) = &project.base {
+                    repo.config.plan.base = base.clone();
+                }
+                if let Some(logs) = &project.logs {
+                    repo.config.log_dir = logs.clone();
+                }
+                if !project.toolchain.is_empty() {
+                    repo.config.toolchain_files = project.toolchain.clone();
+                }
+                let mut targets = std::collections::BTreeMap::new();
+                for check in &project.checks {
+                    let (file, line, _) = sources.locate(check.span);
+                    targets.insert(
+                        check.name.clone(),
+                        crate::manifest::Target::declared(check, format!("{file}:{line}"))?,
+                    );
+                }
+                (Manifest { targets }, Some(project))
+            }
+            None => (Manifest::load(&repo.manifest_path())?, None),
+        };
         let store = Store::open(&repo.state_dir())?;
-        let manifest = Manifest::load(&repo.manifest_path())?;
         Ok(Context {
             repo,
             store,
             manifest,
+            project,
         })
     }
 
@@ -398,6 +426,46 @@ impl Context {
             self.store.update_target(&run.id, &current)?;
             println!("CITRUS_TARGET target={} status=START", target.target);
             let started = now();
+            let declared = self
+                .manifest
+                .targets
+                .get(&target.target)
+                .filter(|entry| !entry.steps.is_empty());
+            if let Some(entry) = declared {
+                let mut code = 0;
+                for step in &entry.steps {
+                    println!(
+                        "── {}  ({})",
+                        step.label,
+                        entry.source.as_deref().unwrap_or("citrus.ci")
+                    );
+                    code = i64::from(crate::lang::compile::execute(step, &self.repo.root, false)?);
+                    if code != 0 {
+                        break;
+                    }
+                }
+                current.seconds = Some((now() - started) as i64);
+                current.exit = Some(code);
+                println!(
+                    "CITRUS_TARGET target={} status={} exit={code} seconds={}",
+                    target.target,
+                    if code == 0 { "PASS" } else { "FAIL" },
+                    current.seconds.unwrap_or_default()
+                );
+                if code == 0 {
+                    current.result = "passed".into();
+                    current.reason = "ran".into();
+                    self.record_inputs(run, &target.target)?;
+                    passed.push(target.target.clone());
+                } else {
+                    current.result = "failed".into();
+                    current.reason = "ran".into();
+                    current.first_error =
+                        report::first_error(&segment(&read_log(&run.log), &target.target, &[]));
+                }
+                self.store.update_target(&run.id, &current)?;
+                continue;
+            }
             let argv = substitute(&self.repo.config.run.local, "{target}", &target.target);
             let mut command = Command::new(&argv[0]);
             command

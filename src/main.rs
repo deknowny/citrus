@@ -13,6 +13,7 @@ mod deploy;
 mod doctor;
 mod exec;
 mod integrate;
+mod lang;
 mod manifest;
 mod plan;
 mod release;
@@ -183,6 +184,10 @@ enum Command {
         #[command(subcommand)]
         action: Option<ReleaseAction>,
     },
+    /// Check citrus.ci before anything runs: syntax, names, fields, globs, portability.
+    Check,
+    /// Run a task declared in citrus.ci (no name: list the tasks).
+    Do { task: Option<String> },
     /// Check that this repository is set up so Citrus can be trusted.
     Doctor,
     /// How Citrus has been used: runs, reuse, time saved.
@@ -372,6 +377,8 @@ fn execute(command: Option<Command>, json: bool) -> Result<i32> {
             Ok(0)
         }
         Command::Stats { days } => stats(&context, days, json),
+        Command::Check => check_command(&context, json),
+        Command::Do { task } => do_command(&context, task, json),
         Command::Integrate { base, push, no_run } => {
             integrate_command(&context, base, push, !no_run, json)
         }
@@ -1899,4 +1906,144 @@ fn emit_release(context: &Context, item: &crate::state::Release, json: bool) -> 
     }
     print_next(&next);
     Ok(code)
+}
+
+fn check_command(context: &Context, json: bool) -> Result<i32> {
+    let Some(project) = &context.project else {
+        if json {
+            println!("{}", json!({"schema": SCHEMA, "ok": true, "file": null}));
+        } else {
+            println!(
+                "no citrus.ci in this repository; nothing to check (TOML configuration is in use)"
+            );
+        }
+        return Ok(0);
+    };
+    // Context::open already failed on errors; here only warnings remain.
+    let (_, sources) = lang::compile::load(&context.repo.root)
+        .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
+        .context("citrus.ci disappeared")?;
+    if json {
+        let warnings: Vec<Value> = project
+            .warnings
+            .iter()
+            .map(|warning| {
+                let (file, line, column) = sources.locate(warning.span);
+                json!({"message": warning.message, "help": warning.help, "file": file, "line": line, "column": column})
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": SCHEMA, "ok": true, "checks": project.checks.len(), "tasks": project.tasks.len(),
+                "not_executed_yet": project.pending.iter().map(|(kind, name, _)| format!("{kind} {name}")).collect::<Vec<_>>(),
+                "warnings": warnings,
+            }))?
+        );
+        return Ok(0);
+    }
+    for warning in &project.warnings {
+        print!(
+            "{}",
+            sources.render(warning).replacen("error:", "warning:", 1)
+        );
+    }
+    println!(
+        "✓ citrus.ci: {} checks, {} tasks{}",
+        project.checks.len(),
+        project.tasks.len(),
+        if project.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(", {} warnings", project.warnings.len())
+        }
+    );
+    if !project.pending.is_empty() {
+        let names: Vec<String> = project
+            .pending
+            .iter()
+            .map(|(kind, name, _)| format!("{kind} {name}"))
+            .collect();
+        println!(
+            "  declared, not executed from .ci yet: {}",
+            names.join(", ")
+        );
+    }
+    Ok(0)
+}
+
+fn do_command(context: &Context, task: Option<String>, json: bool) -> Result<i32> {
+    let project = context
+        .project
+        .as_ref()
+        .context("tasks live in citrus.ci; this repository has none")?;
+    let Some(name) = task else {
+        if json {
+            let tasks: Vec<Value> = project.tasks.iter().map(|task| json!({"task": task.name, "about": task.about, "steps": task.steps.iter().map(|step| &step.label).collect::<Vec<_>>()})).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"schema": SCHEMA, "tasks": tasks}))?
+            );
+        } else if project.tasks.is_empty() {
+            println!("no tasks in citrus.ci");
+        } else {
+            for task in &project.tasks {
+                println!("  {:<24} {}", task.name, task.about);
+            }
+            print_next(&["citrus do <task>".into()]);
+        }
+        return Ok(0);
+    };
+    let task = project
+        .tasks
+        .iter()
+        .find(|task| task.name == name)
+        .with_context(|| {
+            let known: Vec<&str> = project
+                .tasks
+                .iter()
+                .map(|task| task.name.as_str())
+                .collect();
+            match lang::suggest(&name, known.iter().copied()) {
+                Some(close) => format!("no task {name}; did you mean {close}?"),
+                None => format!("no task {name}; tasks: {}", known.join(", ")),
+            }
+        })?;
+    let (_, sources) = lang::compile::load(&context.repo.root)
+        .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
+        .context("citrus.ci disappeared")?;
+    let started = std::time::Instant::now();
+    for (index, step) in task.steps.iter().enumerate() {
+        let (file, line, _) = sources.locate(step.span);
+        eprintln!(
+            "[{}/{}] {}  ({file}:{line})",
+            index + 1,
+            task.steps.len(),
+            step.label
+        );
+        let code = lang::compile::execute(step, &context.repo.root, json)?;
+        if code != 0 {
+            if json {
+                println!(
+                    "{}",
+                    json!({"schema": SCHEMA, "task": name, "state": "failed", "step": step.label, "source": format!("{file}:{line}"), "exit": code})
+                );
+            } else {
+                println!(
+                    "✗ {name} failed at step {} ({file}:{line}), exit {code}",
+                    index + 1
+                );
+            }
+            return Ok(1);
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            json!({"schema": SCHEMA, "task": name, "state": "passed", "seconds": started.elapsed().as_secs()})
+        );
+    } else {
+        println!("✓ {name} · {}", age(started.elapsed().as_secs() as i64));
+    }
+    Ok(0)
 }

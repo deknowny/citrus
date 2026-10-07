@@ -46,8 +46,39 @@ pub fn diagnose(context: &Context) -> Vec<Finding> {
         },
     );
 
+    if context.project.is_some() {
+        let ignored: Vec<&str> = ["citrus.toml", config.manifest.as_str()]
+            .into_iter()
+            .filter(|path| context.repo.root.join(path).exists())
+            .collect();
+        if !ignored.is_empty() {
+            note(
+                "citrus.ci",
+                "warn",
+                format!(
+                    "citrus.ci is the configuration; {} are ignored and can be deleted",
+                    ignored.join(", ")
+                ),
+            );
+        } else {
+            note(
+                "citrus.ci",
+                "ok",
+                format!(
+                    "{} checks, {} tasks",
+                    context.manifest.targets.len(),
+                    context
+                        .project
+                        .as_ref()
+                        .map_or(0, |project| project.tasks.len())
+                ),
+            );
+        }
+    }
     let manifest_path = context.repo.manifest_path();
-    if !manifest_path.exists() {
+    if context.project.is_some() {
+        // Declarations come from citrus.ci.
+    } else if !manifest_path.exists() {
         note(
             "manifest",
             "warn",
@@ -88,7 +119,12 @@ pub fn diagnose(context: &Context) -> Vec<Finding> {
                         format!("globs match no file: {list}"),
                     );
                 }
-                match crate::add::defined(context, &target.name) {
+                let defined = if target.steps.is_empty() {
+                    crate::add::defined(context, &target.name)
+                } else {
+                    Ok(true)
+                };
+                match defined {
                     Ok(false) => note(
                         &format!("target {}", target.name),
                         "fail",

@@ -18,8 +18,12 @@ pub struct Repo {
 
 impl Repo {
     pub fn discover() -> Result<Repo> {
+        Self::discover_at(Path::new("."))
+    }
+
+    pub fn discover_at(start: &Path) -> Result<Repo> {
         let root = PathBuf::from(
-            git_in(Path::new("."), &["rev-parse", "--show-toplevel"])
+            git_in(start, &["rev-parse", "--show-toplevel"])
                 .context("not inside a Git checkout")?,
         );
         let common = PathBuf::from(git_in(

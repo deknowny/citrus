@@ -26,9 +26,10 @@ commands in `next`.
 4. **Failure** — `citrus log last`: the first error of each failed check.
    `--target <name>` for one check, `--full` only if the first error is not enough.
 5. **Unclear why a check is needed** — `citrus why <target>`.
-6. **New check** — create the command (for example a Make target), then
-   `citrus add <target> --inputs <globs> [--extra <globs>] [--cache]`.
-   No wrapper script for running or parsing results.
+6. **New check or task** — when the repository has `citrus.ci`, add a `check`
+   or `task` block there (steps like `run(...)`, `make(...)`, `wait.tcp(...)`,
+   `copy(...)` — no shell scripts), then `citrus check`; `citrus do <task>`
+   runs a task. Without `citrus.ci`: `citrus add <target> --inputs <globs>`.
 7. **Bring in the base branch** — `citrus integrate` (merge, keep what is still
    proven, re-check the rest); `citrus integrate --push` to publish when green.
 8. **Other tasks** — `citrus tasks` shows every worktree; `citrus note <text>`

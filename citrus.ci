@@ -1,0 +1,47 @@
+citrus 1
+
+# Citrus checks itself with Citrus: `citrus run` picks what a change needs.
+
+project {
+  base      = "origin/main"
+  toolchain = ["Cargo.lock"]
+}
+
+let rust = ["src/**", "tests/**"]
+let cargo_files = ["Cargo.toml", "Cargo.lock", "build.rs"]
+
+check "test" {
+  about = "Unit and integration tests on throwaway Git repositories"
+  owns  = rust + ["examples/**"]
+  reads = cargo_files
+  run   = cargo.test()
+  cache = true
+}
+
+check "lint" {
+  about = "rustfmt and clippy with warnings as errors"
+  owns  = rust + ["rustfmt.toml"]
+  reads = cargo_files
+  run   = [cargo.fmt(check: true), cargo.clippy(deny: "warnings")]
+  cache = true
+}
+
+check "docs" {
+  about = "Relative links in Markdown point at existing files"
+  owns  = ["*.md", "docs/**", "skills/**", "scripts/check-links.sh"]
+  run   = run("./scripts/check-links.sh")
+  cache = true
+}
+
+check "doctor" {
+  about = "This repository's own Citrus configuration is valid"
+  owns  = ["citrus.ci", "Makefile", "scripts/release.sh"]
+  reads = rust + cargo_files
+  run   = run("cargo", "run", "--quiet", "--locked", "--", "doctor", "--text")
+  cache = true
+}
+
+task "fmt" {
+  about = "Format the code"
+  steps = [run("cargo", "fmt")]
+}
