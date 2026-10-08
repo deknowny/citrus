@@ -389,6 +389,26 @@ fn observe_kubernetes(
     })
 }
 
+/// The release a declared environment runs now (its record annotation), or
+/// None when the environment is not declared, records nothing or cannot be read.
+pub fn running_release(context: &Context, name: &str) -> Option<String> {
+    let environments = environments(context).ok()?;
+    let environment = environments.get(name)?;
+    let record = &environment.record;
+    if record.annotation.is_empty() {
+        return None;
+    }
+    let observed = observe(environment).ok()?;
+    let holder = if record.workload.is_empty() {
+        observed.first()
+    } else {
+        observed
+            .iter()
+            .find(|item| item.workload == record.workload)
+    }?;
+    holder.annotations.get(&record.annotation).cloned()
+}
+
 /// The commit of the running release, and how it was found.
 fn running_commit(
     context: &Context,

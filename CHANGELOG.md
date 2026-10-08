@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A release continues from the version its environment runs when Citrus can
+  read it (the record annotation), not only from releases Citrus made: units
+  released by other means no longer restart at `initial`.
+
 - `citrus version reserve <start> --scope a,b` holds a release version for
   the committed source and prints it; `check`, `source` and `list` read
   them. The project's `free_version = run(...)` hook skips versions

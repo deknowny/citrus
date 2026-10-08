@@ -1195,6 +1195,55 @@ JSON
 "#;
 
 #[test]
+fn a_release_continues_from_what_the_environment_runs() {
+    let project = Project::new("");
+    project.declare(
+        r#"
+artifact api {
+  inputs = ["src/**"]
+}
+
+environment prod = kubernetes(kubectl: "./kubectl.sh", namespace: "shop") {
+  record = { annotation: "example.com/release" }
+  deploy api = api
+}
+
+release api {
+  environment = prod
+  checks = none
+  version {
+    initial = "0.1.0"
+  }
+  step deploy = run("true")
+}
+"#,
+    );
+    project.write("kubectl.sh", KUBECTL);
+    let mut perms = fs::metadata(project.root().join("kubectl.sh"))
+        .unwrap()
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(project.root().join("kubectl.sh"), perms).unwrap();
+    // Released by other means: Citrus has no history of it.
+    project.write(".citrus-release", "1.4.2");
+    project.write(".gitignore", ".scratch/\n.citrus-release\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "release",
+    ]);
+    let (plan, code) = project.json(&["release", "start", "api", "--dry-run"]);
+    assert_eq!(code, 0, "{plan}");
+    assert_eq!(plan["dry_run"]["previous"], "1.4.2", "{plan}");
+    assert_eq!(plan["dry_run"]["next_version"], "1.4.3", "{plan}");
+}
+
+#[test]
 fn diff_compares_what_runs_with_what_head_would_build() {
     let project = Project::new("");
     project.declare(

@@ -177,11 +177,7 @@ pub fn dry_run(
     let clean = repo
         .git(&["status", "--porcelain", "--untracked-files=no"])?
         .is_empty();
-    let previous = context
-        .store
-        .last_passed_release(unit_name)?
-        .map(|release| release.version)
-        .unwrap_or_default();
+    let previous = previous_version(context, unit_name, unit)?;
     let next = match (given, &unit.version) {
         (Some(version), _) => version.to_owned(),
         (None, Some(spec)) if previous.is_empty() => spec.initial.clone(),
@@ -227,6 +223,19 @@ pub fn dry_run(
         "clean": clean, "checks_gate": unit.checks, "checks_needed": needed,
         "previous": previous, "next_version": next, "steps": commands,
     }))
+}
+
+/// The version the environment runs now when Citrus can see it (releases
+/// may also be made by other means), otherwise the last release Citrus passed.
+fn previous_version(context: &Context, unit_name: &str, unit: &Unit) -> Result<String> {
+    if let Some(running) = crate::deploy::running_release(context, &unit.environment) {
+        return Ok(running);
+    }
+    Ok(context
+        .store
+        .last_passed_release(unit_name)?
+        .map(|release| release.version)
+        .unwrap_or_default())
 }
 
 /// Validate the gates, reserve the version and start the release worker.
@@ -311,10 +320,7 @@ pub fn start(context: &mut Context, request: &Start) -> Result<Release> {
     } else {
         (
             request.version.clone().unwrap_or_default(),
-            previous_release
-                .as_ref()
-                .map(|release| release.version.clone())
-                .unwrap_or_default(),
+            previous_version(context, &request.unit, unit)?,
         )
     };
     if request.version.is_none() && unit.version.is_none() && !request.rollback {
