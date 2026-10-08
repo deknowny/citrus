@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::lang::{Error, Sources, Span};
 
 /// One unit of work Citrus executes, with where it was declared.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Step {
     pub span: Span,
     /// Human label, e.g. `make test-api` or `wait.tcp localhost:5432`.

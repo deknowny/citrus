@@ -31,6 +31,8 @@ pub struct Request {
     pub mode: Mode,
     pub key: Option<String>,
     pub force: bool,
+    /// Checks run at once locally.
+    pub jobs: usize,
 }
 
 #[derive(Debug)]
@@ -340,6 +342,10 @@ impl Context {
         if pending.is_empty() {
             return Ok(run);
         }
+        if request.jobs > 1 {
+            self.store
+                .set_fact(&format!("jobs:{id}"), &request.jobs.to_string())?;
+        }
         let output = OpenOptions::new().create(true).append(true).open(&log)?;
         let pid = self
             .spawn_detached(&["worker", &id], output)
@@ -454,8 +460,15 @@ impl Context {
         let run = self.store.run(id)?.context("unknown run")?;
         self.store.set_state(id, "running")?;
         let targets = self.store.targets(id)?;
+        let jobs: usize = self
+            .store
+            .fact(&format!("jobs:{id}"))?
+            .and_then(|(value, _)| value.parse().ok())
+            .unwrap_or(1);
         let passed = if run.mode == "remote" {
             self.work_remote(&run, &targets)?
+        } else if jobs > 1 {
+            self.work_parallel(&run, &targets, jobs)?
         } else {
             self.work_local(&run, &targets)?
         };
@@ -624,6 +637,247 @@ impl Context {
             current.first_error =
                 Some(format!("no check `{}` in the configuration", target.target));
             self.store.update_target(&run.id, &current)?;
+        }
+        Ok(passed)
+    }
+
+    /// Up to `jobs` checks at once, each in its own `citrus exec-steps`
+    /// process writing its own log; the run log gets each check's output whole,
+    /// between its START and result lines, when it ends. Services start once,
+    /// before any check; a service's `limit` caps the checks using it at once.
+    fn work_parallel(&self, run: &Run, targets: &[RunTarget], jobs: usize) -> Result<Vec<String>> {
+        let mut passed = Vec::new();
+        let pending: Vec<&RunTarget> = targets
+            .iter()
+            .filter(|target| target.result == "pending")
+            .collect();
+        let services: Vec<&crate::model::Service> = self
+            .project
+            .iter()
+            .flat_map(|project| &project.services)
+            .collect();
+        // Services the pending checks need, started in declaration order.
+        let mut failed_services: Vec<String> = Vec::new();
+        for service in &services {
+            let needed = pending.iter().any(|target| {
+                self.manifest
+                    .targets
+                    .get(&target.target)
+                    .is_some_and(|entry| entry.resources.contains(&service.name))
+            });
+            if !needed {
+                continue;
+            }
+            for step in service.start.iter().chain(&service.ready) {
+                println!("── {}  (service {})", step.label, service.name);
+                if crate::model::execute(step, &self.repo.root, false)? != 0 {
+                    println!("service {} did not start", service.name);
+                    failed_services.push(service.name.clone());
+                    break;
+                }
+            }
+        }
+        let tmp = self.repo.state_dir().join("tmp");
+        crate::repo::private_dir(&tmp)?;
+        struct Running {
+            target: RunTarget,
+            child: std::process::Child,
+            log: std::path::PathBuf,
+            spec: std::path::PathBuf,
+            started: u64,
+            watch: Option<std::path::PathBuf>,
+            resources: Vec<String>,
+        }
+        let mut queue: std::collections::VecDeque<&RunTarget> = pending.into_iter().collect();
+        let mut running: Vec<Running> = Vec::new();
+        let limit_of = |name: &str| {
+            services
+                .iter()
+                .find(|service| service.name == name)
+                .and_then(|service| service.limit)
+                .map(|limit| limit.max(1) as usize)
+        };
+        while !queue.is_empty() || !running.is_empty() {
+            // Start what fits: free slots, and services under their limit.
+            while running.len() < jobs {
+                let Some(position) = queue.iter().position(|target| {
+                    let resources = self
+                        .manifest
+                        .targets
+                        .get(&target.target)
+                        .map(|entry| entry.resources.clone())
+                        .unwrap_or_default();
+                    resources.iter().all(|name| {
+                        limit_of(name).is_none_or(|limit| {
+                            running
+                                .iter()
+                                .filter(|other| other.resources.contains(name))
+                                .count()
+                                < limit
+                        })
+                    })
+                }) else {
+                    break;
+                };
+                let Some(target) = queue.remove(position) else {
+                    break;
+                };
+                let mut current = target.clone();
+                let Some(entry) = self.manifest.targets.get(&target.target) else {
+                    println!("CITRUS_TARGET target={} status=START", target.target);
+                    println!(
+                        "CITRUS_TARGET target={} status=FAIL exit=127",
+                        target.target
+                    );
+                    current.result = "failed".into();
+                    current.reason = "not declared".into();
+                    current.first_error =
+                        Some(format!("no check `{}` in the configuration", target.target));
+                    self.store.update_target(&run.id, &current)?;
+                    continue;
+                };
+                if let Some(service) = entry
+                    .resources
+                    .iter()
+                    .find(|name| failed_services.contains(name))
+                {
+                    println!("CITRUS_TARGET target={} status=START", target.target);
+                    println!("service {service} did not start");
+                    println!(
+                        "CITRUS_TARGET target={} status=FAIL exit=1 seconds=0",
+                        target.target
+                    );
+                    current.result = "failed".into();
+                    current.reason = "ran".into();
+                    current.exit = Some(1);
+                    current.first_error = Some(format!("service {service} did not start"));
+                    self.store.update_target(&run.id, &current)?;
+                    continue;
+                }
+                current.result = "running".into();
+                self.store.update_target(&run.id, &current)?;
+                let stem = format!("{}-{}", run.id, target.target);
+                let watch = entry.cache.then(|| tmp.join(format!("observe-{stem}")));
+                let mut env: Vec<(String, String)> = Vec::new();
+                if let Some(watch) = &watch {
+                    let _ = fs::remove_file(watch);
+                    if let Ok(found) =
+                        crate::observe::environment(&self.repo.state_dir().join("observe"), watch)
+                    {
+                        env = found;
+                    }
+                }
+                let spec = tmp.join(format!("steps-{stem}.json"));
+                fs::write(
+                    &spec,
+                    serde_json::to_string(&serde_json::json!({
+                        "root": self.repo.root,
+                        "source": entry.source.clone().unwrap_or_else(|| "citrus.ci".into()),
+                        "steps": entry.steps,
+                        "env": env,
+                    }))?,
+                )?;
+                let log = tmp.join(format!("log-{stem}"));
+                let output = fs::File::create(&log)?;
+                let child = Command::new(std::env::current_exe()?)
+                    .args(["exec-steps"])
+                    .arg(&spec)
+                    .current_dir(&self.repo.root)
+                    .stdin(Stdio::null())
+                    .stdout(output.try_clone()?)
+                    .stderr(output)
+                    .spawn()
+                    .context("start a check process")?;
+                running.push(Running {
+                    target: current,
+                    child,
+                    log,
+                    spec,
+                    started: now(),
+                    watch,
+                    resources: entry.resources.clone(),
+                });
+            }
+            // Collect what ended, and write its output whole.
+            let mut index = 0;
+            let mut ended = false;
+            while index < running.len() {
+                let Some(status) = running[index].child.try_wait()? else {
+                    index += 1;
+                    continue;
+                };
+                ended = true;
+                let done = running.remove(index);
+                let code = i64::from(status.code().unwrap_or(-1));
+                let mut current = done.target;
+                let output = fs::read_to_string(&done.log).unwrap_or_default();
+                let _ = fs::remove_file(&done.log);
+                let _ = fs::remove_file(&done.spec);
+                current.seconds = Some((now() - done.started) as i64);
+                current.exit = Some(code);
+                println!("CITRUS_TARGET target={} status=START", current.target);
+                print!("{output}");
+                if !output.is_empty() && !output.ends_with('\n') {
+                    println!();
+                }
+                println!(
+                    "CITRUS_TARGET target={} status={} exit={code} seconds={}",
+                    current.target,
+                    if code == 0 { "PASS" } else { "FAIL" },
+                    current.seconds.unwrap_or_default()
+                );
+                let mut outside = Vec::new();
+                if let (Some(watch), Some(entry)) =
+                    (&done.watch, self.manifest.targets.get(&current.target))
+                {
+                    let read = crate::observe::in_repository(
+                        crate::observe::read(watch, &self.repo.root),
+                        &self.repo.files()?,
+                    );
+                    let globs: Vec<String> = entry
+                        .inputs
+                        .iter()
+                        .chain(&entry.extra_inputs)
+                        .chain(&self.repo.config.toolchain_files)
+                        .cloned()
+                        .collect();
+                    if let Ok(inputs) = crate::manifest::GlobList::new(&globs) {
+                        outside = crate::observe::outside(&read, &inputs);
+                    }
+                    let _ = fs::remove_file(watch);
+                }
+                if code == 0 {
+                    current.result = "passed".into();
+                    current.reason = "ran".into();
+                    if outside.is_empty() {
+                        self.record_inputs(run, &current.target)?;
+                    } else {
+                        let shown: Vec<&str> = outside.iter().take(5).map(String::as_str).collect();
+                        println!(
+                            "CITRUS_NOTE {} read {}{} outside its inputs; this pass is not reused (add them to #[reads])",
+                            current.target,
+                            shown.join(", "),
+                            if outside.len() > shown.len() {
+                                ", …"
+                            } else {
+                                ""
+                            }
+                        );
+                        current.reason =
+                            format!("ran; read outside its inputs: {}", shown.join(", "));
+                    }
+                    passed.push(current.target.clone());
+                } else {
+                    current.result = "failed".into();
+                    current.reason = "ran".into();
+                    let lines: Vec<String> = output.lines().map(str::to_owned).collect();
+                    current.first_error = report::first_error(&lines);
+                }
+                self.store.update_target(&run.id, &current)?;
+            }
+            if !ended {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
         Ok(passed)
     }
@@ -963,6 +1217,27 @@ pub fn failure_segment(lines: &[String], target: &str, prefixes: &[String]) -> V
 }
 
 /// Log lines of one target: from its START marker to its result marker.
+/// `citrus exec-steps <file>`: run one check's steps (written by a parallel
+/// worker) in order, with the given environment; exit with the first failure.
+pub fn exec_steps(file: &std::path::Path) -> Result<i32> {
+    #[derive(serde::Deserialize)]
+    struct Spec {
+        root: std::path::PathBuf,
+        source: String,
+        steps: Vec<crate::model::Step>,
+        env: Vec<(String, String)>,
+    }
+    let spec: Spec = serde_json::from_str(&fs::read_to_string(file)?)?;
+    for step in &spec.steps {
+        println!("── {}  ({})", step.label, spec.source);
+        let code = crate::model::execute_env(step, &spec.root, false, &spec.env)?;
+        if code != 0 {
+            return Ok(code);
+        }
+    }
+    Ok(0)
+}
+
 pub fn segment(lines: &[String], target: &str, prefixes: &[String]) -> Vec<String> {
     let markers: Vec<String> = std::iter::once("CITRUS_TARGET")
         .chain(prefixes.iter().map(String::as_str))

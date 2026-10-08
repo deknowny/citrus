@@ -3733,3 +3733,99 @@ check machinery {
     );
     assert_eq!(plan("api/a.txt\n"), serde_json::json!(["api"]));
 }
+
+#[test]
+fn checks_run_in_parallel_with_their_output_whole() {
+    let project = Project::v2(
+        r#"#![citrus(2)]
+
+/// One browser at a time.
+#[limit(1)]
+service browser;
+
+#[paths("src/**")]
+group slow {
+    check a {
+        run!("sh -c 'echo a-begins; sleep 2; echo a-ends'")?;
+    }
+
+    check b {
+        run!("sh -c 'echo b-begins; sleep 2; echo b-ends'")?;
+    }
+
+    check c {
+        run!("sh -c 'echo c-begins; sleep 2; echo AssertionError: c broke; exit 3'")?;
+    }
+
+    #[needs(browser)]
+    check e2e_one {
+        run!("sh -c 'date +%s > e2e-one; sleep 1; date +%s >> e2e-one'")?;
+    }
+
+    #[needs(browser)]
+    check e2e_two {
+        run!("sh -c 'date +%s > e2e-two; sleep 1; date +%s >> e2e-two'")?;
+    }
+}
+"#,
+    );
+    let started = std::time::Instant::now();
+    let (run, code) = project.json(&[
+        "run", "--local", "--jobs", "5", "slow.a", "slow.b", "slow.c",
+    ]);
+    let elapsed = started.elapsed();
+    assert_eq!(code, 1, "{run}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(5500),
+        "{elapsed:?}: {run}"
+    );
+    assert_eq!(target(&run, "slow.a")["result"], "passed", "{run}");
+    assert_eq!(target(&run, "slow.c")["result"], "failed", "{run}");
+    assert!(
+        target(&run, "slow.c")["first_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("AssertionError: c broke"),
+        "{run}"
+    );
+    // Each check's output stays between its own markers.
+    let log = fs::read_to_string(run["run"]["log"].as_str().unwrap()).unwrap();
+    for name in ["a", "b"] {
+        let start = log
+            .find(&format!("CITRUS_TARGET target=slow.{name} status=START"))
+            .unwrap();
+        let end = log
+            .find(&format!("CITRUS_TARGET target=slow.{name} status=PASS"))
+            .unwrap();
+        let segment = &log[start..end];
+        assert!(
+            segment.contains(&format!("{name}-begins"))
+                && segment.contains(&format!("{name}-ends")),
+            "{log}"
+        );
+        let other = if name == "a" { "b" } else { "a" };
+        assert!(!segment.contains(&format!("{other}-begins")), "{log}");
+    }
+    // A service's limit keeps its checks apart.
+    let (run, code) = project.json(&[
+        "run",
+        "--local",
+        "--jobs",
+        "4",
+        "slow.e2e-one",
+        "slow.e2e-two",
+    ]);
+    assert_eq!(code, 0, "{run}");
+    let times = |file: &str| -> Vec<u64> {
+        fs::read_to_string(project.root().join(file))
+            .unwrap()
+            .lines()
+            .map(|line| line.trim().parse().unwrap())
+            .collect()
+    };
+    let (one, two) = (times("e2e-one"), times("e2e-two"));
+    assert!(
+        one[1] <= two[0] || two[1] <= one[0],
+        "overlapped: {one:?} {two:?}"
+    );
+}

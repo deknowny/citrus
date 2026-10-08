@@ -98,6 +98,9 @@ enum Command {
         /// Run even if a proven result exists.
         #[arg(long)]
         force: bool,
+        /// Checks run at once on this machine (default: CITRUS_JOBS, else 1).
+        #[arg(long)]
+        jobs: Option<usize>,
     },
     /// Wait for a run (id, unique prefix or `last`) and print its result.
     Wait { run: String },
@@ -245,6 +248,9 @@ enum Command {
     },
     #[command(hide = true)]
     Worker { run: String },
+    /// Runs one check's steps (a JSON file) for a parallel worker.
+    #[command(hide = true)]
+    ExecSteps { file: std::path::PathBuf },
     #[command(hide = true)]
     ReleaseWorker { release: String },
     #[command(hide = true)]
@@ -390,6 +396,10 @@ fn dashed(command: Option<Command>) -> Option<Command> {
 }
 
 fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Result<i32> {
+    // A parallel worker's child needs no configuration: its steps are given.
+    if let Some(Command::ExecSteps { file }) = &command {
+        return exec::exec_steps(file);
+    }
     let command = dashed(command);
     let mut context = Context::open(profile)?;
     let Some(command) = command else {
@@ -408,7 +418,16 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             key,
             detach,
             force,
+            jobs,
         } => {
+            let jobs = jobs
+                .or_else(|| {
+                    std::env::var("CITRUS_JOBS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap_or(1)
+                .max(1);
             let mode = if local {
                 Mode::Local
             } else if remote {
@@ -422,6 +441,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
                 mode,
                 key,
                 force,
+                jobs,
             })?;
             if detach || run.finished() {
                 return emit_run(&context, &run, json);
@@ -681,6 +701,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             }
             Ok(if failed { 1 } else { 0 })
         }
+        Command::ExecSteps { .. } => unreachable!("handled before the configuration loads"),
         Command::Worker { run } => {
             context.work(&run)?;
             Ok(0)
@@ -1575,6 +1596,7 @@ fn integrate_command(
                 mode: Mode::Auto,
                 key: None,
                 force: false,
+                jobs: 1,
             })?;
             let run = if run.finished() {
                 run

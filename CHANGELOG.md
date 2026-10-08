@@ -18,6 +18,9 @@ Breaking: a new configuration language (docs/design/language.md). Every
   packages it builds, and a misspelled subcommand or package is an error.
 - Outside the language names use `-` for `_` (`test_db` → `test-db`),
   like Cargo crate names; the command line takes either.
+- `citrus run --jobs N` (or `CITRUS_JOBS`) runs up to N checks at once, each
+  in its own process; services start once, `#[limit(n)]` caps the checks
+  using a service, and each check's output reaches the log whole.
 - A failed check's first error starts with what its tools reported: failed
   Rust tests and where they panicked, rustc/clippy errors with their place,
   failed unittest/pytest/node tests.

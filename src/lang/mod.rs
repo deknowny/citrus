@@ -19,7 +19,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// A byte range in one of the loaded files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub file: usize,
     pub start: usize,

@@ -48,7 +48,7 @@ their results shared, reusable and short.
 | Command | |
 |---|---|
 | `citrus status` | What the current changes need, what is already proven, what runs right now (all worktrees), shared builders |
-| `citrus run [targets…]` | Run only what is not proven; `--remote` uses your runner; `--detach` returns at once; the same sources join a run already in progress |
+| `citrus run [targets…]` | Run only what is not proven; `--jobs N` runs N checks at once (each check's output stays whole in the log, a service's `#[limit]` caps its checks); `--remote` uses your runner; `--detach` returns at once; the same sources join a run already in progress |
 | `citrus wait <run>` / `show` | Follow a run after a lost terminal or a new agent session; a vanished process becomes `unknown`, not “running forever” |
 | `citrus log <run>` | First error of each failed target; `--target`, `--full` when needed |
 | `citrus why <target>` | Why it is needed, and which inputs changed since its last pass |
