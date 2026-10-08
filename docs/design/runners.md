@@ -45,6 +45,13 @@ start.
   own path and the machine's cache for the repository at `/citrus-cache`
   (`CITRUS_POOL_CACHE`), so the image can point Cargo, pnpm and others there. An agent without
   Docker runs natively and only takes checks that need nothing more.
+- **What a snapshot leaves out, a machine brings.** `#![private(...)]` paths
+  never travel. Each machine can keep its own copies (local test credentials)
+  under `~/.config/citrus/files/<repository>/` (or `CITRUS_AGENT_FILES`); the
+  agent copies them into every tree of that repository.
+- **`#![prepare(cmd!("…"))]` runs in the tree before the checks**, inside
+  the image, with `CITRUS_POOL_RUN` set to the run id so per-run resources
+  (Compose projects, ports) do not collide on a shared machine.
 - **The executor is the requester's Citrus version.** Agents keep a cache of
   Citrus binaries by commit (built or downloaded as `bin/citrus` does) and run
   the job with the matching one; for a container, the Linux build of it.
@@ -63,6 +70,7 @@ citrus agent [--share N] [--labels a,b] [--name NAME]   # join the pool
 citrus pool                     # agents, their load, queued and running checks
 citrus pool drain NAME          # finish current checks, take no more
 citrus run --remote             # through the pool when one is configured
+                                # (CITRUS_REMOTE=runner: the declared runner script)
 ```
 
 `citrus status` shows pool state; no consumer status script is needed (#7).

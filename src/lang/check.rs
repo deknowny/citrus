@@ -584,6 +584,7 @@ const CONFIG: &[&str] = &[
     "runner",
     "image",
     "private",
+    "prepare",
     "command",
     "citrus",
     "tool",

@@ -9,6 +9,16 @@ use std::process::{Child, Command, Output, Stdio};
 use serde_json::Value;
 
 const CONFIG: &str = r#"#![citrus(2)]
+#![private("secret.txt")]
+#![prepare(cmd!("sh prep.sh"))]
+
+/// The machine's own secret.txt arrived, the requester's did not, and
+/// #![prepare] ran in the tree first.
+#[paths("src/**")]
+check prepared {
+    run!("grep -q machine prepared.txt")?;
+    run!("test -n $CITRUS_POOL_RUN")?;
+}
 
 /// Sees the requester's uncommitted change.
 #[paths("src/**")]
@@ -50,6 +60,13 @@ fn citrus(dir: &Path, pool: &str, cache: &Path, args: &[&str]) -> Command {
         .env("CITRUS_POOL", pool)
         .env("CITRUS_POOL_EXECUTOR", "self")
         .env("CITRUS_AGENT_CACHE", cache)
+        .env(
+            "CITRUS_AGENT_FILES",
+            cache
+                .ancestors()
+                .find(|dir| dir.join("files").is_dir())
+                .map_or_else(|| cache.join("files"), |dir| dir.join("files")),
+        )
         .env("CITRUS_AGENT", "test")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLAUDECODE");
@@ -125,6 +142,8 @@ fn checks_run_on_the_agents_that_fit_them() {
     fs::write(project.join("citrus.ci"), CONFIG).unwrap();
     fs::write(project.join("src/a.txt"), "one\n").unwrap();
     fs::write(project.join("other/x"), "x\n").unwrap();
+    fs::write(project.join("prep.sh"), "cp secret.txt prepared.txt\n").unwrap();
+    fs::write(project.join(".gitignore"), "secret.txt\nprepared.txt\n").unwrap();
     git(&project, &["init", "-q", "-b", "main"]);
     git(&project, &["add", "-A"]);
     git(
@@ -149,6 +168,15 @@ fn checks_run_on_the_agents_that_fit_them() {
     );
     git(&project, &["push", "-q", "-u", "origin", "main"]);
 
+    // The requester's secret stays here; agents bring their own.
+    fs::write(project.join("secret.txt"), "requester\n").unwrap();
+    git(
+        &project,
+        &["rm", "-q", "--cached", "--ignore-unmatch", "secret.txt"],
+    );
+    let files = work.path().join("files/origin");
+    fs::create_dir_all(&files).unwrap();
+    fs::write(files.join("secret.txt"), "machine\n").unwrap();
     // Uncommitted and untracked changes travel with the run.
     fs::write(project.join("src/a.txt"), "changed\n").unwrap();
     fs::write(project.join("src/new.txt"), "new\n").unwrap();
@@ -171,6 +199,7 @@ fn checks_run_on_the_agents_that_fit_them() {
     assert_eq!(output.status.code(), Some(1), "{run}");
     assert_eq!(result(&run, "seen")["result"], "passed", "{run}");
     assert_eq!(result(&run, "special")["result"], "passed", "{run}");
+    assert_eq!(result(&run, "prepared")["result"], "passed", "{run}");
     assert_eq!(result(&run, "broken")["result"], "failed", "{run}");
     assert!(
         result(&run, "broken")["first_error"]

@@ -149,6 +149,7 @@ fn migrate(client: &mut Client) -> Result<()> {
         );
         -- Readers follow by transaction, not by id: an id taken by a
         -- transaction that commits later would otherwise be skipped.
+        alter table citrus.runs add column if not exists prepare text[] not null default '{}';
         alter table citrus.events add column if not exists tx xid8 not null default pg_current_xact_id();
         create index if not exists events_by_run on citrus.events (run, id);
         create index if not exists jobs_queued on citrus.jobs (state) where state = 'queued';
@@ -236,10 +237,20 @@ pub fn snapshot(repo: &crate::repo::Repo, run: &str) -> Result<(String, String, 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     };
     let head = git(&["rev-parse", "--verify", "-q", "HEAD"]).ok();
-    match &head {
-        Some(_) => git(&["read-tree", "HEAD"])?,
-        None => git(&["read-tree", "--empty"])?,
-    };
+    // A copy of the worktree's index keeps its stat data: `git add -A` then
+    // hashes only what changed, not every file.
+    let current = repo.git(&["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    let copied = current
+        .ok()
+        .map(|path| PathBuf::from(path.trim()))
+        .filter(|path| path.is_file())
+        .is_some_and(|path| std::fs::copy(path, &index).is_ok());
+    if !copied {
+        match &head {
+            Some(_) => git(&["read-tree", "HEAD"])?,
+            None => git(&["read-tree", "--empty"])?,
+        };
+    }
     git(&["add", "-A", "--", "."])?;
     let private: Vec<String> = repo
         .config
@@ -323,12 +334,13 @@ pub fn run(
         .map(serde_json::to_value)
         .transpose()?;
     let profile = context.repo.config.plan.profile.clone().unwrap_or_default();
+    let prepare = context.repo.config.run.prepare.clone();
     {
         let mut tx = client.transaction()?;
         tx.execute(
-            "insert into citrus.runs (id, repo, commit_sha, ref_name, version, profile, image, requester)
-             values ($1, $2, $3, $4, $5, $6, $7, $8)",
-            &[&id, &repo, &commit, &refname, &VERSION, &profile, &image, &crate::exec::agent()],
+            "insert into citrus.runs (id, repo, commit_sha, ref_name, version, profile, image, requester, prepare)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[&id, &repo, &commit, &refname, &VERSION, &profile, &image, &crate::exec::agent(), &prepare],
         )?;
         for check in checks {
             let needs = context
@@ -825,6 +837,7 @@ struct RunRow {
     version: String,
     profile: String,
     image: Option<crate::model::Image>,
+    prepare: Vec<String>,
 }
 
 /// Take up to `slots` checks of the oldest run this machine can run.
@@ -862,7 +875,7 @@ fn claim(client: &mut Client, machine: &Machine) -> Result<Option<(RunRow, Vec<S
     let mut checks: Vec<String> = rows.iter().map(|row| row.get(1)).collect();
     checks.sort();
     let row = client.query_one(
-        "select id, repo, commit_sha, ref_name, version, profile, image from citrus.runs where id = $1",
+        "select id, repo, commit_sha, ref_name, version, profile, image, prepare from citrus.runs where id = $1",
         &[&id],
     )?;
     let image: Option<serde_json::Value> = row.get(6);
@@ -874,6 +887,7 @@ fn claim(client: &mut Client, machine: &Machine) -> Result<Option<(RunRow, Vec<S
         version: row.get(4),
         profile: row.get(5),
         image: image.map(serde_json::from_value).transpose()?,
+        prepare: row.get(7),
     };
     Ok(Some((run, checks)))
 }
@@ -954,8 +968,82 @@ fn checkout(machine: &Machine, run: &RunRow) -> Result<(PathBuf, PathBuf)> {
             &mirror,
             &["worktree", "add", "-q", "--detach", &target, &run.commit],
         )?;
+        overlay(&machine_files(&run.repo), &tree)?;
     }
     Ok((mirror, tree))
+}
+
+/// Files this machine adds to every tree of a repository (`#![private]`
+/// paths such as local test credentials): `CITRUS_AGENT_FILES/<repo>/…`,
+/// by default `~/.config/citrus/files/<repo>/…`, where <repo> is the last
+/// segment of the remote URL without `.git`.
+fn machine_files(repo: &str) -> PathBuf {
+    let name = repo
+        .trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(repo)
+        .trim_end_matches(".git")
+        .to_owned();
+    let root = std::env::var_os("CITRUS_AGENT_FILES")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()))
+                .join(".config/citrus/files")
+        });
+    root.join(name)
+}
+
+fn overlay(from: &Path, to: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        if source.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            overlay(&source, &target)?;
+        } else {
+            std::fs::copy(&source, &target)
+                .with_context(|| format!("copy {} into the tree", source.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn shell_quote(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c))
+    {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// The executor's argv, after the run's `#![prepare]` command when it has one.
+fn with_prepare(prepare: &[String], exe: &str, args: &[String]) -> Vec<String> {
+    let mut argv = Vec::new();
+    if !prepare.is_empty() {
+        let script = prepare
+            .iter()
+            .map(|word| shell_quote(word))
+            .collect::<Vec<_>>()
+            .join(" ");
+        argv.extend([
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!("{script} && exec \"$@\""),
+            "citrus-prepare".to_owned(),
+        ]);
+    }
+    argv.push(exe.to_owned());
+    argv.extend(args.iter().cloned());
+    argv
 }
 
 /// A Citrus binary of `version` for this machine, or (`linux`) for its containers.
@@ -1137,6 +1225,8 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
         ("CITRUS_AGENT".into(), format!("pool:{}", machine.name)),
         ("CITRUS_POOL".into(), String::new()),
         ("CITRUS_POOL_SHARE".into(), machine.share.to_string()),
+        // Names per-run resources (Compose projects, ports) on a shared machine.
+        ("CITRUS_POOL_RUN".into(), run.id.clone()),
         // The repository's own launcher (bin/citrus) runs this build too.
         (
             "CITRUS_BIN".into(),
@@ -1202,13 +1292,15 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
             "-e",
             "GIT_CONFIG_VALUE_0=*",
         ]);
-        command
-            .arg(image)
-            .arg("/usr/local/bin/citrus-pool")
-            .args(&args);
+        command.arg(image).args(with_prepare(
+            &run.prepare,
+            "/usr/local/bin/citrus-pool",
+            &args,
+        ));
     } else {
-        command = Command::new(&exe);
-        command.args(&args).current_dir(&tree);
+        let argv = with_prepare(&run.prepare, &exe.to_string_lossy(), &args);
+        command = Command::new(&argv[0]);
+        command.args(&argv[1..]).current_dir(&tree);
         for (key, value) in &env {
             command.env(key, value);
         }
@@ -1378,6 +1470,38 @@ fn maintain(client: &mut Client, machine: &Machine) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_runs_before_the_executor_in_one_shell() {
+        let argv = with_prepare(
+            &["python3".into(), "scripts/prep it.py".into()],
+            "/bin/citrus",
+            &["run".into(), "a".into()],
+        );
+        assert_eq!(
+            argv,
+            [
+                "sh",
+                "-c",
+                "python3 'scripts/prep it.py' && exec \"$@\"",
+                "citrus-prepare",
+                "/bin/citrus",
+                "run",
+                "a"
+            ]
+        );
+        assert_eq!(
+            with_prepare(&[], "/bin/citrus", &["run".into()]),
+            ["/bin/citrus", "run"]
+        );
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn machine_files_are_found_by_the_repository_name() {
+        assert!(machine_files("https://github.com/o/garvis-app.git").ends_with("garvis-app"));
+        assert!(machine_files("git@github.com:o/garvis-app").ends_with("garvis-app"));
+    }
 
     #[test]
     fn redacts_the_password_only() {

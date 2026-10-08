@@ -102,6 +102,8 @@ impl Project {
 
     fn citrus(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_citrus"))
+            // The machine's pool (~/.config/citrus/pool) is not the tests'.
+            .env("CITRUS_POOL", "")
             .args(args)
             .current_dir(self.root())
             .env_remove("CODEX_THREAD_ID")
@@ -728,6 +730,8 @@ fn tasks_say_what_other_worktrees_do_and_need() {
     ]);
     let citrus = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_citrus"))
+            // The machine's pool (~/.config/citrus/pool) is not the tests'.
+            .env("CITRUS_POOL", "")
             .args(args)
             .arg("--json")
             .current_dir(&other)
@@ -1047,6 +1051,8 @@ fn parallel_reservations_of_overlapping_images_get_distinct_versions() {
     let children: Vec<_> = (0..8)
         .map(|i| {
             Command::new(env!("CARGO_BIN_EXE_citrus"))
+                // The machine's pool (~/.config/citrus/pool) is not the tests'.
+                .env("CITRUS_POOL", "")
                 .args([
                     "version",
                     "reserve",
@@ -1236,6 +1242,8 @@ fn integrate_runs_the_after_merge_hook() {
 #[test]
 fn version_names_the_source_commit() {
     let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        // The machine's pool (~/.config/citrus/pool) is not the tests'.
+        .env("CITRUS_POOL", "")
         .arg("--version")
         .output()
         .unwrap();
@@ -2537,6 +2545,8 @@ group removed {
     project.commit("classify");
     project.write("paths.txt", "gone/old.sh\n");
     let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        // The machine's pool (~/.config/citrus/pool) is not the tests'.
+        .env("CITRUS_POOL", "")
         .args(["plan", "--paths-file", "paths.txt", "--json"])
         .current_dir(project.root())
         .env("CITRUS_AGENT", "test")
@@ -2554,6 +2564,8 @@ group removed {
     );
     project.write("paths.txt", "old/x\nold/keep/y\n");
     let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        // The machine's pool (~/.config/citrus/pool) is not the tests'.
+        .env("CITRUS_POOL", "")
         .args(["plan", "--paths-file", "paths.txt", "--json"])
         .current_dir(project.root())
         .output()
@@ -3834,6 +3846,8 @@ group slow {
 fn a_run_streams_its_protocol_for_an_outer_citrus() {
     let project = Project::new("");
     let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        // The machine's pool (~/.config/citrus/pool) is not the tests'.
+        .env("CITRUS_POOL", "")
         .args(["run", "ok", "--local", "--text"])
         .current_dir(project.root())
         .env("CITRUS_PROTOCOL", "1")
@@ -3896,6 +3910,8 @@ check nogit {
     ]);
     assert!(!root.join(".git").exists());
     let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        // The machine's pool (~/.config/citrus/pool) is not the tests'.
+        .env("CITRUS_POOL", "")
         .args(["run", "nogit", "--local", "--text"])
         .current_dir(root)
         .env("CITRUS_GIT_DIR", &git_dir)

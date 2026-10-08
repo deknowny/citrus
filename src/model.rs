@@ -315,6 +315,8 @@ pub struct Project {
     pub image: Option<Image>,
     /// Paths a pool snapshot never carries (`#![private(...)]`).
     pub private: Vec<String>,
+    /// Run by a pool agent in the tree before the checks (`#![prepare(cmd!(...))]`).
+    pub prepare: Vec<String>,
     pub after_merge: Vec<String>,
     pub commands: Vec<(String, String, String)>,
     pub groups: Vec<Group>,
