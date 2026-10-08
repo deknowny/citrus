@@ -528,7 +528,6 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         group: from.group.clone(),
         narrows,
         via,
-        arms: Vec::new(),
         profiles,
         covered_by: Vec::new(),
         when,

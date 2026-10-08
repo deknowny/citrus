@@ -184,7 +184,7 @@ pub fn dry_run(
         (None, Some(_)) => bump(&previous).unwrap_or_default(),
         (None, None) => String::new(),
     };
-    let plan = crate::plan::compute(repo, &mut context.manifest, None)?;
+    let plan = crate::plan::compute(repo, &context.manifest, None)?;
     let files = repo.files()?;
     let snapshot = repo.snapshot()?;
     let mut needed = Vec::new();
@@ -374,7 +374,7 @@ pub fn start(context: &mut Context, request: &Start) -> Result<Release> {
 /// Checks the plan selects for HEAD that are not proven yet.
 pub fn unproven_checks(context: &mut Context) -> Result<Vec<String>> {
     let repo = &context.repo;
-    let plan = crate::plan::compute(repo, &mut context.manifest, None)?;
+    let plan = crate::plan::compute(repo, &context.manifest, None)?;
     let files = repo.files()?;
     let snapshot = repo.snapshot()?;
     Ok(plan

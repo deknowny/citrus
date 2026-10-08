@@ -258,11 +258,10 @@ impl Context {
         if explicit && request.mode == Mode::Remote {
             bail!("--remote runs the planned set; drop the target names or use --local");
         }
-        let mut arms = std::collections::BTreeMap::new();
         let names = if explicit {
             request.targets.clone()
         } else {
-            let plan = plan::compute(&self.repo, &mut self.manifest, request.base.as_deref())?;
+            let plan = plan::compute(&self.repo, &self.manifest, request.base.as_deref())?;
             // The planner itself says it cannot tell what these changes need.
             if plan.status == "incomplete" && !plan.unmapped.is_empty() {
                 let shown: Vec<&str> = plan.unmapped.iter().take(5).map(String::as_str).collect();
@@ -277,7 +276,6 @@ impl Context {
                     }
                 );
             }
-            arms = plan.arms.clone();
             plan.targets
         };
         let files = self.repo.files()?;
@@ -341,11 +339,6 @@ impl Context {
         self.store.insert_run(&run, &decisions)?;
         if pending.is_empty() {
             return Ok(run);
-        }
-        // The worker runs the `match changed` arms this plan chose.
-        if !arms.is_empty() {
-            self.store
-                .set_fact(&format!("arms:{id}"), &serde_json::to_string(&arms)?)?;
         }
         let output = OpenOptions::new().create(true).append(true).open(&log)?;
         let pid = self
@@ -459,9 +452,6 @@ impl Context {
     /// Runs inside the detached worker process; stdout and stderr are the run log.
     pub fn work(&mut self, id: &str) -> Result<()> {
         let run = self.store.run(id)?.context("unknown run")?;
-        if let Some((arms, _)) = self.store.fact(&format!("arms:{id}"))? {
-            self.manifest.choose_arms(&serde_json::from_str(&arms)?);
-        }
         self.store.set_state(id, "running")?;
         let targets = self.store.targets(id)?;
         let passed = if run.mode == "remote" {

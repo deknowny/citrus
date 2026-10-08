@@ -27,16 +27,12 @@ pub struct Plan {
     pub signals: Vec<String>,
     /// Labels whose condition holds.
     pub labels: Vec<String>,
-    /// `match changed` arm chosen for a check (its index); absent: `_`.
-    pub arms: BTreeMap<String, usize>,
 }
 
-/// The plan for the changes since `base`; `manifest` takes the `match
-/// changed` arms it chose, so fingerprints and runs follow them.
-pub fn compute(repo: &Repo, manifest: &mut Manifest, base: Option<&str>) -> Result<Plan> {
+/// The plan for the changes since `base`.
+pub fn compute(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<Plan> {
     let mut plan = compute_all(repo, manifest, base)?;
     narrow(&mut plan, repo, manifest);
-    manifest.choose_arms(&plan.arms);
     Ok(plan)
 }
 
@@ -123,13 +119,12 @@ fn edited_checks(repo: &Repo, manifest: &Manifest, before: &str) -> Vec<String> 
 /// revision those changes start from (for manifest edits).
 pub fn for_paths(
     repo: &Repo,
-    manifest: &mut Manifest,
+    manifest: &Manifest,
     paths: &[String],
     before: &str,
 ) -> Result<Plan> {
     let mut plan = for_paths_all(repo, manifest, paths, before)?;
     narrow(&mut plan, repo, manifest);
-    manifest.choose_arms(&plan.arms);
     Ok(plan)
 }
 
@@ -392,18 +387,6 @@ fn select(
             selected.retain(|name| !target.replaces.contains(name));
         } else {
             selected.retain(|name| *name != target.name);
-        }
-    }
-    for name in &selected {
-        let Some(target) = manifest.targets.get(name) else {
-            continue;
-        };
-        if let Some(index) = target
-            .arms
-            .iter()
-            .position(|(when, _)| facts.holds(when, &selected))
-        {
-            plan.arms.insert(name.clone(), index);
         }
     }
     plan.targets = selected;

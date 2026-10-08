@@ -35,8 +35,6 @@ pub struct Target {
     pub narrows: bool,
     /// Groups whose paths select it too.
     pub via: Vec<String>,
-    /// `match changed` arms; a plan picks one (or none: `steps`).
-    pub arms: Vec<(crate::model::Cond, Vec<crate::model::Step>)>,
     /// `file:line` of the declaration in `citrus.ci`.
     pub source: Option<String>,
     /// Profiles it belongs to; empty: all.
@@ -93,7 +91,6 @@ impl Target {
             extensions: check.meta.clone(),
             env: check.env.iter().cloned().collect(),
             steps: check.steps.clone(),
-            arms: check.arms.clone(),
             group: check.group.clone(),
             narrows: check.narrows,
             via: check.via.clone(),
@@ -109,20 +106,7 @@ impl Target {
 
     /// Same inputs, cache and resources: a reformatted entry is not a new check.
     pub fn same_declaration(&self, other: &Target) -> bool {
-        let arms = |target: &Target| -> Vec<Vec<Vec<String>>> {
-            target
-                .arms
-                .iter()
-                .map(|(_, steps)| steps.iter().map(|step| step.work.canonical()).collect())
-                .collect()
-        };
         self.declaration() == other.declaration()
-            && arms(self) == arms(other)
-            && self
-                .arms
-                .iter()
-                .map(|(when, _)| when)
-                .eq(other.arms.iter().map(|(when, _)| when))
             && self.cache == other.cache
             && self.resources == other.resources
             && self.extensions == other.extensions
@@ -176,18 +160,6 @@ impl PathGroup {
 }
 
 impl Manifest {
-    /// Each listed check runs its chosen `match changed` arm; the others keep `_`.
-    pub fn choose_arms(&mut self, arms: &BTreeMap<String, usize>) {
-        for (name, index) in arms {
-            if let Some(target) = self.targets.get_mut(name)
-                && let Some((_, steps)) = target.arms.get(*index)
-            {
-                target.steps = steps.clone();
-                target.arms.clear();
-            }
-        }
-    }
-
     /// The checks of a compiled `citrus.ci`.
     pub fn from_project(
         project: &crate::model::Project,
@@ -239,11 +211,6 @@ impl Manifest {
                     "when": target.when,
                     "source": target.source,
                     "declaration": target.declaration(),
-                    // `match changed` arms: what the check runs when each holds.
-                    "arms": target.arms.iter().map(|(when, steps)| serde_json::json!({
-                        "when": when,
-                        "run": steps.iter().map(|step| step.work.canonical()).collect::<Vec<_>>(),
-                    })).collect::<Vec<_>>(),
                 })
             })
             .collect();

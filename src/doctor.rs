@@ -88,7 +88,6 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
                 let rules = target
                     .steps
                     .iter()
-                    .chain(target.arms.iter().flat_map(|(_, steps)| steps))
                     .filter_map(|step| match &step.work {
                         crate::model::Work::Process { argv, .. }
                             if argv.first().map(String::as_str) == Some("make") =>
@@ -145,7 +144,7 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
         }
     }
 
-    match plan::compute(&context.repo, &mut context.manifest, None) {
+    match plan::compute(&context.repo, &context.manifest, None) {
         Ok(plan) => note(
             "planner",
             if plan.unmapped.is_empty() {

@@ -228,8 +228,6 @@ pub struct Check {
     pub narrows: bool,
     /// Groups whose paths select it too (`paths = [platform, …]`).
     pub via: Vec<String>,
-    /// `match changed` arms: the first whose condition holds replaces `steps`.
-    pub arms: Vec<(Cond, Vec<Step>)>,
     /// Profiles the check belongs to; empty: every profile.
     pub profiles: Vec<String>,
     /// Checks that already run this one: with one of them in a plan, this one is dropped.

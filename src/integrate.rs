@@ -121,7 +121,7 @@ pub fn carry(
 ) -> Result<()> {
     let selected = match plan::for_paths(
         &context.repo,
-        &mut context.manifest,
+        &context.manifest,
         &result.incoming_paths,
         before,
     ) {
@@ -145,7 +145,7 @@ pub fn carry(
         }
     };
     let snapshot_after = context.repo.snapshot()?;
-    let current = plan::compute(&context.repo, &mut context.manifest, None)?;
+    let current = plan::compute(&context.repo, &context.manifest, None)?;
     for target in &current.targets {
         // Declared cached checks follow their input fingerprint; nothing to carry.
         if context

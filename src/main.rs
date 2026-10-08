@@ -789,7 +789,7 @@ fn emit_run(context: &Context, run: &Run, json: bool) -> Result<i32> {
 }
 
 fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> {
-    let plan = plan::compute(&context.repo, &mut context.manifest, base)?;
+    let plan = plan::compute(&context.repo, &context.manifest, base)?;
     let files = context.repo.files()?;
     let snapshot = context.repo.snapshot()?;
     let decisions = plan
@@ -1018,7 +1018,7 @@ fn plan_command(
     json: bool,
 ) -> Result<i32> {
     let plan = match paths_file {
-        None => plan::compute(&context.repo, &mut context.manifest, base)?,
+        None => plan::compute(&context.repo, &context.manifest, base)?,
         Some(file) => {
             let text = if file == "-" {
                 std::io::read_to_string(std::io::stdin())?
@@ -1038,7 +1038,7 @@ fn plan_command(
                 .repo
                 .git(&["merge-base", &base, "HEAD"])
                 .unwrap_or_default();
-            plan::for_paths(&context.repo, &mut context.manifest, &paths, &before)?
+            plan::for_paths(&context.repo, &context.manifest, &paths, &before)?
         }
     };
     let files = context.repo.files()?;
@@ -1049,7 +1049,7 @@ fn plan_command(
         .map(|name| context.decide(&files, &snapshot, name, false))
         .collect::<Result<Vec<_>>>()?;
     if json {
-        // What each planned check runs, with its `match changed` arm chosen.
+        // What each planned check runs.
         let runs: serde_json::Map<String, serde_json::Value> = plan
             .targets
             .iter()
@@ -1147,7 +1147,7 @@ fn log(context: &Context, reference: &str, target: Option<&str>, full: bool) -> 
 }
 
 fn why(context: &mut Context, target: &str, base: Option<&str>, json: bool) -> Result<i32> {
-    let plan = plan::compute(&context.repo, &mut context.manifest, base)?;
+    let plan = plan::compute(&context.repo, &context.manifest, base)?;
     let files = context.repo.files()?;
     let snapshot = context.repo.snapshot()?;
     let decision = context.decide(&files, &snapshot, target, false)?;
@@ -1316,7 +1316,7 @@ fn print_next(next: &[String]) {
 
 /// `citrus` alone: where things stand and what can be done here.
 fn overview(context: &mut Context, json: bool) -> Result<i32> {
-    let plan = plan::compute(&context.repo, &mut context.manifest, None).ok();
+    let plan = plan::compute(&context.repo, &context.manifest, None).ok();
     let (mut needed, mut proven) = (0, 0);
     if let Some(plan) = &plan {
         let files = context.repo.files()?;
