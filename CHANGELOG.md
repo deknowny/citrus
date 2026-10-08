@@ -18,6 +18,8 @@ Breaking: a new configuration language (docs/design/language.md). Every
   packages it builds, and a misspelled subcommand or package is an error.
 - Outside the language names use `-` for `_` (`test_db` → `test-db`),
   like Cargo crate names; the command line takes either.
+- `citrus run --paths-file FILE` plans for exactly those changed paths (a
+  release's diff); the runner gets them as `CITRUS_PATHS`.
 - A service's `stop { … }` runs when the run is over, whatever its result.
 - `CITRUS_GIT_DIR`: Citrus reads a snapshot's repository kept outside the
   tree (a builder's copy), while the checks' programs see no Git checkout.

@@ -3953,3 +3953,31 @@ group db {
         assert_eq!(log, "started\nstopped\n", "jobs {jobs}: {run}");
     }
 }
+
+#[test]
+fn a_run_plans_for_given_paths_and_tells_the_runner() {
+    let project = Project::new(
+        r#"#![runner(cmd!("sh pool.sh"))]
+"#,
+    );
+    project.write(
+        "pool.sh",
+        "cp \"$CITRUS_PATHS\" given-paths\nfor t in $(cat \"$CITRUS_TARGETS\"); do echo \"CITRUS_TARGET target=$t status=PASS exit=0 seconds=0\"; done\n",
+    );
+    project.commit("pool");
+    project.write("paths.txt", "other/x\n");
+    // No diff with the base: the given path alone decides.
+    let (run, code) = project.json(&["run", "--paths-file", "paths.txt", "--remote"]);
+    assert_eq!(code, 0, "{run}");
+    let names: Vec<&str> = run["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["target"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["fail"], "{run}");
+    assert_eq!(
+        fs::read_to_string(project.root().join("given-paths")).unwrap(),
+        "other/x\n"
+    );
+}

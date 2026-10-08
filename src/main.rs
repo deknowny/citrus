@@ -101,6 +101,9 @@ enum Command {
         /// Checks run at once on this machine (default: CITRUS_JOBS, else 1).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Plan for exactly the changed paths in this file (one per line).
+        #[arg(long)]
+        paths_file: Option<std::path::PathBuf>,
     },
     /// Wait for a run (id, unique prefix or `last`) and print its result.
     Wait { run: String },
@@ -419,7 +422,24 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             detach,
             force,
             jobs,
+            paths_file,
         } => {
+            let paths = match &paths_file {
+                Some(file) => {
+                    let text = std::fs::read_to_string(file)
+                        .with_context(|| format!("read {}", file.display()))?;
+                    let mut paths: Vec<String> = text
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    paths.sort();
+                    paths.dedup();
+                    Some(paths)
+                }
+                None => None,
+            };
             let jobs = jobs
                 .or_else(|| {
                     std::env::var("CITRUS_JOBS")
@@ -442,6 +462,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
                 key,
                 force,
                 jobs,
+                paths,
             })?;
             if detach || run.finished() {
                 return emit_run(&context, &run, json);
@@ -1630,6 +1651,7 @@ fn integrate_command(
                 key: None,
                 force: false,
                 jobs: 1,
+                paths: None,
             })?;
             let run = if run.finished() {
                 run

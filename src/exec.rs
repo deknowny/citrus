@@ -33,6 +33,8 @@ pub struct Request {
     pub force: bool,
     /// Checks run at once locally.
     pub jobs: usize,
+    /// Plan for exactly these changed paths instead of the diff with the base.
+    pub paths: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -263,7 +265,20 @@ impl Context {
         let names = if explicit {
             request.targets.clone()
         } else {
-            let plan = plan::compute(&self.repo, &self.manifest, request.base.as_deref())?;
+            let plan = match &request.paths {
+                Some(paths) => {
+                    let base = request
+                        .base
+                        .as_deref()
+                        .unwrap_or(&self.repo.config.plan.base);
+                    let before = self
+                        .repo
+                        .git(&["merge-base", base, "HEAD"])
+                        .unwrap_or_default();
+                    plan::for_paths(&self.repo, &self.manifest, paths, &before)?
+                }
+                None => plan::compute(&self.repo, &self.manifest, request.base.as_deref())?,
+            };
             // The planner itself says it cannot tell what these changes need.
             if plan.status == "incomplete" && !plan.unmapped.is_empty() {
                 let shown: Vec<&str> = plan.unmapped.iter().take(5).map(String::as_str).collect();
@@ -345,6 +360,10 @@ impl Context {
         if request.jobs > 1 {
             self.store
                 .set_fact(&format!("jobs:{id}"), &request.jobs.to_string())?;
+        }
+        if let Some(paths) = &request.paths {
+            self.store
+                .set_fact(&format!("paths:{id}"), &serde_json::to_string(paths)?)?;
         }
         let output = OpenOptions::new().create(true).append(true).open(&log)?;
         let pid = self
@@ -955,6 +974,20 @@ impl Context {
                 .map(|target| format!("{}\n", target.target))
                 .collect::<String>(),
         )?;
+        // The changed paths a run was asked about (`--paths-file`); empty: the diff.
+        let paths_file = wanted.with_extension("paths");
+        let given: Vec<String> = self
+            .store
+            .fact(&format!("paths:{}", run.id))?
+            .and_then(|(value, _)| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        fs::write(
+            &paths_file,
+            given
+                .iter()
+                .map(|path| format!("{path}\n"))
+                .collect::<String>(),
+        )?;
         // One pipe for stdout and stderr keeps the log in order.
         let mut command = Command::new("sh");
         command
@@ -965,6 +998,7 @@ impl Context {
             .current_dir(&self.repo.root)
             .env("CITRUS_CHECKS", self.manifest.export_file(&self.repo)?)
             .env("CITRUS_TARGETS", &wanted)
+            .env("CITRUS_PATHS", &paths_file)
             .env(
                 "CITRUS_PROFILE",
                 self.repo.config.plan.profile.clone().unwrap_or_default(),
