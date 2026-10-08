@@ -2985,6 +2985,14 @@ check named {
     run!("make ok")?;
 }
 
+/// Chosen by a condition, but it says what it reads: a group's paths.
+#[when(selected(lib::unit))]
+#[reads(lib)]
+#[cache(true)]
+check reader {
+    run!("make ok")?;
+}
+
 "#,
     );
     let (targets, _) = project.json(&["targets"]);
@@ -3008,6 +3016,12 @@ check named {
         row("named")["extra_inputs"],
         serde_json::json!(["lib/**", "Makefile"]),
         "a group it names is an input: {targets}"
+    );
+    assert_eq!(row("reader")["cache"], true, "{targets}");
+    assert_eq!(
+        row("reader")["extra_inputs"],
+        serde_json::json!(["lib/**", "Makefile"]),
+        "a group it reads is an input: {targets}"
     );
 }
 

@@ -232,6 +232,9 @@ pub struct Check {
     pub narrows: bool,
     /// Groups whose paths select it too (`paths = [platform, …]`).
     pub via: Vec<String>,
+    /// Groups whose paths are read but do not select it (`#[reads(group)]`).
+    #[serde(skip)]
+    pub reads_via: Vec<String>,
     /// Profiles the check belongs to; empty: every profile.
     pub profiles: Vec<String>,
     /// Checks that already run this one: with one of them in a plan, this one is dropped.

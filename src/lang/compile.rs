@@ -517,9 +517,10 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
     if !narrows {
         owns = from.paths.clone();
     }
-    let (mut reads, _) = compiler.globs(&item.attrs, "reads")?;
+    let (mut reads, reads_via) = compiler.globs(&item.attrs, "reads")?;
     reads.extend(from.reads.iter().cloned());
-    let known_inputs = !owns.is_empty() || !reads.is_empty() || !via.is_empty();
+    let known_inputs =
+        !owns.is_empty() || !reads.is_empty() || !via.is_empty() || !reads_via.is_empty();
     for glob in understood_reads {
         if !reads.contains(&glob) {
             reads.push(glob);
@@ -571,6 +572,7 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         cache: true,
         cache_set: compiler.flag(&item.attrs, "cache")?.or(from.cache),
         known_inputs,
+        reads_via,
         resources,
         meta,
         env,
@@ -1157,6 +1159,7 @@ pub fn compile(
         let mut reads: Vec<String> = check
             .via
             .iter()
+            .chain(&check.reads_via)
             .flat_map(|name| group_paths.get(name).into_iter().flatten().cloned())
             .collect();
         if !reads.is_empty() {
