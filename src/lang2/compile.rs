@@ -237,6 +237,63 @@ fn unique(items: Vec<String>) -> Vec<String> {
 /// or a list of globs), `signal("…")`, `selected(check)`, `profile(p)`, with
 /// `&&`, `||`, `!`, `true`, `false`.
 fn condition(expr: &Expr, compiler: &mut Compiler) -> Compiled<Cond> {
+    condition_in(expr, compiler, &BTreeMap::new())
+}
+
+/// `bound`: the arguments of a `const fn` whose body is being expanded.
+fn condition_in(
+    expr: &Expr,
+    compiler: &mut Compiler,
+    bound: &BTreeMap<String, Expr>,
+) -> Compiled<Cond> {
+    let program = compiler.program;
+    // A name: a bound argument, or a constant holding a condition.
+    if let Expr::Path(segments, _) = expr
+        && segments.len() == 1
+    {
+        if let Some(value) = bound.get(&segments[0]) {
+            return condition_in(&value.clone(), compiler, &BTreeMap::new());
+        }
+        if let Some(ItemKind::Const { value, .. }) = program
+            .items
+            .iter()
+            .find(|item| item.name == segments[0])
+            .map(|item| &item.kind)
+        {
+            return condition_in(value, compiler, &BTreeMap::new());
+        }
+    }
+    // A call of a `const fn` returning a condition: its body with the arguments.
+    if let Expr::Call { callee, args, .. } = expr
+        && let Expr::Path(segments, _) = &**callee
+        && segments.len() == 1
+        && let Some(ItemKind::Fn(function)) = program
+            .items
+            .iter()
+            .find(|item| item.name == segments[0])
+            .map(|item| &item.kind)
+        && let Some(tail) = &function.body.tail
+    {
+        let mut inner = BTreeMap::new();
+        for (param, arg) in function.params.iter().zip(args) {
+            let arg = match arg {
+                Expr::Path(names, _) if names.len() == 1 && bound.contains_key(&names[0]) => {
+                    bound[&names[0]].clone()
+                }
+                other => other.clone(),
+            };
+            inner.insert(param.name.clone(), arg);
+        }
+        return condition_in(tail, compiler, &inner);
+    }
+    let resolve = |arg: &Expr| -> Expr {
+        match arg {
+            Expr::Path(names, _) if names.len() == 1 && bound.contains_key(&names[0]) => {
+                bound[&names[0]].clone()
+            }
+            other => other.clone(),
+        }
+    };
     let help = "conditions: touched(…), only(…), without(…), signal(\"…\"), selected(…), profile(…), with &&, || and !";
     Ok(match expr {
         Expr::Bool(flag, _) => Cond::Always(*flag),
@@ -262,6 +319,7 @@ fn condition(expr: &Expr, compiler: &mut Compiler) -> Compiled<Cond> {
                     format!("`{}` takes one argument", segments.join("::")),
                 ));
             };
+            let arg = &resolve(arg);
             let name = |arg: &Expr, compiler: &mut Compiler| -> Compiled<String> {
                 match arg {
                     Expr::Path(segments, _) => Ok(external(segments)),
@@ -288,7 +346,9 @@ fn condition(expr: &Expr, compiler: &mut Compiler) -> Compiled<Cond> {
                 "selected" => Cond::Selected(name(arg, compiler)?),
                 "profile" => Cond::Profile(name(arg, compiler)?),
                 other => {
-                    return Err(Error::at(*span, format!("`{other}` is not a condition")).help(help));
+                    return Err(
+                        Error::at(*span, format!("`{other}` is not a condition")).help(help)
+                    );
                 }
             }
         }
@@ -425,7 +485,9 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         return Err(Error::at(item.name_span, format!("check {name} has no paths"))
             .help("run a command Citrus understands (cargo …), put it in a group, or give it `#[paths(\"…\")]`"));
     }
-    let step = compiler.script(format!("check:{name}"), item.span, Vec::new(), env.clone());
+    let step = lowered(body, &env, item.span).unwrap_or_else(|| {
+        compiler.script(format!("check:{name}"), item.span, Vec::new(), env.clone())
+    });
     Ok(Check {
         name: name.to_owned(),
         description: item.doc.clone(),
@@ -446,6 +508,46 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         when,
         replaces: Compiler::names(&item.attrs, "replaces"),
         span: item.span,
+    })
+}
+
+/// A body that only runs one fixed command line is that process: other
+/// tools see its argv (`CITRUS_CHECKS`), and no interpreter starts for it.
+fn lowered(body: &Block, env: &[(String, String)], span: Span) -> Option<Step> {
+    let expr = match (body.stmts.as_slice(), &body.tail) {
+        ([super::ast::Stmt::Expr(expr)], None) => expr,
+        ([], Some(tail)) => &**tail,
+        _ => return None,
+    };
+    let Expr::Try(inner, _) = expr else {
+        return None;
+    };
+    let Expr::Command {
+        run: true,
+        env: own,
+        words,
+        ..
+    } = &**inner
+    else {
+        return None;
+    };
+    let argv: Vec<String> = words
+        .iter()
+        .map(super::ast::CmdWord::literal)
+        .collect::<Option<_>>()?;
+    let mut all = env.to_vec();
+    for (key, word) in own {
+        all.push((key.clone(), word.literal()?));
+    }
+    let work = Work::Process {
+        argv,
+        env: all,
+        portable: true,
+    };
+    Some(Step {
+        span,
+        label: work.label(),
+        work,
     })
 }
 
@@ -681,6 +783,7 @@ pub fn compile(
     revision: Option<&str>,
 ) -> Compiled<Project> {
     let mut interp = Interp::new(program, root);
+    interp.revision = revision.map(str::to_owned);
     interp.load_consts(program).map_err(failure)?;
     let shared = program
         .items
@@ -854,13 +957,15 @@ pub fn compile(
                 let compiled = check(&mut compiler, item, &item.name, &Inherited::default())?;
                 project.checks.push(compiled);
             }
-            ItemKind::Task { .. } => {
-                let step = compiler.script(
-                    format!("task:{}", item.name),
-                    item.span,
-                    Vec::new(),
-                    Vec::new(),
-                );
+            ItemKind::Task { body } => {
+                let step = lowered(body, &[], item.span).unwrap_or_else(|| {
+                    compiler.script(
+                        format!("task:{}", item.name),
+                        item.span,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                });
                 project.tasks.push(Task {
                     name: item.name.clone(),
                     about: item.doc.clone().unwrap_or_default(),

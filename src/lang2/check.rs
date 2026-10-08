@@ -24,6 +24,8 @@ pub enum Ty {
     Output,
     Release,
     Error,
+    /// A plan condition: `touched(…)`, `signal("…")`, combined with `&&`, `||`, `!`.
+    Cond,
     /// Not known yet: an empty list, a `return` that never falls through.
     Unknown,
 }
@@ -47,6 +49,7 @@ impl fmt::Display for Ty {
             Ty::Output => write!(f, "Output"),
             Ty::Release => write!(f, "Release"),
             Ty::Error => write!(f, "Error"),
+            Ty::Cond => write!(f, "Cond"),
             Ty::Unknown => write!(f, "_"),
         }
     }
@@ -100,6 +103,9 @@ pub fn std_fn(path: &[String]) -> Option<StdFn> {
         "std::fs::glob" => f(vec![Ty::Glob], Ty::List(Box::new(Ty::Path)), true),
         "std::env::var" => f(vec![Ty::Str], Ty::Option(Box::new(Ty::Str)), true),
         "std::wait::http" => f(vec![Ty::Str, Ty::Duration], result_unit(), true),
+        "std::wait::tcp" => f(vec![Ty::Str, Ty::Duration], result_unit(), true),
+        "std::wait::file" => f(vec![Ty::Path, Ty::Duration], result_unit(), true),
+        "std::fs::copy" => f(vec![Ty::Path, Ty::Path], result_unit(), true),
         "std::docs::check_links" => f(vec![Ty::Glob], result_unit(), true),
         "std::log::info" => f(vec![Ty::Str], Ty::Unit, true),
         _ => None,
@@ -107,12 +113,18 @@ pub fn std_fn(path: &[String]) -> Option<StdFn> {
 }
 
 pub const STD_FUNCTIONS: &[&str] = &[
+    "std::paths::cargo",
+    "std::paths::next",
+    "std::paths::package",
     "std::proc::Command::new",
     "std::fs::read",
     "std::fs::exists",
     "std::fs::glob",
     "std::env::var",
     "std::wait::http",
+    "std::wait::tcp",
+    "std::wait::file",
+    "std::fs::copy",
     "std::docs::check_links",
     "std::log::info",
 ];
@@ -270,6 +282,7 @@ pub fn resolve_type(
         "Output" => Ty::Output,
         "Release" => Ty::Release,
         "Error" => Ty::Error,
+        "Cond" => Ty::Cond,
         "list" => {
             arity(1)?;
             Ty::List(inner(0)?)
@@ -482,6 +495,11 @@ fn check_item(item: &Item, globals: &Globals) -> Result<(), Error> {
 }
 
 /// Attribute arguments are evaluated when the file loads.
+/// Conditions of the plan, usable in `#[when]`, `#![label]`, `const` and `const fn`.
+pub const CONDITION_FNS: &[&str] = &[
+    "touched", "only", "without", "signal", "selected", "profile",
+];
+
 /// Attributes that name items, and the kind each names.
 const NAMING: &[(&str, &[&str])] = &[
     ("needs", &["service"]),
@@ -604,7 +622,19 @@ pub fn check_attr(attr: &Attr, globals: &Globals) -> Result<(), Error> {
                 }
             }
         }
-        _ if CONDITIONS.contains(&name) => {}
+        _ if CONDITIONS.contains(&name) => {
+            let last = attr.args.last().map(|(_, arg)| arg);
+            if let Some(arg) = last {
+                let mut checker = Checker::new(globals, Phase::Load, Ty::Unknown);
+                let ty = checker.expr(arg)?;
+                if !matches!(ty, Ty::Cond | Ty::Bool | Ty::Unknown) {
+                    return Err(Error::at(
+                        arg.span(),
+                        format!("`#[{name}]` takes a condition, not {ty}"),
+                    ));
+                }
+            }
+        }
         _ if CONFIG.contains(&name) => {
             for (_, arg) in &attr.args {
                 config_value(arg, globals)?;
@@ -1049,6 +1079,7 @@ impl<'a> Checker<'a> {
                 let ty = self.expr(inner)?;
                 match (*op, &ty) {
                     ("!", Ty::Bool) => Ty::Bool,
+                    ("!", Ty::Cond) => Ty::Cond,
                     ("-", Ty::Int) => Ty::Int,
                     _ => return Err(Error::at(*span, format!("`{op}` does not apply to {ty}"))),
                 }
@@ -1057,6 +1088,17 @@ impl<'a> Checker<'a> {
                 let a = self.expr(left)?;
                 let b = self.expr(right)?;
                 match *op {
+                    "&&" | "||" if a == Ty::Cond || b == Ty::Cond => {
+                        for (ty, side) in [(&a, left), (&b, right)] {
+                            if !matches!(ty, Ty::Cond | Ty::Bool | Ty::Unknown) {
+                                return Err(Error::at(
+                                    side.span(),
+                                    format!("a condition combines conditions, not {ty}"),
+                                ));
+                            }
+                        }
+                        Ty::Cond
+                    }
                     "&&" | "||" => {
                         expect(&a, &Ty::Bool, left.span())?;
                         expect(&b, &Ty::Bool, right.span())?;
@@ -1338,6 +1380,31 @@ impl<'a> Checker<'a> {
             ));
         };
         let name = segments.join("::");
+        // Plan conditions: their argument names a group or a check, or holds globs.
+        if segments.len() == 1 && CONDITION_FNS.contains(&name.as_str()) {
+            let [arg] = args else {
+                return Err(Error::at(span, format!("`{name}` takes one argument")));
+            };
+            let is_item = matches!(arg, Expr::Path(segments, _) if self.globals.items.contains_key(&segments.join("::")));
+            if !is_item {
+                let ty = self.expr(arg)?;
+                let fits = match name.as_str() {
+                    "signal" => matches!(ty, Ty::Str),
+                    "touched" | "only" | "without" => {
+                        matches!(ty, Ty::Str | Ty::Glob | Ty::Unknown)
+                            || assignable(&ty, &Ty::List(Box::new(Ty::Glob)))
+                    }
+                    _ => matches!(ty, Ty::Str),
+                };
+                if !fits {
+                    return Err(Error::at(
+                        arg.span(),
+                        format!("`{name}` takes a group or check name or globs, not {ty}"),
+                    ));
+                }
+            }
+            return Ok(Ty::Cond);
+        }
         match name.as_str() {
             "Some" | "Ok" => {
                 if args.len() != 1 {
@@ -1355,6 +1422,20 @@ impl<'a> Checker<'a> {
                 return Ok(Ty::Result(Box::new(Ty::Unknown)));
             }
             _ => {}
+        }
+        // The files a package is built from, read when the file loads.
+        if matches!(
+            name.as_str(),
+            "std::paths::cargo" | "std::paths::next" | "std::paths::package"
+        ) {
+            if args.is_empty() {
+                return Err(Error::at(span, format!("`{name}` takes package names")));
+            }
+            for arg in args {
+                let ty = self.expr(arg)?;
+                expect(&ty, &Ty::Str, arg.span())?;
+            }
+            return Ok(Ty::List(Box::new(Ty::Glob)));
         }
         if segments[0] == "std" {
             let Some(found) = std_fn(segments) else {

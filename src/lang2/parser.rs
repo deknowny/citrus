@@ -56,6 +56,11 @@ pub fn parse_file(file: usize, source: &str, program: &mut Program) -> Parsed<()
         program.inner.push(parser.attr("#![")?);
     }
     while !parser.at_eof() {
+        // Project attributes may follow items, e.g. in a file of their own.
+        if parser.at_sym("#![") {
+            program.inner.push(parser.attr("#![")?);
+            continue;
+        }
         program.items.push(parser.item()?);
     }
     Ok(())

@@ -142,6 +142,8 @@ pub struct Interp<'a> {
     pub root: &'a Path,
     /// Environment of every program a body runs (the check's and profile's `env`).
     pub env: Vec<(String, String)>,
+    /// The commit the configuration is read at (None: the working tree).
+    pub revision: Option<String>,
     scopes: Vec<BTreeMap<String, Value>>,
 }
 
@@ -176,6 +178,7 @@ impl<'a> Interp<'a> {
             consts: BTreeMap::new(),
             root,
             env: Vec::new(),
+            revision: None,
             scopes: vec![BTreeMap::new()],
         }
     }
@@ -446,6 +449,12 @@ impl<'a> Interp<'a> {
                         span: *span,
                         context: Vec::new(),
                     })),
+                    // Plan conditions are compiled from their source, not evaluated.
+                    _ if segments.len() == 1
+                        && super::check::CONDITION_FNS.contains(&name.as_str()) =>
+                    {
+                        Value::Unit
+                    }
                     _ if segments[0] == "std" => self.std_call(&name, values, *span)?,
                     _ => self.call_fn(&name, values, *span)?,
                 }
@@ -831,6 +840,26 @@ impl<'a> Interp<'a> {
                         .collect(),
                 ))
             }
+            "std::paths::cargo" | "std::paths::next" | "std::paths::package" => {
+                let files = super::tools::RepoFiles::new(self.root, self.revision.as_deref());
+                let names: Vec<String> = args.iter().map(Value::text).collect();
+                let found = match name {
+                    "std::paths::cargo" => crate::lang::cargo::crates(&files, &names),
+                    "std::paths::next" => {
+                        crate::lang::web::closure(&files, &names, crate::lang::web::Kind::Next)
+                    }
+                    _ => crate::lang::web::closure(&files, &names, crate::lang::web::Kind::Package),
+                };
+                match found {
+                    Ok(globs) => Value::List(Rc::new(
+                        globs
+                            .into_iter()
+                            .map(|glob| Value::Glob(glob.into()))
+                            .collect(),
+                    )),
+                    Err(message) => return Err(panic(span, message)),
+                }
+            }
             "std::env::var" => match std::env::var(arg(0).as_str()) {
                 Ok(value) => Value::Some(Box::new(Value::str(value))),
                 Err(_) => Value::None,
@@ -839,6 +868,27 @@ impl<'a> Interp<'a> {
                 Work::WaitHttp {
                     url: arg(0).text(),
                     timeout: arg(1).as_int() as u64,
+                },
+                span,
+            ),
+            "std::wait::tcp" => self.builtin(
+                Work::WaitTcp {
+                    address: arg(0).text(),
+                    timeout: arg(1).as_int() as u64,
+                },
+                span,
+            ),
+            "std::wait::file" => self.builtin(
+                Work::WaitFile {
+                    path: arg(0).text(),
+                    timeout: arg(1).as_int() as u64,
+                },
+                span,
+            ),
+            "std::fs::copy" => self.builtin(
+                Work::Copy {
+                    from: arg(0).text(),
+                    to: arg(1).text(),
                 },
                 span,
             ),
