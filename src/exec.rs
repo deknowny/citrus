@@ -964,12 +964,12 @@ impl Context {
         Ok(())
     }
 
-    /// `--remote` goes to the pool when one is configured and either no
-    /// runner script is declared or CITRUS_REMOTE=pool asks for it.
+    /// `--remote` goes to the pool whenever one is configured;
+    /// CITRUS_REMOTE=runner asks for the declared runner script instead.
     pub fn uses_pool(&self) -> bool {
         crate::pool::url().is_some()
-            && (self.repo.config.run.remote.is_empty()
-                || std::env::var("CITRUS_REMOTE").as_deref() == Ok("pool"))
+            && !(std::env::var("CITRUS_REMOTE").as_deref() == Ok("runner")
+                && !self.repo.config.run.remote.is_empty())
     }
 
     fn work_remote(&self, run: &Run, targets: &[RunTarget]) -> Result<Vec<String>> {

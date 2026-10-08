@@ -63,6 +63,7 @@ citrus agent [--share N] [--labels a,b] [--name NAME]   # join the pool
 citrus pool                     # agents, their load, queued and running checks
 citrus pool drain NAME          # finish current checks, take no more
 citrus run --remote             # through the pool when one is configured
+                                # (CITRUS_REMOTE=runner: the declared runner script)
 ```
 
 `citrus status` shows pool state; no consumer status script is needed (#7).
