@@ -159,18 +159,49 @@ fn migrate(client: &mut Client) -> Result<()> {
 
 /// Checks of agents that stopped answering go back to the queue.
 fn requeue_stale(client: &mut Client) -> Result<Vec<(String, String, String)>> {
-    let rows = client.query(
-        "update citrus.jobs j set state = 'queued', agent = null, claimed = null
-         where j.state = 'claimed' and not exists (
-             select 1 from citrus.agents a
-             where a.name = j.agent and a.seen > now() - make_interval(secs => $1))
-         returning j.run, j.check_name, coalesce(j.agent, '')",
-        &[&(STALE_SECONDS as f64)],
-    )?;
+    // Several requesters and agents do this at once: rows another one holds
+    // are skipped, not waited for, so their locks never cross.
+    let rows = retry(|| {
+        client.query(
+            "with stale as (
+                 select j.run, j.check_name, j.agent from citrus.jobs j
+                 where j.state = 'claimed' and not exists (
+                     select 1 from citrus.agents a
+                     where a.name = j.agent and a.seen > now() - make_interval(secs => $1))
+                 order by j.run, j.check_name
+                 for update of j skip locked)
+             update citrus.jobs j set state = 'queued', agent = null, claimed = null
+             from stale where j.run = stale.run and j.check_name = stale.check_name
+             returning j.run, j.check_name, coalesce(stale.agent, '')",
+            &[&(STALE_SECONDS as f64)],
+        )
+    })?;
     Ok(rows
         .iter()
         .map(|row| (row.get(0), row.get(1), row.get(2)))
         .collect())
+}
+
+/// Postgres may abort one side of a lock conflict (deadlock, serialization):
+/// that statement is safe to run again.
+fn retry<T>(mut statement: impl FnMut() -> Result<T, postgres::Error>) -> Result<T> {
+    let mut attempt = 0;
+    loop {
+        match statement() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < 5
+                    && error.code().is_some_and(|code| {
+                        *code == postgres::error::SqlState::T_R_DEADLOCK_DETECTED
+                            || *code == postgres::error::SqlState::T_R_SERIALIZATION_FAILURE
+                    }) =>
+            {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(50 * attempt));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn notify(client: &mut Client, channel: &str, payload: &str) -> Result<()> {
@@ -892,17 +923,21 @@ fn claim(client: &mut Client, machine: &Machine) -> Result<Option<(RunRow, Vec<S
          from picked where j.run = picked.run and j.check_name = picked.check_name
          returning j.run, j.check_name"
     );
-    let rows = client.query(
-        &query,
-        &[
-            &machine.labels,
-            &machine.container,
-            &machine.docker,
-            &(machine.native || !machine.docker),
-            &(machine.slots as i64),
-            &machine.name,
-        ],
-    )?;
+    let native = machine.native || !machine.docker;
+    let slots = machine.slots as i64;
+    let rows = retry(|| {
+        client.query(
+            &query,
+            &[
+                &machine.labels,
+                &machine.container,
+                &machine.docker,
+                &native,
+                &slots,
+                &machine.name,
+            ],
+        )
+    })?;
     let Some(first) = rows.first() else {
         return Ok(None);
     };
@@ -931,15 +966,16 @@ fn emit(client: &mut Client, run: &str, agent: &str, lines: &[String]) -> Result
     if lines.is_empty() {
         return Ok(());
     }
-    let mut tx = client.transaction()?;
-    let statement =
-        tx.prepare("insert into citrus.events (run, agent, line) values ($1, $2, $3)")?;
-    for line in lines {
-        tx.execute(&statement, &[&run, &agent, line])?;
-    }
-    tx.execute("select pg_notify('citrus_events', $1)", &[&run])?;
-    tx.commit()?;
-    Ok(())
+    retry(|| {
+        let mut tx = client.transaction()?;
+        let statement =
+            tx.prepare("insert into citrus.events (run, agent, line) values ($1, $2, $3)")?;
+        for line in lines {
+            tx.execute(&statement, &[&run, &agent, line])?;
+        }
+        tx.execute("select pg_notify('citrus_events', $1)", &[&run])?;
+        tx.commit()
+    })
 }
 
 /// Results of a batch: reported ones as reported, the rest failed.
@@ -955,11 +991,13 @@ fn settle(
             Some((_, seconds)) => ("failed", *seconds),
             None => ("failed", None),
         };
-        client.execute(
-            "update citrus.jobs set state = 'done', result = $3, seconds = $4, finished = now()
-             where run = $1 and check_name = $2",
-            &[&run, check, &result, &seconds],
-        )?;
+        retry(|| {
+            client.execute(
+                "update citrus.jobs set state = 'done', result = $3, seconds = $4, finished = now()
+                 where run = $1 and check_name = $2",
+                &[&run, check, &result, &seconds],
+            )
+        })?;
     }
     client.execute("select pg_notify('citrus_events', $1)", &[&run])?;
     Ok(())
