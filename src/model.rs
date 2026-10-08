@@ -341,6 +341,16 @@ pub fn dead_globs(project: &Project, root: &Path) -> Vec<Error> {
 /// Execute one step in `root`; the process inherits stdout/stderr.
 /// `stdout_to_stderr` keeps a JSON answer on stdout clean while steps print.
 pub fn execute(step: &Step, root: &Path, stdout_to_stderr: bool) -> anyhow::Result<i32> {
+    execute_env(step, root, stdout_to_stderr, &[])
+}
+
+/// `execute` with more environment for the programs the step starts.
+pub fn execute_env(
+    step: &Step,
+    root: &Path,
+    stdout_to_stderr: bool,
+    extra: &[(String, String)],
+) -> anyhow::Result<i32> {
     let deadline = |seconds: u64| Instant::now() + Duration::from_secs(seconds);
     match &step.work {
         Work::Process { argv, env, .. } => {
@@ -351,6 +361,7 @@ pub fn execute(step: &Step, root: &Path, stdout_to_stderr: bool) -> anyhow::Resu
             command
                 .args(args)
                 .envs(env.iter().cloned())
+                .envs(extra.iter().cloned())
                 .current_dir(root)
                 .stdin(std::process::Stdio::null());
             if stdout_to_stderr {
@@ -423,7 +434,10 @@ pub fn execute(step: &Step, root: &Path, stdout_to_stderr: bool) -> anyhow::Resu
         }
         Work::Script {
             item, args, env, ..
-        } => Ok(crate::lang::run_item(root, item, args, env)),
+        } => {
+            let env: Vec<(String, String)> = env.iter().chain(extra).cloned().collect();
+            Ok(crate::lang::run_item(root, item, args, &env))
+        }
         Work::LinksCheck { pattern } => {
             let files = crate::repo::Repo::discover_at(root)?.files()?;
             let mut broken = 0;

@@ -17,6 +17,7 @@ mod integrate;
 mod lang;
 mod manifest;
 mod model;
+mod observe;
 mod plan;
 mod release;
 mod repo;

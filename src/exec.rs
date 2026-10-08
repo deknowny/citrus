@@ -523,16 +523,56 @@ impl Context {
                 } else {
                     &[]
                 };
+                // A check that may be reused is watched: its Python and Node
+                // programs must read nothing outside its inputs.
+                let watch = entry.cache.then(|| {
+                    let dir = self.repo.state_dir().join("observe");
+                    let log = self
+                        .repo
+                        .state_dir()
+                        .join("tmp")
+                        .join(format!("observe-{}-{}", run.id, target.target));
+                    let _ = std::fs::remove_file(&log);
+                    let ready = log
+                        .parent()
+                        .map_or(Ok(()), crate::repo::private_dir)
+                        .and_then(|()| crate::observe::environment(&dir, &log));
+                    (log.clone(), ready)
+                });
+                let extra = match &watch {
+                    Some((_, Ok(env))) => env.clone(),
+                    _ => Vec::new(),
+                };
                 for step in steps {
                     println!(
                         "── {}  ({})",
                         step.label,
                         entry.source.as_deref().unwrap_or("citrus.ci")
                     );
-                    code = i64::from(crate::model::execute(step, &self.repo.root, false)?);
+                    code = i64::from(crate::model::execute_env(
+                        step,
+                        &self.repo.root,
+                        false,
+                        &extra,
+                    )?);
                     if code != 0 {
                         break;
                     }
+                }
+                let mut outside = Vec::new();
+                if let Some((log, Ok(_))) = &watch {
+                    let read = crate::observe::read(log, &self.repo.root);
+                    let globs: Vec<String> = entry
+                        .inputs
+                        .iter()
+                        .chain(&entry.extra_inputs)
+                        .chain(&self.repo.config.toolchain_files)
+                        .cloned()
+                        .collect();
+                    if let Ok(inputs) = crate::manifest::GlobList::new(&globs) {
+                        outside = crate::observe::outside(&read, &inputs);
+                    }
+                    let _ = std::fs::remove_file(log);
                 }
                 current.seconds = Some((now() - started) as i64);
                 current.exit = Some(code);
@@ -545,7 +585,23 @@ impl Context {
                 if code == 0 {
                     current.result = "passed".into();
                     current.reason = "ran".into();
-                    self.record_inputs(run, &target.target)?;
+                    if outside.is_empty() {
+                        self.record_inputs(run, &target.target)?;
+                    } else {
+                        let shown: Vec<&str> = outside.iter().take(5).map(String::as_str).collect();
+                        println!(
+                            "CITRUS_NOTE {} read {}{} outside its inputs; this pass is not reused (add them to #[reads])",
+                            target.target,
+                            shown.join(", "),
+                            if outside.len() > shown.len() {
+                                ", …"
+                            } else {
+                                ""
+                            }
+                        );
+                        current.reason =
+                            format!("ran; read outside its inputs: {}", shown.join(", "));
+                    }
                     passed.push(target.target.clone());
                 } else {
                     current.result = "failed".into();

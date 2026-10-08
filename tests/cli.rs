@@ -3607,3 +3607,43 @@ check api {
     assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(text.contains("1 checks understood as Cargo"), "{text}");
 }
+
+#[test]
+fn a_reused_check_must_read_only_its_inputs() {
+    let project = Project::v2(
+        r#"#![citrus(2)]
+
+#[paths("tools/check.py")]
+#[cache]
+check tool {
+    run!("python3 -B tools/check.py")?;
+}
+"#,
+    );
+    project.write(
+        "tools/check.py",
+        "import pathlib\nassert pathlib.Path('data/limits.json').read_text().strip() == '{}'\n",
+    );
+    project.write("data/limits.json", "{}\n");
+    project.git(&["add", "-A"]);
+    let output = project.citrus(&["run", "tool", "--local", "--text"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("ran; read outside its inputs: data/limits.json"),
+        "{text}"
+    );
+    // Not reused: it runs again.
+    let (run, _) = project.json(&["run", "tool", "--local"]);
+    assert_eq!(target(&run, "tool")["result"], "passed", "{run}");
+
+    project.write(
+        "citrus.ci",
+        "#![citrus(2)]\n\n#[paths(\"tools/check.py\")]\n#[reads(\"data/**\")]\n#[cache]\ncheck tool {\n    run!(\"python3 -B tools/check.py\")?;\n}\n",
+    );
+    project.git(&["add", "-A"]);
+    let (run, _) = project.json(&["run", "tool", "--local"]);
+    assert_eq!(target(&run, "tool")["result"], "passed", "{run}");
+    let (run, _) = project.json(&["run", "tool", "--local"]);
+    assert_eq!(target(&run, "tool")["result"], "reused", "{run}");
+}

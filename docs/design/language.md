@@ -278,6 +278,11 @@ A program Citrus does not know is a plain process: its check declares
 `#[paths]`. `citrus why` and `citrus targets` show what each command was
 understood as.
 
+A check that may be reused is watched when it runs locally: its Python and
+Node programs (audit hook, `--require`) must read no repository file, and
+list no directory, outside its paths and `#[reads]`. Otherwise its pass is
+not reused and Citrus names what it read. Other programs are not watched.
+
 `citrus deps` checks the inference against the compiler after a build: every
 repository file a crate read (Cargo's dep-info, and build scripts'
 `rerun-if-changed`) must be among the inputs of each understood check that

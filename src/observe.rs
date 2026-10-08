@@ -40,9 +40,18 @@ def _citrus_observe():
 
     def hook(event, args):
         if event == "open" and args and not isinstance(args[0], int):
+            mode, flags = (args + (None, None))[1:3]
+            if isinstance(mode, str) and any(c in mode for c in "wax"):
+                return
+            if isinstance(flags, int) and flags & 3 == _os.O_WRONLY:
+                return
             note("file", args[0])
-        elif event in ("os.listdir", "os.scandir", "glob.glob") and args:
-            note("dir" if event != "glob.glob" else "glob", args[0] if args[0] is not None else ".")
+        # os.listdir is how imports look for modules; scandir and glob are
+        # how programs list what they then read.
+        elif event == "os.scandir" and args:
+            note("dir", args[0] if args[0] is not None else ".")
+        elif event == "glob.glob" and args:
+            note("glob", args[0])
         elif event == "subprocess.Popen" and len(args) > 1:
             for arg in args[1] or []:
                 if isinstance(arg, (str, bytes)) and _os.path.isfile(arg):
@@ -96,9 +105,9 @@ if (target) {
       return original.call(this, file, ...rest);
     };
   };
-  for (const name of ['readFileSync', 'openSync', 'readFile', 'open', 'createReadStream']) wrap(fs, name, 'file');
+  for (const name of ['readFileSync', 'readFile', 'createReadStream']) wrap(fs, name, 'file');
   for (const name of ['readdirSync', 'readdir', 'opendirSync', 'opendir']) wrap(fs, name, 'dir');
-  for (const name of ['readFile', 'open']) wrap(fs.promises, name, 'file');
+  for (const name of ['readFile']) wrap(fs.promises, name, 'file');
   for (const name of ['readdir', 'opendir']) wrap(fs.promises, name, 'dir');
   const child = require('child_process');
   for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync']) {
@@ -162,10 +171,37 @@ pub fn read(log: &Path, root: &Path) -> Vec<String> {
         if relative.is_empty() || relative.starts_with(".git") || relative.starts_with("target/") {
             continue;
         }
-        found.insert(match kind {
-            "dir" => format!("{relative}/"),
-            _ => relative,
+        found.insert(if kind == "dir" {
+            format!("{relative}/")
+        } else {
+            relative
         });
     }
     found.into_iter().collect()
+}
+
+/// What was read that `inputs` (globs) do not cover. A listed directory is
+/// covered when any file could be added to it unseen by no input: only
+/// `dir/*`-like globs cover it. A glob pattern is covered when its own
+/// directory is.
+pub fn outside(read: &[String], inputs: &crate::manifest::GlobList) -> Vec<String> {
+    const PROBE: &str = "\u{1}citrus-probe";
+    read.iter()
+        .filter(|path| {
+            if let Some(dir) = path.strip_suffix('/') {
+                !inputs.matches(&format!("{dir}/{PROBE}"))
+            } else if path.contains(['*', '?', '[']) {
+                let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+                let probe = if dir.is_empty() {
+                    PROBE.to_owned()
+                } else {
+                    format!("{dir}/{PROBE}")
+                };
+                !inputs.matches(&probe)
+            } else {
+                !inputs.matches(path)
+            }
+        })
+        .cloned()
+        .collect()
 }
