@@ -96,7 +96,7 @@ pub fn connect(url: &str) -> Result<Client> {
 
 /// The pool's tables; any client creates them on first use.
 /// The schema version this build writes; bump with every change below.
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 /// The pool's tables. DDL takes exclusive table locks even when it changes
 /// nothing, so it runs only when the recorded version is behind; every other
@@ -169,6 +169,16 @@ fn migrate(client: &mut Client) -> Result<()> {
         alter table citrus.events add column if not exists tx xid8 not null default pg_current_xact_id();
         create index if not exists events_by_run on citrus.events (run, id);
         create index if not exists jobs_queued on citrus.jobs (state) where state = 'queued';
+        -- Citrus builds by commit and platform (`citrus pool publish`): agents
+        -- and launchers take them instead of compiling a version each.
+        create table if not exists citrus.binaries (
+            commit_sha text not null,
+            platform text not null,
+            sha256 text not null,
+            data bytea not null,
+            created timestamptz not null default now(),
+            primary key (commit_sha, platform)
+        );
         create table if not exists citrus.meta (version integer not null);
         delete from citrus.meta;
         insert into citrus.meta (version) values (SCHEMA_VERSION);
@@ -1321,6 +1331,16 @@ fn executor(
     if binary.exists() {
         return Ok(binary);
     }
+    if let Some(url) = url()
+        && let Ok(mut client) = connect(&url)
+        && fetch_binary(&mut client, version, &platform, &binary)?
+    {
+        announce(format!(
+            "takes Citrus {} for {platform} from the pool",
+            &version[..12.min(version.len())]
+        ))?;
+        return Ok(binary);
+    }
     let staging = machine
         .cache
         .join("bin")
@@ -1377,6 +1397,83 @@ fn executor(
         let _ = std::fs::remove_dir_all(&staging);
     }
     Ok(binary)
+}
+
+/// A published build of `commit` for `platform`, written to `to` (checked
+/// against its sha256); false when the pool holds none.
+fn fetch_binary(client: &mut Client, commit: &str, platform: &str, to: &Path) -> Result<bool> {
+    use sha2::{Digest, Sha256};
+    let Some(row) = client.query_opt(
+        "select sha256, data from citrus.binaries where commit_sha = $1 and platform = $2",
+        &[&commit, &platform],
+    )?
+    else {
+        return Ok(false);
+    };
+    let (expected, data): (String, Vec<u8>) = (row.get(0), row.get(1));
+    if hex::encode(Sha256::digest(&data)) != expected {
+        bail!("the pool's Citrus {commit} for {platform} fails its checksum");
+    }
+    let dir = to.parent().context("binary dir")?;
+    std::fs::create_dir_all(dir)?;
+    let staging = dir.join(format!(".citrus-{}", std::process::id()));
+    std::fs::write(&staging, &data)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&staging, to)?;
+    Ok(true)
+}
+
+/// Publish a Citrus build to the pool under the commit it reports
+/// (`citrus --version`) and `platform` (default: this machine's).
+pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, String, String)> {
+    use sha2::{Digest, Sha256};
+    let output = Command::new(file)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("run {} --version", file.display()))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let commit = text
+        .split(['(', ')'])
+        .nth(1)
+        .filter(|commit| commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit()))
+        .with_context(|| {
+            format!(
+                "{} reports no clean commit: {}",
+                file.display(),
+                text.trim()
+            )
+        })?
+        .to_owned();
+    let platform = platform
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{}-{}", os_label(), arch()));
+    let data = std::fs::read(file)?;
+    let sha = hex::encode(Sha256::digest(&data));
+    let url = url().context("no pool: set CITRUS_POOL or ~/.config/citrus/pool")?;
+    let mut client = connect(&url)?;
+    client.execute(
+        "insert into citrus.binaries (commit_sha, platform, sha256, data) values ($1, $2, $3, $4)
+         on conflict (commit_sha, platform) do update set sha256 = $3, data = $4, created = now()",
+        &[&commit, &platform, &sha, &data],
+    )?;
+    Ok((commit, platform, sha))
+}
+
+/// Published Citrus builds, newest first: commit, platform, sha256, bytes.
+pub fn binaries() -> Result<Vec<(String, String, String, i64)>> {
+    let url = url().context("no pool: set CITRUS_POOL or ~/.config/citrus/pool")?;
+    let mut client = connect(&url)?;
+    Ok(client
+        .query(
+            "select commit_sha, platform, sha256, octet_length(data)::bigint from citrus.binaries
+             order by created desc limit 50",
+            &[],
+        )?
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .collect())
 }
 
 /// The image of a run, built on this machine (Docker's cache keeps it cheap).

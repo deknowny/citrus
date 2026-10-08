@@ -698,3 +698,54 @@ fn a_long_check_does_not_hold_the_agent() {
     assert_eq!(result(&run, "fast")["result"], "passed", "{run}");
     assert!(agent.wait().unwrap().success());
 }
+
+/// A published build is listed under the commit it reports and can be
+/// published again (a rebuild replaces it).
+#[test]
+fn a_published_build_is_held_by_commit_and_platform() {
+    let Ok(pool) = std::env::var("CITRUS_TEST_POOL") else {
+        eprintln!("CITRUS_TEST_POOL is not set: pool tests skipped");
+        return;
+    };
+    let _serial = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let work = tempfile::tempdir().unwrap();
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let fake = work.path().join("citrus");
+    fs::write(
+        &fake,
+        format!("#!/bin/sh\necho 'citrus 0.3.0 ({commit})'\n"),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..2 {
+        let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+            .args(["pool", "publish", "--platform", "linux-x86_64"])
+            .arg(&fake)
+            .env("CITRUS_POOL", &pool)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let listed = json(
+        &Command::new(env!("CARGO_BIN_EXE_citrus"))
+            .args(["pool", "binaries", "--json"])
+            .env("CITRUS_POOL", &pool)
+            .output()
+            .unwrap(),
+    );
+    let rows: Vec<&Value> = listed["binaries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["commit"] == commit)
+        .collect();
+    assert_eq!(rows.len(), 1, "{listed}");
+    assert_eq!(rows[0]["platform"], "linux-x86_64");
+}

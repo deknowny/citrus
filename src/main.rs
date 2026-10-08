@@ -390,6 +390,16 @@ enum PoolAction {
     Drain { name: String },
     /// Let a drained agent take checks again (when it runs).
     Resume { name: String },
+    /// Store a Citrus build for the commit it reports, so agents and
+    /// launchers take it instead of compiling that version.
+    Publish {
+        file: std::path::PathBuf,
+        /// `linux-x86_64`, `macos-aarch64`…; default: this machine's.
+        #[arg(long)]
+        platform: Option<String>,
+    },
+    /// The Citrus builds the pool holds.
+    Binaries,
 }
 
 fn pool_command(action: Option<&PoolAction>, json: bool) -> Result<i32> {
@@ -402,6 +412,40 @@ fn pool_command(action: Option<&PoolAction>, json: bool) -> Result<i32> {
         Some(PoolAction::Resume { name }) => {
             pool::set_agent_state(name, "ready")?;
             println!("agent {name} takes checks again");
+            return Ok(0);
+        }
+        Some(PoolAction::Publish { file, platform }) => {
+            let (commit, platform, sha) = pool::publish_binary(file, platform.as_deref())?;
+            println!(
+                "published Citrus {} for {platform} · sha256 {}",
+                &commit[..12],
+                &sha[..12]
+            );
+            return Ok(0);
+        }
+        Some(PoolAction::Binaries) => {
+            let rows = pool::binaries()?;
+            if json {
+                let rows: Vec<_> = rows
+                    .iter()
+                    .map(|(commit, platform, sha, bytes)| {
+                        json!({"commit": commit, "platform": platform, "sha256": sha, "bytes": bytes})
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"schema": SCHEMA, "binaries": rows}))?
+                );
+            } else {
+                for (commit, platform, sha, bytes) in rows {
+                    println!(
+                        "{}  {platform:<16} sha256 {} · {} KiB",
+                        &commit[..12],
+                        &sha[..12],
+                        bytes / 1024
+                    );
+                }
+            }
             return Ok(0);
         }
         None => {}
