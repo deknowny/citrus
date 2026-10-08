@@ -172,22 +172,31 @@ impl Makefiles {
             };
             queue.extend(rule.prereqs.iter().cloned());
             for line in &rule.recipe {
-                let words = words(line);
-                for (index, word) in words.iter().enumerate() {
-                    if (word == "$(MAKE)" || word == "make")
-                        && let Some(rest) = words.get(index + 1..)
-                    {
-                        queue.extend(
-                            rest.iter()
-                                .filter(|word| self.rules.contains_key(word.as_str()))
-                                .cloned(),
-                        );
-                    }
-                }
+                queue.extend(self.sub_makes(line));
                 lines.push(line.clone());
             }
         }
         lines
+    }
+
+    /// Rules a recipe line runs through `$(MAKE) a b` or `make a b`. Quoted
+    /// text is a message or data (`echo 'use make check'`), not a command.
+    fn sub_makes(&self, line: &str) -> Vec<String> {
+        let words = words(&unquoted(line));
+        let mut found = Vec::new();
+        for (index, word) in words.iter().enumerate() {
+            if (word == "$(MAKE)" || word == "make")
+                && let Some(rest) = words.get(index + 1..)
+            {
+                found.extend(
+                    rest.iter()
+                        .take_while(|word| !matches!(word.as_str(), "&&" | "||" | "|"))
+                        .filter(|word| self.rules.contains_key(word.as_str()))
+                        .cloned(),
+                );
+            }
+        }
+        found
     }
 
     /// Every rule's name.
@@ -228,21 +237,8 @@ impl Makefiles {
                 }
             }
             for line in &rule.recipe {
-                let words = words(line);
-                for (index, word) in words.iter().enumerate() {
-                    // `$(MAKE) a b` and `make a b` run more rules.
-                    if (word == "$(MAKE)" || word == "make")
-                        && let Some(rest) = words.get(index + 1..)
-                    {
-                        queue.extend(
-                            rest.iter()
-                                .take_while(|word| {
-                                    !matches!(word.as_str(), ";" | "&&" | "||" | "|")
-                                })
-                                .filter(|word| self.rules.contains_key(word.as_str()))
-                                .cloned(),
-                        );
-                    }
+                queue.extend(self.sub_makes(line));
+                for word in &words(line) {
                     if let Some(found) = repo_path(word, "", &known) {
                         if !found.ends_with("/**") {
                             scripts.push((found.clone(), 0));
@@ -315,6 +311,21 @@ fn is_code(path: &str, text: &str) -> bool {
         Some((_, ext)) => matches!(ext, "sh" | "bash" | "py" | "mjs" | "cjs" | "js" | "ts"),
         None => text.starts_with("#!"),
     }
+}
+
+/// The line without its quoted parts.
+fn unquoted(line: &str) -> String {
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    for c in line.chars() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None => out.push(c),
+        }
+    }
+    out
 }
 
 /// Lines with `\`-continuations joined; recipe lines keep their tab.
@@ -580,5 +591,18 @@ mod tests {
             .collect::<Vec<_>>()
         );
         assert!(makefiles.inputs("no-such-target", &files).is_none());
+        // `make` in a message is not a command.
+        let files = fake(&[
+            (
+                "Makefile",
+                "test-a:\n\t@test -x a || { echo 'use make other' >&2; exit 2; }\nother:\n\t./scripts/other.sh\n",
+            ),
+            ("scripts/other.sh", ""),
+        ]);
+        let makefiles = Makefiles::load(&files).unwrap();
+        assert_eq!(
+            makefiles.inputs("test-a", &files).unwrap().0,
+            vec!["Makefile"]
+        );
     }
 }
