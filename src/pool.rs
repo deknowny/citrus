@@ -1312,6 +1312,11 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
         ),
     ];
     let name = format!("citrus-{}-{}", run.id, short_hash(&checks.join(",")));
+    // Docker Desktop shares host folders through a file system on which mmap
+    // fails with SIGBUS (pnpm, linkers): there the tree is copied into a
+    // volume for the batch, mounted at the same path.
+    let desktop = in_container && std::env::consts::OS != "linux";
+    let tree_volume = desktop.then(|| format!("{name}-tree"));
     let mut command;
     if in_container {
         emit(
@@ -1332,9 +1337,32 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
             "host",
         ]);
         command.arg("--cpus").arg(machine.share.to_string());
-        for dir in [&tree, &mirror] {
-            command.arg("-v").arg(format!("{0}:{0}", dir.display()));
+        if let Some(volume) = &tree_volume {
+            let copied = Command::new("docker")
+                .args(["run", "--rm", "--entrypoint", "sh", "-v"])
+                .arg(format!("{}:/citrus-source:ro", tree.display()))
+                .arg("-v")
+                .arg(format!("{volume}:{}", tree.display()))
+                .arg(&image)
+                .arg("-c")
+                .arg(format!(
+                    "cp -a /citrus-source/. {}/",
+                    shell_quote(&tree.to_string_lossy())
+                ))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .status()
+                .context("copy the tree into a volume")?;
+            if !copied.success() {
+                bail!("could not copy the tree into the volume {volume}");
+            }
+            command
+                .arg("-v")
+                .arg(format!("{volume}:{}", tree.display()));
+        } else {
+            command.arg("-v").arg(format!("{0}:{0}", tree.display()));
         }
+        command.arg("-v").arg(format!("{0}:{0}", mirror.display()));
         // Caches kept between runs, at a path images can name in ENV. Docker
         // Desktop shares host folders through a file system on which mmap
         // (linkers, databases) fails with SIGBUS: there the cache is a volume.
@@ -1475,6 +1503,13 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
     }
     let _ = reader.join();
     let status = child.wait()?;
+    if let Some(volume) = &tree_volume {
+        let _ = Command::new("docker")
+            .args(["volume", "rm", "-f", volume])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     if stopped {
         emit(client, &run.id, &machine.name, &pending)?;
         return Err(Stopped.into());
