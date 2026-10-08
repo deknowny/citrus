@@ -1277,10 +1277,15 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
         for dir in [&tree, &mirror] {
             command.arg("-v").arg(format!("{0}:{0}", dir.display()));
         }
-        // Caches kept between runs, at a path images can name in ENV.
-        command
-            .arg("-v")
-            .arg(format!("{}:/citrus-cache", shared.display()));
+        // Caches kept between runs, at a path images can name in ENV. Docker
+        // Desktop shares host folders through a file system on which mmap
+        // (linkers, databases) fails with SIGBUS: there the cache is a volume.
+        let cache = if std::env::consts::OS == "linux" {
+            shared.to_string_lossy().into_owned()
+        } else {
+            format!("citrus-cache-{}", short_hash(&run.repo))
+        };
+        command.arg("-v").arg(format!("{cache}:/citrus-cache"));
         command
             .arg("-v")
             .arg(format!("{}:/usr/local/bin/citrus-pool:ro", exe.display()))
