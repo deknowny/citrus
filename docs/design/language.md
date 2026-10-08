@@ -260,6 +260,39 @@ A program Citrus does not know is a plain process: its check declares
 `#[paths]`. `citrus why` and `citrus targets` show what each command was
 understood as.
 
+## Tests
+
+A `#[test] fn` states what a change would run. `citrus test [filter]` runs
+every test in one process, planning each change like `citrus plan
+--paths-file`, signal command included; a change without a profile is
+planned in the project's first one.
+
+```rust
+#[test]
+fn a_script_runs_the_pipeline_contract() -> Result<()> {
+    let plan = std::plan::of(["scripts/release.sh"])?;
+    assert plan.checks == ["pipeline.contract"];
+    assert plan.groups_of("scripts/release.sh") == ["pipeline"];
+}
+
+#[test]
+fn clyer_alone_is_the_clyer_scope() -> Result<()> {
+    let plan = std::plan::change(["clyer/bot.rs"])
+        .profile("e2e")
+        .env("VALIDATION_SCOPE", "clyer")     // seen by the signal command
+        .plan()?;
+    assert plan.selects("clyer.e2e"), "the e2e check runs";
+    assert plan.labels == ["scope-clyer"];
+}
+```
+
+A `Plan` has `checks`, `groups`, `labels`, `signals`, `notes` (checks left
+out by profile or `covers`) and `unclaimed` (paths no group or check owns);
+`owners(path)` are the checks owning a path and `groups_of(path)` its
+groups. `selects(name)` fails on a name that is not a check, so a typo
+cannot pass. A failed `==` or `!=` shows both sides. Names are the outside
+ones (`group.check`, `-` for `_`).
+
 ## Statements and expressions
 
 ```rust
@@ -288,12 +321,14 @@ the run reports with its place in the file.
 | `std::wait::http(url, timeout)`, `tcp(address, timeout)`, `file(path, timeout)` | readiness |
 | `std::docs::check_links(glob)` | relative Markdown links point at files |
 | `std::log::info(message)` | a line in the log |
+| `std::plan::of(paths) -> Result<Plan>`, `std::plan::change(paths)` | what a change would run ([Tests](#tests)) |
 
 Methods: `str`/`path` — `len`, `contains`, `starts_with`, `ends_with`,
 `find`, `trim`, `lines`, `split`, `count`, `is_empty`, `matches(glob)`;
 `list` — `len`, `contains`, `first`, `last`, `join`, `is_empty`, `push` (on
 a `let mut`); `Option` — `is_some`, `is_none`, `unwrap_or`, `ok_or`;
-`Result` — `is_ok`, `is_err`, `context`, `ok`; `Version` — `bump`.
+`Result` — `is_ok`, `is_err`, `context`, `ok`; `Version` — `bump`;
+`Change` — `profile`, `env`, `plan`; `Plan` — `selects`, `owners`, `groups_of`.
 
 ## Non-goals
 

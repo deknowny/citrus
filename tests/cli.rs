@@ -3364,3 +3364,119 @@ check api {
         );
     }
 }
+
+#[test]
+fn tests_assert_what_a_change_would_run() {
+    let project = Project::new(
+        r#"#![signals(cmd!("sh signals.sh"))]
+#![label("scope-clyer", signal("scope:clyer"))]
+
+profile fast;
+profile e2e;
+
+#[paths("scripts/**")]
+group pipeline {
+    check contract {
+        run!("make ok")?;
+    }
+
+    #[profile(e2e)]
+    check e2e {
+        run!("make ok")?;
+    }
+}
+
+#[paths("docs/**")]
+group docs {}
+
+#[test]
+fn a_script_runs_the_contract() -> Result<()> {
+    let plan = std::plan::of(["scripts/x.sh"])?;
+    assert plan.checks == ["pipeline.contract"];
+    assert plan.selects("pipeline.contract"), "not selected";
+    assert plan.owners("scripts/x.sh") == ["pipeline.contract", "pipeline.e2e"];
+    assert plan.groups_of("scripts/x.sh") == ["pipeline"];
+    assert plan.unclaimed.is_empty();
+}
+
+#[test]
+fn the_e2e_profile_adds_its_check() -> Result<()> {
+    let plan = std::plan::change(["scripts/x.sh"]).profile("e2e").plan()?;
+    assert plan.checks == ["pipeline.contract", "pipeline.e2e"];
+}
+
+#[test]
+fn the_signal_command_sees_the_environment() -> Result<()> {
+    let plan = std::plan::change(["docs/a.md"]).env("SCOPE", "clyer").plan()?;
+    assert plan.labels == ["scope-clyer"];
+    let plain = std::plan::of(["docs/a.md"])?;
+    assert plain.labels.is_empty();
+}
+
+#[test]
+fn an_unknown_path_is_unclaimed() -> Result<()> {
+    let plan = std::plan::of(["elsewhere/x"])?;
+    assert plan.checks.is_empty(), "nothing to run";
+    assert plan.unclaimed == ["elsewhere/x"];
+}
+
+#[test]
+fn a_wrong_expectation_fails() -> Result<()> {
+    let plan = std::plan::of(["docs/a.md"])?;
+    assert plan.checks == ["pipeline.contract"], "docs ran the contract";
+}
+
+#[test]
+fn a_misspelled_check_fails() -> Result<()> {
+    let plan = std::plan::of(["docs/a.md"])?;
+    assert !plan.selects("pipeline.contracts"), "selected";
+}
+"#,
+    );
+    project.write(
+        "signals.sh",
+        "if [ \"$SCOPE\" = clyer ]; then echo 'SIGNAL scope:clyer'; fi\n",
+    );
+    project.commit("tests");
+    let output = project.citrus(&["test", "--text"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    for passing in [
+        "a-script-runs-the-contract",
+        "the-e2e-profile-adds-its-check",
+        "the-signal-command-sees-the-environment",
+        "an-unknown-path-is-unclaimed",
+    ] {
+        assert!(text.contains(&format!("test {passing} ... ok")), "{text}");
+    }
+    assert!(
+        text.contains("test a-wrong-expectation-fails ... FAILED"),
+        "{text}"
+    );
+    assert!(
+        text.contains("docs ran the contract\n  left: []\n right: [pipeline.contract]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("test a-misspelled-check-fails ... FAILED"),
+        "{text}"
+    );
+    assert!(
+        text.contains("no check `pipeline.contracts`; did you mean `pipeline.contract`?"),
+        "{text}"
+    );
+    assert!(text.contains("4 passed, 2 failed"), "{text}");
+    let output = project.citrus(&["test", "unknown_path", "--text"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let output = project.citrus(&["test", "nothing-like-this"]);
+    assert_eq!(output.status.code(), Some(2));
+}

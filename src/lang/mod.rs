@@ -269,8 +269,10 @@ pub fn run_item(
             return 1;
         }
     };
+    let planner = crate::plan::planner(root);
     let mut interp = Interp::new(&program, root);
     interp.env = env.to_vec();
+    interp.planner = Some(&planner);
     if let Err(failure) = interp.load_consts(&program) {
         eprint!("{}", interp::render(&failure, &sources));
         return 1;
@@ -331,6 +333,54 @@ pub fn run_item(
             1
         }
     }
+}
+
+/// One `#[test]` function's outcome: its name and the rendered failure.
+pub struct TestOutcome {
+    pub name: String,
+    pub failure: Option<String>,
+}
+
+/// Run the `#[test]` functions whose names contain `filter`.
+pub fn run_tests(root: &Path, filter: Option<&str>) -> Result<Vec<TestOutcome>, String> {
+    let entry = if root.join("citrus.ci").exists() {
+        "citrus.ci"
+    } else {
+        ".citrus"
+    };
+    let (program, sources) =
+        parse(root, entry, None).map_err(|(error, sources)| sources.render(&error))?;
+    let planner = crate::plan::planner(root);
+    let mut interp = Interp::new(&program, root);
+    interp.planner = Some(&planner);
+    interp
+        .load_consts(&program)
+        .map_err(|failure| interp::render(&failure, &sources))?;
+    let mut outcomes = Vec::new();
+    for item in &program.items {
+        if !matches!(item.kind, ItemKind::Fn(_))
+            || !item.attrs.iter().any(|attr| attr.name == "test")
+        {
+            continue;
+        }
+        if filter.is_some_and(|filter| {
+            !item.name.contains(filter) && !compile::dash(&item.name).contains(filter)
+        }) {
+            continue;
+        }
+        let failure = match interp.call_fn(&item.name, Vec::new(), item.span) {
+            Ok(Value::Err(failure)) | Err(interp::Flow::Return(Value::Err(failure))) => {
+                Some((*failure).clone())
+            }
+            Err(interp::Flow::Panic(failure)) => Some(failure),
+            _ => None,
+        };
+        outcomes.push(TestOutcome {
+            name: compile::dash(&item.name),
+            failure: failure.map(|failure| interp::render(&failure, &sources)),
+        });
+    }
+    Ok(outcomes)
 }
 
 fn find_body<'a>(

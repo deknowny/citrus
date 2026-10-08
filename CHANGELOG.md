@@ -18,6 +18,9 @@ Breaking: a new configuration language (docs/design/language.md). Every
   packages it builds, and a misspelled subcommand or package is an error.
 - Outside the language names use `-` for `_` (`test_db` → `test-db`),
   like Cargo crate names; the command line takes either.
+- `#[test] fn` states what a change would run (`std::plan::of`,
+  `std::plan::change(…).profile(…).env(…).plan()`); `citrus test` runs them
+  in one process. A failed `==`/`!=` assertion shows both sides.
 - `match changed` is replaced by checks with exclusive `#[when]`;
   `citrus fmt` is removed until the language has a formatter.
 

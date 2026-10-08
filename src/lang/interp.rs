@@ -79,6 +79,7 @@ impl Value {
                 "{name} {{ {} }}",
                 fields
                     .iter()
+                    .filter(|(k, _)| !k.starts_with("__"))
                     .map(|(k, v)| format!("{k}: {}", v.text()))
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -136,6 +137,9 @@ pub enum Flow {
 
 type Eval<T> = Result<T, Flow>;
 
+/// Plans a change: `std::plan` asks it.
+pub type Planner<'a> = dyn Fn(&crate::plan::Change) -> anyhow::Result<crate::plan::Plan> + 'a;
+
 pub struct Interp<'a> {
     pub fns: BTreeMap<String, &'a FnDecl>,
     pub consts: BTreeMap<String, Value>,
@@ -144,6 +148,10 @@ pub struct Interp<'a> {
     pub env: Vec<(String, String)>,
     /// The commit the configuration is read at (None: the working tree).
     pub revision: Option<String>,
+    /// Plans a change for `std::plan` (`citrus test` and check bodies).
+    pub planner: Option<&'a Planner<'a>>,
+    /// Declared checks by their outside names, for `Plan::selects`.
+    checks: Vec<String>,
     scopes: Vec<BTreeMap<String, Value>>,
 }
 
@@ -173,12 +181,33 @@ impl<'a> Interp<'a> {
                 _ => None,
             })
             .collect();
+        let mut checks = Vec::new();
+        for item in &program.items {
+            match &item.kind {
+                ItemKind::Check { .. } => checks.push(super::compile::dash(&item.name)),
+                ItemKind::Group { items } => checks.extend(
+                    items
+                        .iter()
+                        .filter(|inner| matches!(inner.kind, ItemKind::Check { .. }))
+                        .map(|inner| {
+                            format!(
+                                "{}.{}",
+                                super::compile::dash(&item.name),
+                                super::compile::dash(&inner.name)
+                            )
+                        }),
+                ),
+                _ => {}
+            }
+        }
         Interp {
             fns,
             consts: BTreeMap::new(),
             root,
             env: Vec::new(),
             revision: None,
+            planner: None,
+            checks,
             scopes: vec![BTreeMap::new()],
         }
     }
@@ -316,11 +345,32 @@ impl<'a> Interp<'a> {
                 message,
                 span,
             } => {
-                if !self.expr(cond)?.truthy() {
-                    let text = match message {
+                // A failed comparison shows both sides, like Rust's assert_eq.
+                let sides = match cond {
+                    Expr::Binary(op, left, right, _) if *op == "==" || *op == "!=" => {
+                        Some((self.expr(left)?, self.expr(right)?))
+                    }
+                    _ => None,
+                };
+                let holds = match (&sides, cond) {
+                    (Some((left, right)), Expr::Binary(op, ..)) => {
+                        (left.text() == right.text()) == (*op == "==")
+                    }
+                    _ => self.expr(cond)?.truthy(),
+                };
+                if !holds {
+                    let mut text = match message {
                         Some(message) => self.expr(message)?.text(),
+                        None if sides.is_some() => "assertion failed".to_owned(),
                         None => format!("assertion failed: {}", self.source_hint(cond)),
                     };
+                    if let Some((left, right)) = sides {
+                        text.push_str(&format!(
+                            "\n  left: {}\n right: {}",
+                            left.text(),
+                            right.text()
+                        ));
+                    }
                     return Err(fail(*span, text));
                 }
             }
@@ -713,6 +763,69 @@ impl<'a> Interp<'a> {
                 Some(next) => Value::Version(next.into()),
                 None => return Err(panic(span, format!("cannot bump version {version}"))),
             },
+            (Value::Struct(kind, fields), _) if &**kind == "Change" => {
+                let mut fields = (**fields).clone();
+                match name {
+                    "profile" => {
+                        fields.insert("profile".into(), Value::Some(Box::new(arg(0))));
+                    }
+                    "env" => {
+                        let Some(Value::List(env)) = fields.get("env") else {
+                            return Err(panic(span, "a Change without env"));
+                        };
+                        let mut env = (**env).clone();
+                        env.push(Value::str(format!("{}={}", arg(0).text(), arg(1).text())));
+                        fields.insert("env".into(), Value::List(Rc::new(env)));
+                    }
+                    "plan" => return Ok(self.plan(&fields, span)),
+                    _ => return Err(panic(span, format!("Change has no method `{name}`"))),
+                }
+                Value::Struct(kind.clone(), Rc::new(fields))
+            }
+            (Value::Struct(kind, fields), "selects") if &**kind == "Plan" => {
+                let wanted = arg(0).text();
+                if !self.checks.contains(&wanted) {
+                    let mut message = format!("no check `{wanted}`");
+                    if let Some(close) =
+                        super::suggest(&wanted, self.checks.iter().map(String::as_str))
+                    {
+                        message.push_str(&format!("; did you mean `{close}`?"));
+                    }
+                    return Err(panic(span, message));
+                }
+                let checks = fields.get("checks").map(Value::text).unwrap_or_default();
+                let Some(Value::List(checks)) = fields.get("checks") else {
+                    return Err(panic(span, format!("a Plan without checks: {checks}")));
+                };
+                Value::Bool(checks.iter().any(|check| check.text() == wanted))
+            }
+            (Value::Struct(kind, fields), "owners" | "groups_of") if &**kind == "Plan" => {
+                let prefix = if name == "owners" {
+                    "target:"
+                } else {
+                    "group:"
+                };
+                let wanted = arg(0).text();
+                let owners = match fields.get("__mapped") {
+                    Some(Value::List(mapped)) => mapped
+                        .iter()
+                        .filter_map(|entry| {
+                            let text = entry.text();
+                            let (path, owners) = text.split_once('\t')?;
+                            (path == wanted).then(|| owners.to_owned())
+                        })
+                        .next(),
+                    _ => None,
+                };
+                Value::List(Rc::new(
+                    owners
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter_map(|owner| owner.strip_prefix(prefix))
+                        .map(Value::str)
+                        .collect(),
+                ))
+            }
             (Value::Command(spec), _) => {
                 let mut spec = (**spec).clone();
                 match name {
@@ -806,6 +919,87 @@ impl<'a> Interp<'a> {
                 context: Vec::new(),
             })),
         }
+    }
+
+    /// `Change::plan`: what Citrus would run for the change.
+    fn plan(&self, fields: &BTreeMap<String, Value>, span: Span) -> Value {
+        let failure = |message: String| {
+            Value::Err(Rc::new(Failure {
+                message,
+                span,
+                context: Vec::new(),
+            }))
+        };
+        let Some(planner) = self.planner else {
+            return failure(
+                "std::plan needs the project (`citrus test`, a check or a task)".into(),
+            );
+        };
+        let texts = |name: &str| match fields.get(name) {
+            Some(Value::List(items)) => items.iter().map(Value::text).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let change = crate::plan::Change {
+            paths: texts("paths"),
+            profile: match fields.get("profile") {
+                Some(Value::Some(profile)) => Some(profile.text()),
+                _ => None,
+            },
+            env: texts("env")
+                .iter()
+                .filter_map(|pair| pair.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+        };
+        let plan = match planner(&change) {
+            Ok(plan) => plan,
+            Err(error) => return failure(format!("plan of {:?}: {error:#}", change.paths)),
+        };
+        let list = |items: &[String], make: fn(Rc<str>) -> Value| {
+            Value::List(Rc::new(
+                items
+                    .iter()
+                    .map(|item| make(item.as_str().into()))
+                    .collect(),
+            ))
+        };
+        let mapped: Vec<String> = plan
+            .mapped
+            .iter()
+            .map(|(path, owners)| format!("{path}\t{owners}"))
+            .collect();
+        Value::Ok(Box::new(Value::Struct(
+            "Plan".into(),
+            Rc::new(BTreeMap::from([
+                ("checks".to_owned(), list(&plan.targets, Value::Str)),
+                ("groups".to_owned(), list(&plan.groups, Value::Str)),
+                ("labels".to_owned(), list(&plan.labels, Value::Str)),
+                ("signals".to_owned(), list(&plan.signals, Value::Str)),
+                ("notes".to_owned(), list(&plan.notes, Value::Str)),
+                ("unclaimed".to_owned(), list(&plan.unmapped, Value::Path)),
+                ("__mapped".to_owned(), list(&mapped, Value::Str)),
+            ])),
+        )))
+    }
+
+    fn change(paths: Value) -> Value {
+        let paths = match paths {
+            Value::List(items) => Value::List(Rc::new(
+                items
+                    .iter()
+                    .map(|item| Value::Path(item.text().into()))
+                    .collect(),
+            )),
+            other => other,
+        };
+        Value::Struct(
+            "Change".into(),
+            Rc::new(BTreeMap::from([
+                ("paths".to_owned(), paths),
+                ("profile".to_owned(), Value::None),
+                ("env".to_owned(), Value::List(Rc::new(Vec::new()))),
+            ])),
+        )
     }
 
     fn builtin(&self, work: Work, span: Span) -> Value {
@@ -920,6 +1114,11 @@ impl<'a> Interp<'a> {
                 },
                 span,
             ),
+            "std::plan::change" => Self::change(arg(0)),
+            "std::plan::of" => match Self::change(arg(0)) {
+                Value::Struct(_, fields) => self.plan(&fields, span),
+                other => other,
+            },
             "std::log::info" => {
                 println!("{}", arg(0).text());
                 Value::Unit

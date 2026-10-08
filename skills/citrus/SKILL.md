@@ -33,8 +33,9 @@ commands in `next`.
    none); `task name { … }`. Commands are written as in a terminal, no
    shell; `{x}` puts a value in, `{list...}` spreads one. A `///` comment
    above it is its description. Then `citrus check` (it explains mistakes
-   before anything runs); `citrus do <task>` runs a task. The language:
-   docs/design/language.md.
+   before anything runs); `citrus do <task>` runs a task. To pin down what a
+   change runs, add a `#[test] fn` with `std::plan::of([...])` and run
+   `citrus test`. The language: docs/design/language.md.
 7. **Bring in the base branch** — `citrus integrate` (merge, keep what is still
    proven, re-check the rest); `citrus integrate --push` to publish when green.
 8. **Other tasks** — `citrus tasks` shows every worktree and the agreements

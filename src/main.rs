@@ -213,6 +213,8 @@ enum Command {
     },
     /// Check citrus.ci before anything runs: syntax, names, fields, globs, portability.
     Check,
+    /// Run the configuration's `#[test]` functions (plans of example changes).
+    Test { filter: Option<String> },
     /// Run a task declared in citrus.ci (no name: list the tasks).
     Do { task: Option<String> },
     /// Check that this repository is set up so Citrus can be trusted.
@@ -431,6 +433,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
         }
         Command::Stats { days } => stats(&context, days, json),
         Command::Check => check_command(&context, json),
+        Command::Test { filter } => test_command(&context, filter.as_deref(), json),
         Command::Do { task } => do_command(&context, task, json),
         Command::Integrate { base, push, no_run } => {
             integrate_command(&mut context, base, push, !no_run, json)
@@ -2220,6 +2223,61 @@ fn emit_release(context: &Context, item: &crate::state::Release, json: bool) -> 
     }
     print_next(&next);
     Ok(code)
+}
+
+fn test_command(context: &Context, filter: Option<&str>, json: bool) -> Result<i32> {
+    let started = std::time::Instant::now();
+    let outcomes = citrus_lang_tests(&context.repo.root, filter)?;
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| outcome.failure.is_some())
+        .count();
+    if json {
+        let tests: Vec<Value> = outcomes
+            .iter()
+            .map(|outcome| json!({"name": outcome.name, "ok": outcome.failure.is_none(), "error": outcome.failure}))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({"schema": SCHEMA, "tests": tests, "passed": outcomes.len() - failed, "failed": failed})
+            )?
+        );
+    } else {
+        for outcome in &outcomes {
+            match &outcome.failure {
+                None => println!("test {} ... ok", outcome.name),
+                Some(failure) => {
+                    println!("test {} ... FAILED", outcome.name);
+                    print!("{failure}");
+                }
+            }
+        }
+        println!(
+            "{} passed, {failed} failed in {:.1}s",
+            outcomes.len() - failed,
+            started.elapsed().as_secs_f64()
+        );
+    }
+    if outcomes.is_empty() {
+        if !json {
+            eprintln!(
+                "no #[test] functions{}",
+                filter
+                    .map(|f| format!(" matching `{f}`"))
+                    .unwrap_or_default()
+            );
+        }
+        return Ok(2);
+    }
+    Ok(i32::from(failed > 0))
+}
+
+fn citrus_lang_tests(
+    root: &std::path::Path,
+    filter: Option<&str>,
+) -> Result<Vec<lang::TestOutcome>> {
+    lang::run_tests(root, filter).map_err(|rendered| anyhow::anyhow!("{rendered}"))
 }
 
 fn check_command(context: &Context, json: bool) -> Result<i32> {

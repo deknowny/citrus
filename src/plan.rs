@@ -67,7 +67,7 @@ fn narrow(plan: &mut Plan, repo: &Repo, manifest: &Manifest) {
 fn compute_all(repo: &Repo, manifest: &Manifest, base: Option<&str>) -> Result<Plan> {
     let fork = fork_point(repo, base.unwrap_or(&repo.config.plan.base));
     let paths = changed_paths(repo, &fork)?;
-    select(repo, manifest, paths, &fork, false)
+    select(repo, manifest, paths, &fork, false, &[])
 }
 
 fn fork_point(repo: &Repo, base: &str) -> String {
@@ -134,7 +134,61 @@ pub fn for_paths(
 }
 
 fn for_paths_all(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
-    select(repo, manifest, paths.to_vec(), before, true)
+    select(repo, manifest, paths.to_vec(), before, true, &[])
+}
+
+/// A change a `#[test]` asks about: its paths, the profile it is planned
+/// in and what the signal command sees in its environment.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Change {
+    pub paths: Vec<String>,
+    pub profile: Option<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// Plans changes for `std::plan` in the checkout at `root`: the project is
+/// loaded on first use, and a change without a profile is planned in the
+/// project's first one, whatever the caller's environment says.
+pub fn planner(root: &std::path::Path) -> impl Fn(&Change) -> Result<Plan> + '_ {
+    let loaded: std::cell::OnceCell<std::result::Result<(Repo, Manifest, String), String>> =
+        std::cell::OnceCell::new();
+    move |change| {
+        let found = loaded.get_or_init(|| {
+            (|| -> Result<(Repo, Manifest, String)> {
+                let mut repo = Repo::discover_at(root)?;
+                let (project, sources) = crate::model::load(root)
+                    .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
+                    .ok_or_else(|| anyhow::anyhow!("no Citrus configuration here"))?;
+                if let Some(base) = &project.base {
+                    repo.config.plan.base = base.clone();
+                }
+                repo.config.plan.profile = project.profiles.first().cloned();
+                let manifest = Manifest::from_project(&project, &sources)?;
+                let before = repo
+                    .git(&["merge-base", &repo.config.plan.base, "HEAD"])
+                    .unwrap_or_default();
+                Ok((repo, manifest, before))
+            })()
+            .map_err(|error| format!("{error:#}"))
+        });
+        let (repo, manifest, before) =
+            found.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
+        for_change(repo, manifest, change, before)
+    }
+}
+
+/// The plan of `change` as `citrus plan --paths-file` would make it.
+pub fn for_change(repo: &Repo, manifest: &Manifest, change: &Change, before: &str) -> Result<Plan> {
+    let mut repo = repo.clone();
+    if let Some(profile) = &change.profile {
+        repo.config.plan.profile = Some(profile.clone());
+    }
+    let mut paths = change.paths.clone();
+    paths.sort();
+    paths.dedup();
+    let mut plan = select(&repo, manifest, paths, before, true, &change.env)?;
+    narrow(&mut plan, &repo, manifest);
+    Ok(plan)
 }
 
 /// Declared targets owning `paths`; new or edited declarations since `before` too.
@@ -145,6 +199,7 @@ fn select(
     paths: Vec<String>,
     fork: &str,
     explicit: bool,
+    env: &[(String, String)],
 ) -> Result<Plan> {
     let mut plan = Plan {
         files: paths.len(),
@@ -171,7 +226,7 @@ fn select(
         edited_surfaces = surfaces;
         plan.targets.extend(changed);
     }
-    let found = signals(repo, manifest, &paths, fork, explicit)?;
+    let found = signals(repo, manifest, &paths, fork, explicit, env)?;
     // Which groups and checks the changed paths touch.
     let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // How many changed paths each group contains, for only() and without().
@@ -388,6 +443,7 @@ fn signals(
     paths: &[String],
     base: &str,
     explicit: bool,
+    env: &[(String, String)],
 ) -> Result<Signals> {
     let Some((program, args)) = manifest.signals.split_first() else {
         return Ok(Signals {
@@ -420,6 +476,7 @@ fn signals(
             "CITRUS_PROFILE",
             repo.config.plan.profile.clone().unwrap_or_default(),
         )
+        .envs(env.iter().cloned())
         .output();
     let _ = std::fs::remove_file(&file);
     let output = output?;

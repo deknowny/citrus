@@ -24,6 +24,10 @@ pub enum Ty {
     Output,
     Release,
     Error,
+    /// A change a `#[test]` plans: `std::plan::change(paths)`.
+    Change,
+    /// What Citrus would run for a change.
+    Plan,
     /// A plan condition: `touched(…)`, `signal("…")`, combined with `&&`, `||`, `!`.
     Cond,
     /// Not known yet: an empty list, a `return` that never falls through.
@@ -49,6 +53,8 @@ impl fmt::Display for Ty {
             Ty::Output => write!(f, "Output"),
             Ty::Release => write!(f, "Release"),
             Ty::Error => write!(f, "Error"),
+            Ty::Change => write!(f, "Change"),
+            Ty::Plan => write!(f, "Plan"),
             Ty::Cond => write!(f, "Cond"),
             Ty::Unknown => write!(f, "_"),
         }
@@ -108,6 +114,12 @@ pub fn std_fn(path: &[String]) -> Option<StdFn> {
         "std::fs::copy" => f(vec![Ty::Path, Ty::Path], result_unit(), true),
         "std::docs::check_links" => f(vec![Ty::Glob], result_unit(), true),
         "std::log::info" => f(vec![Ty::Str], Ty::Unit, true),
+        "std::plan::change" => f(vec![Ty::List(Box::new(Ty::Path))], Ty::Change, false),
+        "std::plan::of" => f(
+            vec![Ty::List(Box::new(Ty::Path))],
+            Ty::Result(Box::new(Ty::Plan)),
+            true,
+        ),
         _ => None,
     }
 }
@@ -127,6 +139,8 @@ pub const STD_FUNCTIONS: &[&str] = &[
     "std::fs::copy",
     "std::docs::check_links",
     "std::log::info",
+    "std::plan::change",
+    "std::plan::of",
 ];
 
 /// A method of a built-in type: parameters, result, I/O, needs a `let mut` receiver.
@@ -167,6 +181,11 @@ pub fn method(receiver: &Ty, name: &str) -> Option<(Vec<Ty>, Ty, bool, bool)> {
         (Ty::Command, "current_dir") => pure(vec![Ty::Path], Ty::Command),
         (Ty::Command, "run") => Some((vec![], result_unit(), true, false)),
         (Ty::Command, "output") => Some((vec![], Ty::Result(Box::new(Ty::Output)), true, false)),
+        (Ty::Change, "profile") => pure(vec![Ty::Str], Ty::Change),
+        (Ty::Change, "env") => pure(vec![Ty::Str, Ty::Str], Ty::Change),
+        (Ty::Change, "plan") => Some((vec![], Ty::Result(Box::new(Ty::Plan)), true, false)),
+        (Ty::Plan, "selects") => pure(vec![Ty::Str], Ty::Bool),
+        (Ty::Plan, "owners" | "groups_of") => pure(vec![Ty::Path], Ty::List(Box::new(Ty::Str))),
         _ => None,
     }
 }
@@ -203,6 +222,11 @@ fn methods_of(receiver: &Ty) -> Vec<&'static str> {
         "current_dir",
         "run",
         "output",
+        "profile",
+        "plan",
+        "selects",
+        "owners",
+        "groups_of",
     ]
     .into_iter()
     .filter(|name| method(receiver, name).is_some())
@@ -218,6 +242,10 @@ pub fn builtin_field(receiver: &Ty, name: &str) -> Option<Ty> {
         (Ty::Release, "previous") => Some(Ty::Option(Box::new(Ty::Version))),
         (Ty::Release, "commit" | "unit") => Some(Ty::Str),
         (Ty::Error, "message") => Some(Ty::Str),
+        (Ty::Plan, "checks" | "groups" | "labels" | "signals" | "notes") => {
+            Some(Ty::List(Box::new(Ty::Str)))
+        }
+        (Ty::Plan, "unclaimed") => Some(Ty::List(Box::new(Ty::Path))),
         _ => None,
     }
 }
@@ -282,6 +310,8 @@ pub fn resolve_type(
         "Output" => Ty::Output,
         "Release" => Ty::Release,
         "Error" => Ty::Error,
+        "Change" => Ty::Change,
+        "Plan" => Ty::Plan,
         "Cond" => Ty::Cond,
         "list" => {
             arity(1)?;
@@ -441,6 +471,16 @@ fn check_item_in(item: &Item, globals: &Globals, group: Option<&str>) -> Result<
     match &item.kind {
         ItemKind::Fn(function) => {
             let sig = &globals.fns[&item.name];
+            if item.attrs.iter().any(|attr| attr.name == "test")
+                && (function.is_const
+                    || !function.params.is_empty()
+                    || !matches!(&sig.ret, Ty::Unit) && sig.ret != result_unit())
+            {
+                return Err(Error::at(
+                    item.span,
+                    "a `#[test]` is `fn name() -> Result<()>`: no parameters, not `const`",
+                ));
+            }
             let phase = if function.is_const {
                 Phase::Plan
             } else {
@@ -627,6 +667,8 @@ pub fn check_attr_in(attr: &Attr, globals: &Globals, group: Option<&str>) -> Res
                 }
             }
         }
+        "test" if attr.args.is_empty() => {}
+        "test" => return Err(Error::at(attr.span, "`#[test]` takes no arguments")),
         "cache" | "production" => {
             for (_, arg) in &attr.args {
                 let mut checker = Checker::new(globals, Phase::Load, Ty::Unknown);
@@ -674,7 +716,7 @@ pub fn check_attr_in(attr: &Attr, globals: &Globals, group: Option<&str>) -> Res
                 .map(|(name, _)| *name)
                 .chain(CONFIG.iter().copied())
                 .chain(CONDITIONS.iter().copied())
-                .chain(["paths", "reads", "cache", "production", "version"]);
+                .chain(["paths", "reads", "cache", "production", "version", "test"]);
             let mut error = Error::at(attr.span, format!("unknown attribute `#[{other}]`"));
             if let Some(close) = suggest(other, known) {
                 error = error.help(format!("did you mean `#[{close}]`?"));
