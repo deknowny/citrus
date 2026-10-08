@@ -45,16 +45,13 @@ dbg_macro = "deny"
 todo = "deny"
 print_stdout = "warn"
 
+# Plain release; `strip` only keeps the published binary small.
 [profile.release]
-lto = "thin"
-codegen-units = 1
 strip = true
 
-# Pinned builds that roll out across a pool (bin/citrus, agents): optimized,
-# but incremental and without whole-program LTO, so a one-line change
-# rebuilds in seconds instead of most of a minute.
+# Pinned builds that roll out across a pool: release, incremental, so a
+# one-line change rebuilds in about two seconds.
 [profile.fast]
 inherits = "release"
-lto = false
 codegen-units = 256
 incremental = true
