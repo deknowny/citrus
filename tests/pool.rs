@@ -14,7 +14,9 @@ fn citrus_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_citrus"));
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("CITRUS_") && name != "CITRUS_TEST_POOL" {
+        // A shared target directory would take the fixtures' own builds.
+        if (name.starts_with("CITRUS_") && name != "CITRUS_TEST_POOL") || name == "CARGO_TARGET_DIR"
+        {
             command.env_remove(&key);
         }
     }
@@ -712,8 +714,8 @@ fn a_long_check_does_not_hold_the_agent() {
     assert!(agent.wait().unwrap().success());
 }
 
-/// A published build is listed under the commit it reports and can be
-/// published again (a rebuild replaces it).
+/// A published build is listed under the commit it reports; publishing it
+/// again keeps the first one.
 #[test]
 fn a_published_build_is_held_by_commit_and_platform() {
     let Ok(pool) = std::env::var("CITRUS_TEST_POOL") else {

@@ -3,8 +3,31 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CITRUS_BUILD_COMMIT");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
+    // An edit not yet added changes no Git file but makes the build dirty.
+    for path in ["src", "build.rs", "Cargo.toml", "Cargo.lock"] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    // The files that move with the checked-out commit, wherever Git keeps
+    // them: in a linked worktree `.git` is a file and HEAD lives elsewhere,
+    // and a build that missed that published a new tree as an old commit.
+    for (args, file) in [
+        (&["rev-parse", "--absolute-git-dir"][..], "HEAD"),
+        (&["rev-parse", "--absolute-git-dir"][..], "index"),
+        (
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"][..],
+            "packed-refs",
+        ),
+    ] {
+        if let Some(dir) = git(args) {
+            println!("cargo:rerun-if-changed={dir}/{file}");
+        }
+    }
+    if let (Some(common), Some(head)) = (
+        git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+        git(&["symbolic-ref", "-q", "HEAD"]),
+    ) {
+        println!("cargo:rerun-if-changed={common}/{head}");
+    }
     let commit = std::env::var("CITRUS_BUILD_COMMIT")
         .ok()
         .filter(|value| !value.is_empty())

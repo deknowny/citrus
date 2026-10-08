@@ -1433,7 +1433,8 @@ pub fn fetch_published(commit: &str, platform: &str, to: &Path) -> Result<bool> 
 }
 
 /// Publish a Citrus build to the pool under the commit it reports
-/// (`citrus --version`) and `platform` (default: this machine's).
+/// (`citrus --version`) and `platform` (default: this machine's). The first
+/// build of a commit stays: whoever took it keeps the same bytes.
 pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, String, String)> {
     use sha2::{Digest, Sha256};
     let output = Command::new(file)
@@ -1469,7 +1470,7 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
     let mut client = connect(&url)?;
     client.execute(
         "insert into citrus.binaries (commit_sha, platform, sha256, data) values ($1, $2, $3, $4)
-         on conflict (commit_sha, platform) do update set sha256 = $3, data = $4, created = now()",
+         on conflict (commit_sha, platform) do nothing",
         &[&commit, &platform, &sha, &data],
     )?;
     Ok((commit, platform, sha))

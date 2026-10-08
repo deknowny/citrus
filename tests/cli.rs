@@ -13,7 +13,9 @@ fn citrus_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_citrus"));
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("CITRUS_") && name != "CITRUS_TEST_POOL" {
+        // A shared target directory would take the fixtures' own builds.
+        if (name.starts_with("CITRUS_") && name != "CITRUS_TEST_POOL") || name == "CARGO_TARGET_DIR"
+        {
             command.env_remove(&key);
         }
     }
