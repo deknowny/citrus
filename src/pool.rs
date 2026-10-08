@@ -95,9 +95,26 @@ pub fn connect(url: &str) -> Result<Client> {
 }
 
 /// The pool's tables; any client creates them on first use.
+/// The schema version this build writes; bump with every change below.
+const SCHEMA_VERSION: i32 = 3;
+
+/// The pool's tables. DDL takes exclusive table locks even when it changes
+/// nothing, so it runs only when the recorded version is behind; every other
+/// connection reads one row.
 fn migrate(client: &mut Client) -> Result<()> {
+    let current: Option<i32> = client
+        .query_opt(
+            "select version from citrus.meta where to_regclass('citrus.meta') is not null",
+            &[],
+        )
+        .ok()
+        .flatten()
+        .map(|row| row.get(0));
+    if current.is_some_and(|version| version >= SCHEMA_VERSION) {
+        return Ok(());
+    }
     client.batch_execute(
-        "begin;
+        &"begin;
         select pg_advisory_xact_lock(74657);
         create schema if not exists citrus;
         create table if not exists citrus.agents (
@@ -152,7 +169,11 @@ fn migrate(client: &mut Client) -> Result<()> {
         alter table citrus.events add column if not exists tx xid8 not null default pg_current_xact_id();
         create index if not exists events_by_run on citrus.events (run, id);
         create index if not exists jobs_queued on citrus.jobs (state) where state = 'queued';
-        commit;",
+        create table if not exists citrus.meta (version integer not null);
+        delete from citrus.meta;
+        insert into citrus.meta (version) values (SCHEMA_VERSION);
+        commit;"
+            .replace("SCHEMA_VERSION", &SCHEMA_VERSION.to_string()),
     )?;
     Ok(())
 }
