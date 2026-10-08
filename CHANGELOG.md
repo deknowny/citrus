@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Breaking: a new configuration language (docs/design/language.md). Every
+`.ci` file starts with `#![citrus(2)]`; the old language is gone.
+
+- Rust-like items: `check`, `group`, `task`, `profile`, `service`,
+  `artifact`, `environment`, `release`, `const`, `fn`, `struct`, configured
+  by attributes (`#[paths(…)]`, `#[needs(…)]`, `#[when(…)]`, …) and project
+  attributes (`#![main(…)]`, `#![signals(cmd!(…))]`, …).
+- Bodies are typed code checked before anything runs: `Option`, `Result`
+  with one error type, lists, structs, `match`, `?`, `assert`. A failure is
+  reported with its place in the file. Conditions are values (`Cond`) and
+  can live in constants and `const fn`.
+- `run!("…")` and `cmd!("…")` take command lines as in a terminal, without
+  a shell. Citrus understands Cargo commands: a check's inputs are the
+  packages it builds, and a misspelled subcommand or package is an error.
+- `match changed` is replaced by checks with exclusive `#[when]`;
+  `citrus fmt` is removed until the language has a formatter.
+
 - A release continues from the version its environment runs when Citrus can
   read it (the record annotation), not only from releases Citrus made: units
   released by other means no longer restart at `initial`.

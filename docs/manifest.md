@@ -32,13 +32,15 @@ The runner runs with `CITRUS_CHECKS` set to a JSON file; `citrus targets --json`
              "inputs": ["api/**"], "extra_inputs": ["Cargo.lock"], "resources": ["database"],
              "meta": {"linux": true}, "source": ".citrus/api.ci:3",
              "declaration": {"env": {"SQLX_OFFLINE": "true"}, "extra_inputs": ["Cargo.lock"],
-                             "inputs": ["api/**"], "run": [["run", "make", "--no-print-directory", "test-api"]],
+                             "inputs": ["api/**"], "run": [["run", "make", "test-api"]],
                              "target": "api.unit"}}]}
 ```
 
-`inputs` are `paths`, `extra_inputs` are `reads`, `resources` are the
-services in `needs`, `arms` the `match changed` arms with what each runs. `run` is what the check runs: for a `match changed`
-check, the arm the plan chose (`CITRUS_CHECKS` of a run), otherwise `_`.
+`inputs` are `#[paths]` and what its commands read (docs/design/language.md#commands),
+`extra_inputs` are `#[reads]`, `resources` are the services in `#[needs]`.
+`run` is what the check runs: a body that runs one fixed command line is
+that process (`["run", program, args…]`); any other body is
+`["script", "check:<name>", <digest of its source and the functions it may call>]`.
 
 ## Input fingerprint
 

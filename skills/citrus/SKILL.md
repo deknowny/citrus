@@ -27,12 +27,14 @@ commands in `next`.
    `--target <name>` for one check, `--full` only if the first error is not enough.
 5. **Unclear why a check is needed** — `citrus why <target>`.
 6. **New check or task** — declare it in `citrus.ci` (or the product's
-   `.citrus/*.ci`): `check name = make("target") { paths = [...] }`, inside
-   the product's `group` when it protects the group's paths; `task name =
-   [...]`. Steps are actions such as `make(...)`, `cargo.test(...)`,
-   `pnpm.test(...)`, `wait.tcp(...)`, `copy(...)` — no shell scripts. A
-   comment above it is its description. Then `citrus fmt` and
-   `citrus check`; `citrus do <task>` runs a task.
+   `.citrus/*.ci`), inside the product's `group` when it protects the
+   group's paths: `check name { run!("make target")?; }` with
+   `#[paths("…")]` unless Citrus understands the command (`cargo …` needs
+   none); `task name { … }`. Commands are written as in a terminal, no
+   shell; `{x}` puts a value in, `{list...}` spreads one. A `///` comment
+   above it is its description. Then `citrus check` (it explains mistakes
+   before anything runs); `citrus do <task>` runs a task. The language:
+   docs/design/language.md.
 7. **Bring in the base branch** — `citrus integrate` (merge, keep what is still
    proven, re-check the rest); `citrus integrate --push` to publish when green.
 8. **Other tasks** — `citrus tasks` shows every worktree and the agreements

@@ -84,29 +84,32 @@ See [docs/manifest.md](docs/manifest.md) for the exact format.
 cargo install --git https://github.com/deknowny/citrus --locked   # or a release binary
 cd your-repo
 cat > citrus.ci <<'CI'
-citrus 1
+#![citrus(2)]
 
-# Unit tests.
-check test = make("test") {
-  paths = ["src/**", "tests/**"]
+/// Unit tests: their inputs come from Cargo.
+check test {
+    run!("cargo test --locked")?;
 }
 
-# Start the database and wait for it.
-task dev-db = [compose.up("db"), wait.tcp("localhost:5432", timeout: 60s)]
+/// Start the database and wait for it.
+task dev_db {
+    run!("docker compose up -d db")?;
+    std::wait::tcp("localhost:5432", 60s)?;
+}
 CI
 citrus check     # validates the configuration, points at the line if something is wrong
 citrus status
 citrus run
-citrus do dev-db
+citrus do dev_db
 ```
 
-`citrus.ci` is the whole configuration, in a small language where every
-element does something: declarations (`check test`, `group api`,
-`profile e2e`), references to them by bare name, data in quotes, and a
-comment above a declaration as its description. Paths are derived from the
-workspace — `crate("api")` is a Rust crate and every crate it depends on,
-`next("@acme/shop")` a Next.js app and its packages — and steps are built
-into Citrus so they behave the same on macOS, Linux and Windows. A larger
+`citrus.ci` is the whole configuration, in a small language that reads
+like Rust: items (`check test`, `group api`, `profile e2e`), attributes
+(`#[paths(…)]`, `#[needs(…)]`, `#[when(…)]`), typed bodies checked before
+anything runs, and a `///` comment as the description. Commands are written
+as in a terminal, `run!("cargo test -p api")`, and Citrus understands the
+ones it knows: a Cargo check needs no paths, its inputs are the packages it
+builds; a typo in a package name is an error before anything runs. A larger
 project splits it into `.citrus/*.ci`, one file per product — see
 [docs/design/language.md](docs/design/language.md). This repository's own
 [`citrus.ci`](citrus.ci) is a short real example; every declaration is

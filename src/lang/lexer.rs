@@ -1,4 +1,4 @@
-//! Tokens of language v2 (docs/design/language-v2.md).
+//! Tokens of the Citrus language (docs/design/language.md).
 
 use crate::lang::{Error, Span};
 

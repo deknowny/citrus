@@ -5,37 +5,46 @@ order from a committed source, records every step, holds the unit's
 environment for one release at a time, and knows what to do after an
 interruption.
 
-```
-# The web app to production.
+```rust
+/// The web app's production: one release at a time here, across worktrees.
+environment web_production;
+
+/// The web app to production.
+#[environment(web_production)]
+// The version after the last passed (or running) release, or the first free
+// one after it; held for this commit and the names it publishes.
+#[version(initial = "1.4.0", scope = ["web-image"])]     // scope default: the unit's name
 release web {
-  environment = web-production     # one release at a time here, across worktrees
-  checks = proven                  # default; `none`: no check gate
+    step build(r: Release) {
+        run!("make image VERSION={r.version}")?;
+    }
 
-  # The version after the last passed release, or the first free one after
-  # it; held for this commit and the names it publishes.
-  version {
-    initial = "1.4.0"
-    scope = ["web-image"]          # default: the unit's name
-  }
+    #[production]                      // needs --approve
+    #[recover(reconcile)]              // when the outcome is unknown: reconcile, never repeat
+    step deploy(r: Release) {
+        run!("make deploy VERSION={r.version}")?;
+    }
 
-  step build = make("image", VERSION: version)
-  step deploy = make("deploy", VERSION: version) {
-    production = true              # needs --approve
-    # When the outcome is unknown: reconcile, never blindly repeat.
-    recover = make("deploy-reconcile", VERSION: version)
-  }
-  step postcheck = make("smoke", VERSION: version)
+    step postcheck(r: Release) {
+        run!("make smoke VERSION={r.version}")?;
+    }
 
-  # `version` is the release before the last passed one.
-  rollback = make("deploy", VERSION: version) {
-    production = true
-  }
+    // `r.version` is the release before the last passed one.
+    #[production]
+    rollback(r: Release) {
+        run!("make deploy VERSION={r.version}")?;
+    }
+}
+
+fn reconcile(r: Release) -> Result<()> {
+    run!("make deploy-reconcile VERSION={r.version}")
 }
 ```
 
-Values Citrus fills in: `version` (being reserved, released, or the
-rollback target), `previous` (last passed release), `commit`, `unit`; inside
-strings write `{version}`.
+`#[checks(none)]` turns off the gate that every check the plan selects is
+proven for the release commit. `Release` holds `version` (being released, or
+the rollback target), `previous` (`Option`: the release before), `commit`
+and `unit`.
 
 ## Versions
 
@@ -52,12 +61,10 @@ reserves the same way.
 Versions published outside Citrus are reported by the project's
 `free_version` hook:
 
-```
-project {
-  # Prints the first version at or after $CITRUS_VERSION that the registry
-  # does not have for any name in $CITRUS_SCOPE (comma-separated).
-  free_version = run("scripts/registry.sh", "free-version")
-}
+```rust
+// Prints the first version at or after $CITRUS_VERSION that the registry
+// does not have for any name in $CITRUS_SCOPE (comma-separated).
+#![free_version(cmd!("scripts/registry.sh free-version"))]
 ```
 
 It prints the version on its last line (a `NAME=` prefix is ignored).
