@@ -1137,6 +1137,15 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
         ("CITRUS_AGENT".into(), format!("pool:{}", machine.name)),
         ("CITRUS_POOL".into(), String::new()),
         ("CITRUS_POOL_SHARE".into(), machine.share.to_string()),
+        // The repository's own launcher (bin/citrus) runs this build too.
+        (
+            "CITRUS_BIN".into(),
+            if in_container {
+                "/usr/local/bin/citrus-pool".to_owned()
+            } else {
+                exe.to_string_lossy().into_owned()
+            },
+        ),
         (
             "CITRUS_POOL_CACHE".into(),
             shared.to_string_lossy().into_owned(),
