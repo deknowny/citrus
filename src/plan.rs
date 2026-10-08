@@ -284,6 +284,14 @@ fn select(
         if !given.is_empty() {
             owners = given;
             groups.clear();
+        } else {
+            // Checks whose Make recipes read the path run too; the path
+            // stays its owners' as well.
+            for target in manifest.targets.values() {
+                if target.follows(path) && !owners.contains(&target.name.as_str()) {
+                    owners.push(&target.name);
+                }
+            }
         }
         // Checks that name a group in their paths run for its paths too.
         for target in manifest.targets.values() {

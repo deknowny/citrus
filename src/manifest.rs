@@ -47,6 +47,8 @@ pub struct Target {
     pub position: usize,
     owned: GlobList,
     extra: GlobList,
+    /// What its Make recipes read (see `follows`).
+    followed: GlobList,
 }
 
 /// Globs in order; `!glob` removes matches of the globs before it, and the
@@ -101,7 +103,13 @@ impl Target {
             position: 0,
             owned,
             extra,
+            followed: GlobList::new(&check.follows)?,
         })
+    }
+
+    /// A change to `path` selects it because its recipes read the path.
+    pub fn follows(&self, path: &str) -> bool {
+        self.followed.matches(path)
     }
 
     /// Same inputs, cache and resources: a reformatted entry is not a new check.

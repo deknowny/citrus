@@ -399,6 +399,8 @@ struct Reads {
     summaries: Vec<String>,
     /// Some command was not understood (or does not select).
     opaque: bool,
+    /// Inputs that select the check without being its alone.
+    follows: Vec<String>,
 }
 
 fn understood(compiler: &Compiler, body: &Block) -> Compiled<Reads> {
@@ -425,6 +427,7 @@ fn understood(compiler: &Compiler, body: &Block) -> Compiled<Reads> {
     }
     let mut inputs = Vec::new();
     let mut reads: Vec<String> = Vec::new();
+    let mut follows: Vec<String> = Vec::new();
     let mut summaries = Vec::new();
     let mut opaque = false;
     for expr in found {
@@ -450,6 +453,11 @@ fn understood(compiler: &Compiler, body: &Block) -> Compiled<Reads> {
                 if !found.selects {
                     opaque = true;
                 }
+                for glob in &found.follows {
+                    if !follows.contains(glob) {
+                        follows.push(glob.clone());
+                    }
+                }
                 let into = if found.selects {
                     &mut inputs
                 } else {
@@ -470,6 +478,7 @@ fn understood(compiler: &Compiler, body: &Block) -> Compiled<Reads> {
         reads,
         summaries,
         opaque,
+        follows,
     })
 }
 
@@ -502,6 +511,7 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         reads: understood_reads,
         summaries,
         opaque,
+        follows,
     } = understood(compiler, body)?;
     // Understood inputs select the check on their own only when every command
     // was understood; a plain process next to them needs `#[paths]`.
@@ -521,9 +531,9 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
     reads.extend(from.reads.iter().cloned());
     let known_inputs =
         !owns.is_empty() || !reads.is_empty() || !via.is_empty() || !reads_via.is_empty();
-    for glob in understood_reads {
-        if !reads.contains(&glob) {
-            reads.push(glob);
+    for glob in &understood_reads {
+        if !reads.contains(glob) {
+            reads.push(glob.clone());
         }
     }
     let mut env = from.env.clone();
@@ -573,6 +583,7 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         cache_set: compiler.flag(&item.attrs, "cache")?.or(from.cache),
         known_inputs,
         reads_via,
+        follows,
         resources,
         meta,
         env,

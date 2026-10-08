@@ -197,7 +197,9 @@ impl Makefiles {
 
     /// Repository files `make <target>` reads: None when the target is not a
     /// rule here. Inputs are globs (`dir/**` for a directory a recipe names).
-    pub fn inputs(&self, target: &str, files: &dyn Files) -> Option<Vec<String>> {
+    /// First everything, then what certainly is read: the Makefiles and the
+    /// files the recipes name (not the files scripts merely mention).
+    pub fn inputs(&self, target: &str, files: &dyn Files) -> Option<(Vec<String>, Vec<String>)> {
         self.rules.get(target)?;
         let known: BTreeSet<&str> = files.list().iter().map(String::as_str).collect();
         let mut inputs: BTreeSet<String> = BTreeSet::new();
@@ -250,6 +252,7 @@ impl Makefiles {
                 }
             }
         }
+        let direct: Vec<String> = inputs.iter().cloned().collect();
         // Scripts read the files they name, and code follows into the code
         // it names; data and documents are read, not followed.
         while let Some((script, depth)) = scripts.pop() {
@@ -262,7 +265,7 @@ impl Makefiles {
                 }
             }
         }
-        Some(inputs.into_iter().collect())
+        Some((inputs.into_iter().collect(), direct))
     }
 
     /// Files a script names (none for a file that is not code).
@@ -420,6 +423,8 @@ fn words(text: &str) -> Vec<String> {
 /// A word naming a repository file or directory, relative to the root or to
 /// `dir`: the file, or `dir/**`.
 fn repo_path(word: &str, dir: &str, known: &BTreeSet<&str>) -> Option<String> {
+    // Recipe prefixes: `@` (quiet), `+` (run under -n).
+    let word = word.trim_start_matches(['@', '+']);
     let word = word
         .trim_start_matches("$$repo_root/")
         .trim_start_matches("$repo_root/")
@@ -545,7 +550,18 @@ mod tests {
             ("scripts/other.sh", ""),
         ]);
         let makefiles = Makefiles::load(&files).unwrap();
-        let inputs = makefiles.inputs("test-api", &files).unwrap();
+        let (inputs, direct) = makefiles.inputs("test-api", &files).unwrap();
+        assert_eq!(
+            direct,
+            vec![
+                "Makefile",
+                "docs/tests/**",
+                "make/schema.mk",
+                "make/tests.mk",
+                "scripts/run-tests.sh",
+                "scripts/test-schema.py"
+            ]
+        );
         assert_eq!(
             inputs,
             vec![

@@ -19,6 +19,9 @@ pub struct Understood {
     /// Whether a change to the inputs selects the check (Cargo) or only
     /// invalidates its pass (Make: recipes are shared by many checks).
     pub selects: bool,
+    /// Inputs that select the check without being its alone: what a Make
+    /// recipe certainly reads.
+    pub follows: Vec<String>,
 }
 
 /// Repository files for the tool readers: the working tree or a commit.
@@ -167,6 +170,7 @@ fn make_targets(
         return Ok(None);
     }
     let mut inputs: Vec<String> = Vec::new();
+    let mut follows: Vec<String> = Vec::new();
     let mut inner: Vec<String> = Vec::new();
     for target in &targets {
         // Recipe commands Citrus understands (Cargo, declared wrappers) add
@@ -183,7 +187,7 @@ fn make_targets(
                 }
             }
         }
-        let Some(found) = makefiles.inputs(target, files) else {
+        let Some((found, direct)) = makefiles.inputs(target, files) else {
             let mut error = Error::at(span, format!("no Make target `{target}`"));
             if let Some(close) = suggest(target, makefiles.targets()) {
                 error = error.help(format!("did you mean `{close}`?"));
@@ -193,6 +197,11 @@ fn make_targets(
         for input in found {
             if !inputs.contains(&input) {
                 inputs.push(input);
+            }
+        }
+        for input in direct {
+            if !follows.contains(&input) {
+                follows.push(input);
             }
         }
     }
@@ -205,6 +214,7 @@ fn make_targets(
         summary,
         inputs,
         selects: false,
+        follows,
     }))
 }
 
@@ -389,6 +399,7 @@ fn cargo(
         summary,
         inputs,
         selects: true,
+        follows: Vec::new(),
     }))
 }
 

@@ -3661,3 +3661,64 @@ check tool {
     let (run, _) = project.json(&["run", "tool", "--local"]);
     assert_eq!(target(&run, "tool")["result"], "reused", "{run}");
 }
+
+#[test]
+fn a_change_to_what_a_recipe_reads_selects_its_check() {
+    let project = Project::v2(
+        r#"#![citrus(2)]
+
+#[paths("api/**")]
+check api {
+    run!("make test-api")?;
+}
+
+#[paths("web/**")]
+check web {
+    run!("make test-web")?;
+}
+
+/// The build machinery.
+#[paths("make/**", "scripts/**")]
+check machinery {
+    run!("make ok")?;
+}
+"#,
+    );
+    project.write("Makefile", "include make/*.mk\nok:\n\t@true\n");
+    project.write("make/api.mk", "test-api:\n\t@./scripts/api-test.sh\n");
+    project.write("make/web.mk", "test-web:\n\t@true\n");
+    project.write("scripts/api-test.sh", "#!/bin/sh\ntrue\n");
+    project.write("api/a.txt", "a\n");
+    project.write("web/w.txt", "w\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "make",
+    ]);
+    let plan = |paths: &str| {
+        project.write("paths.txt", paths);
+        let output = project.citrus(&["plan", "--paths-file", "paths.txt", "--json"]);
+        let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+        plan["plan"]["targets"].clone()
+    };
+    // The recipe's Makefile and the script it runs select the check that
+    // runs them, and still their owner.
+    assert_eq!(
+        plan("make/api.mk\n"),
+        serde_json::json!(["api", "machinery"])
+    );
+    assert_eq!(
+        plan("scripts/api-test.sh\n"),
+        serde_json::json!(["api", "machinery"])
+    );
+    assert_eq!(
+        plan("make/web.mk\n"),
+        serde_json::json!(["web", "machinery"])
+    );
+    assert_eq!(plan("api/a.txt\n"), serde_json::json!(["api"]));
+}

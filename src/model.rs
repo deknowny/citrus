@@ -235,6 +235,10 @@ pub struct Check {
     /// Groups whose paths are read but do not select it (`#[reads(group)]`).
     #[serde(skip)]
     pub reads_via: Vec<String>,
+    /// What its `make` recipes read: a change there selects it too, without
+    /// taking the path from the checks and groups that own it.
+    #[serde(skip)]
+    pub follows: Vec<String>,
     /// Profiles the check belongs to; empty: every profile.
     pub profiles: Vec<String>,
     /// Checks that already run this one: with one of them in a plan, this one is dropped.

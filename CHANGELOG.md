@@ -23,6 +23,9 @@ Breaking: a new configuration language (docs/design/language.md). Every
   failed unittest/pytest/node tests.
 - A cached check run locally is watched: what its Python and Node programs
   read outside its inputs keeps the pass from being reused, and is named.
+- A change to a file a check's Make recipe certainly reads (its Makefiles,
+  the files the recipe names) selects the check too, next to the path's
+  owners.
 - Commands in a target's recipe that Citrus understands (Cargo, declared
   wrappers) add what they read; `citrus deps` checks those targets too. Only
   paths and `#[reads]` let a pass be reused: inputs inferred from a recipe

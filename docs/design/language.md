@@ -266,8 +266,11 @@ starts:
   defining them and the variables their recipes use, and the files the
   recipes name, followed into the scripts those name (code only, files
   only). A target the Makefiles do not define is an error before anything
-  runs. A recipe is shared by many checks, so these inputs only make a pass
-  stale (they join `#[reads]`); what selects the check stays its paths.
+  runs. These inputs make a pass stale (they join `#[reads]`). What the
+  recipes certainly read — the Makefiles and the files the recipes name —
+  also selects the check, without taking the path from the checks and
+  groups that own it: a change to `scripts/run-tests.sh` runs every check
+  whose recipe runs it.
 
 A wrapper script is understood like the command line it stands for once the
 project says so: `#![tool("scripts/cargo-test.sh", cmd!("cargo test"))]`
