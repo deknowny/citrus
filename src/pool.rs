@@ -22,6 +22,25 @@ const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const STALE_SECONDS: i64 = 60;
 const HEARTBEAT: Duration = Duration::from_secs(10);
 
+/// Set by SIGTERM/SIGINT: the agent hands its checks back and leaves.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_stop(_signal: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// The batch was stopped with the agent; its checks go back to the queue.
+#[derive(Debug)]
+struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the agent is stopping")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
 /// The pool this person uses: `CITRUS_POOL`, else the first line of
 /// `~/.config/citrus/pool`. Per person, not per repository.
 pub fn url() -> Option<String> {
@@ -642,6 +661,11 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
         cache: cache_root(),
     };
     std::fs::create_dir_all(&machine.cache)?;
+    // SAFETY: the handler only stores to an atomic.
+    unsafe {
+        libc::signal(libc::SIGTERM, on_stop as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_stop as *const () as libc::sighandler_t);
+    }
     let mut client = connect(&url)?;
     client.execute(
         "insert into citrus.agents (name, labels, container, cpus, share, slots, version, state, running, seen, started)
@@ -730,11 +754,37 @@ fn serve(
             eprintln!("citrus agent {}: drained", machine.name);
             return Ok(0);
         }
+        if STOP.load(Ordering::SeqCst) {
+            eprintln!("citrus agent {}: stopped", machine.name);
+            return Ok(0);
+        }
         let claimed = claim(client, machine)?;
         if let Some((run, checks)) = claimed {
             running.store(checks.len(), Ordering::SeqCst);
             let outcome = execute(client, machine, &run, &checks);
             running.store(0, Ordering::SeqCst);
+            if let Err(error) = &outcome
+                && error.downcast_ref::<Stopped>().is_some()
+            {
+                // Another agent takes them; nothing ran to completion here.
+                client.execute(
+                    "update citrus.jobs set state = 'queued', agent = null, claimed = null
+                     where run = $1 and agent = $2 and state = 'claimed'",
+                    &[&run.id, &machine.name],
+                )?;
+                emit(
+                    client,
+                    &run.id,
+                    &machine.name,
+                    &[format!(
+                        "CITRUS_STAGE {} stopped: {} back in the queue",
+                        machine.name,
+                        checks.join(", ")
+                    )],
+                )?;
+                notify(client, "citrus_jobs", &run.id)?;
+                continue;
+            }
             if let Err(error) = outcome {
                 // The checks fail with the reason; the agent stays.
                 let line = format!("citrus agent {}: {error:#}", machine.name);
@@ -909,7 +959,12 @@ fn checkout(machine: &Machine, run: &RunRow) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// A Citrus binary of `version` for this machine, or (`linux`) for its containers.
-fn executor(machine: &Machine, version: &str, container: Option<&str>) -> Result<PathBuf> {
+fn executor(
+    machine: &Machine,
+    version: &str,
+    container: Option<&str>,
+    announce: &mut dyn FnMut(String) -> Result<()>,
+) -> Result<PathBuf> {
     let own = std::env::current_exe()?;
     let same_platform =
         container.is_none_or(|platform| platform == format!("{}/{}", os_label(), arch()));
@@ -942,6 +997,10 @@ fn executor(machine: &Machine, version: &str, container: Option<&str>) -> Result
         .join(format!(".{version}-{platform}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)?;
+    announce(format!(
+        "builds Citrus {} for {platform} (once per version)",
+        &version[..12.min(version.len())]
+    ))?;
     let status = match container {
         None => Command::new("cargo")
             .args([
@@ -1026,6 +1085,23 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
             format!("CITRUS_STAGE {} runs {}", machine.name, checks.join(", ")),
         ],
     )?;
+    if !machine
+        .cache
+        .join("work")
+        .join(&run.id)
+        .join(".git")
+        .exists()
+    {
+        emit(
+            client,
+            &run.id,
+            &machine.name,
+            &[format!(
+                "CITRUS_STAGE {} fetches the snapshot",
+                machine.name
+            )],
+        )?;
+    }
     let (mirror, tree) = checkout(machine, run)?;
     let in_container = run.image.is_some() && machine.docker;
     let platform = if in_container {
@@ -1033,7 +1109,14 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
     } else {
         None
     };
-    let exe = executor(machine, &run.version, platform.as_deref())?;
+    let exe = executor(machine, &run.version, platform.as_deref(), &mut |what| {
+        emit(
+            client,
+            &run.id,
+            &machine.name,
+            &[format!("CITRUS_STAGE {} {what}", machine.name)],
+        )
+    })?;
     let jobs = checks.len().to_string();
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -1062,6 +1145,12 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
     let name = format!("citrus-{}-{}", run.id, short_hash(&checks.join(",")));
     let mut command;
     if in_container {
+        emit(
+            client,
+            &run.id,
+            &machine.name,
+            &[format!("CITRUS_STAGE {} prepares the image", machine.name)],
+        )?;
         let image = build_image(&tree, run.image.as_ref().context("image")?)?;
         command = Command::new("docker");
         command.args([
@@ -1149,6 +1238,7 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
     let mut flushed = Instant::now();
     let mut looked = Instant::now();
     let mut cancelled = false;
+    let mut stopped = false;
     loop {
         match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(line) => {
@@ -1177,6 +1267,18 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
             pending.clear();
             flushed = Instant::now();
         }
+        if !cancelled && STOP.load(Ordering::SeqCst) {
+            cancelled = true;
+            stopped = true;
+            if in_container {
+                let _ = Command::new("docker")
+                    .args(["kill", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = child.kill();
+        }
         if !cancelled && looked.elapsed() >= Duration::from_secs(2) {
             looked = Instant::now();
             let state: String = client
@@ -1197,6 +1299,10 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
     }
     let _ = reader.join();
     let status = child.wait()?;
+    if stopped {
+        emit(client, &run.id, &machine.name, &pending)?;
+        return Err(Stopped.into());
+    }
     let code = status.code().unwrap_or(-1);
     for check in checks {
         if !reported.contains_key(check) {
