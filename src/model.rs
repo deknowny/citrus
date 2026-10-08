@@ -280,6 +280,23 @@ pub struct Pool {
     pub status: Vec<String>,
 }
 
+/// `#![image(dockerfile = "…", target = "…", context = "…")]`: built by each
+/// pool agent with Docker; the checks run inside it.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Image {
+    pub dockerfile: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default = "Image::default_context")]
+    pub context: String,
+}
+
+impl Image {
+    fn default_context() -> String {
+        ".".into()
+    }
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Project {
     pub base: Option<String>,
@@ -294,6 +311,10 @@ pub struct Project {
     pub profile_env: Vec<(String, Vec<(String, String)>)>,
     pub services: Vec<Service>,
     pub pool: Option<Pool>,
+    /// The image checks run in on pool agents (`#![image(...)]`).
+    pub image: Option<Image>,
+    /// Paths a pool snapshot never carries (`#![private(...)]`).
+    pub private: Vec<String>,
     pub after_merge: Vec<String>,
     pub commands: Vec<(String, String, String)>,
     pub groups: Vec<Group>,

@@ -21,12 +21,16 @@ anyhow = "1"
 clap = { version = "4.5", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 hex = "0.4"
 libc = "0.2"
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
 rusqlite = { version = "0.39", default-features = false, features = ["bundled"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false }
+tokio-postgres-rustls = "0.14.0"
 # Reads Cargo manifests for `cargo.closure` (not configuration).
 toml = { version = "1.0", default-features = false, features = ["parse", "serde"] }
+webpki-roots = "1.0.9"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,133 +1,84 @@
-# Design: runners — checks on your own machines (`#![runner]` built in)
+# Design: the pool — every machine that runs `citrus agent`
 
-Status: proposal, for review before implementation. Issue #9.
+Status: in progress. Issues #9 (runners), #7 (resource status), #10 (shared state).
 
 ## Why
 
 `citrus run --remote` hands the planned checks to a consumer script
-(`#![runner(cmd!(...))]`). In the first consumer that script is the last
-piece of the old CI. It has about 4,500 lines in seven files:
+(`#![runner(cmd!(...))]`). In the first consumer that script is the last piece
+of the old CI: about 4,500 lines (builder pool, leases, transport, snapshot
+proof, adapter). It also splits machines into "local" and "remote", although a
+check does not care where it runs.
 
-| Piece | Lines | What it does |
-|---|---|---|
-| builder pool | 630 | probe hosts over SSH (CPU, memory, pressure, disk, leases), pick the best one, wait while all are busy |
-| lease and coordinator | 1,060 | one exclusive kernel `flock` per builder and resource; records who holds it |
-| transport | 1,820 | describe the source snapshot, ship it (git archive + gitlinks + a filtered tarball), build a runner image, start a container with CPU/memory limits, stream its log, clean up |
-| snapshot proof | 540 | before and after the run, prove the builder ran exactly the described files |
-| local Docker host | 190 | the developer's Mac as one more builder |
-| bundle, adapter | 300 | tarball filter; translate the transport's log into Citrus lines |
-
-Most of this is generic: every team that runs checks on its own machines
-needs to pick a machine, lease it, ship exactly the snapshot, run inside a
-limit, and report. The consumer-specific part is small: host addresses, the
-image to run in, and resource limits.
-
-Measured cost today (run r-20261008-161750-c562, 11 checks): 8 minutes end to
-end, of which the checks themselves took 2.6 minutes (`citrus run --local` in
-the container). The other 5 minutes are the transport: probes, lease,
-snapshot archive, runner image resolve, dependency setup and container start.
-That overhead, not the checks, is what a built-in runner removes.
+Measured (run r-20261008-161750-c562, 11 checks): 8 minutes end to end, of
+which the checks took 2.6 minutes. The other 5 minutes are the transport:
+probes, lease, snapshot archive, image resolve, dependency setup, container
+start.
 
 ## Model
 
-A runner is a machine Citrus can lease and run checks on. It is declared in
-`.ci`, next to services:
+- **A machine joins by running `citrus agent`.** It reports what it is (OS,
+  architecture, CPUs, memory, Docker), how much it shares (`--share 6`) and
+  its load. Stopping the agent leaves the pool. Nothing is registered by hand.
+- **Agents pull work.** `citrus run` puts the checks in a shared queue; every
+  agent takes what fits it. Laptops behind NAT work the same as servers: no
+  inbound connections, no SSH into anyone's machine.
+- **The coordinator is a Postgres database.** Queue, agents, run events: three
+  tables. Claims use `FOR UPDATE SKIP LOCKED`; wake-ups use `LISTEN/NOTIFY`.
+  There is no Citrus server process. The pool URL is per person, not per
+  repository: `CITRUS_POOL` or `~/.config/citrus/pool`.
+- **Snapshots travel through Git.** The requester records its working tree
+  (uncommitted changes included, ignored files and `#![private(...)]` paths
+  excluded) as a commit and pushes it to `refs/citrus/runs/<run>` of the
+  repository's own remote. Agents fetch it into a cached mirror: Git sends only
+  the difference. The ref is deleted when the run ends.
+- **Checks are split across agents.** One queue row per check. An agent claims
+  as many checks of a run as it has free slots and runs them with one
+  `citrus run --local --jobs N`, so services and `#[limit]` still apply per
+  machine. When it finishes, it claims more. A run of 11 checks on four
+  machines takes about the time of its slowest check.
+- **The configuration says what checks need, not where they run.**
+  `#[meta(linux = true)]` (and `#[requires("docker")]`) match agent labels.
+  `#![image(dockerfile = "...", target = "...")]` names the image the checks
+  run in; an agent with Docker builds it once per input hash and runs the
+  executor inside, with the snapshot and its caches mounted. An agent without
+  Docker runs natively and only takes checks that need nothing more.
+- **The executor is the requester's Citrus version.** Agents keep a cache of
+  Citrus binaries by commit (built or downloaded as `bin/citrus` does) and run
+  the job with the matching one; for a container, the Linux build of it.
 
-```rust
-/// The Ryzen builders: Linux, Docker, the shared Cargo and pnpm caches.
-#[hosts("root@81.90.20.4", "root@81.90.20.5")]
-#[budget(cpus = 30, memory = "96G", disk_free = "80G")]
-#[image(dockerfile = "deploy/ci/runner.Dockerfile", target = "runner")]
-#[caches("/cargo", "/pnpm-store")]
-runner ryzen {}
+## Each machine keeps its own rules
 
-/// The developer's Mac, through Docker Desktop's Linux VM.
-#[hosts("local")]
-#[budget(cpus = "all - 1")]
-#[platform("linux/arm64")]
-runner mac {}
+`citrus agent --share 6 --labels ryzen --only-on-power --idle` — a laptop gives
+at most 6 CPUs, only on mains, and stops taking work while its owner is
+active. A production host can join with `--share 4 --quiet-hours 01-07` or not
+at all: heavy builds next to production workloads have hurt before.
+
+## Commands
+
+```
+citrus agent [--share N] [--labels a,b] [--name NAME]   # join the pool
+citrus pool                     # agents, their load, queued and running checks
+citrus pool drain NAME          # finish current checks, take no more
+citrus run --remote             # through the pool when one is configured
 ```
 
-- `#[hosts]`: SSH destinations (`ssh` config applies) or `local`.
-- `#[budget]`: what one run may take. Citrus starts the container with these
-  limits, and with `--jobs` from the CPU budget.
-- `#[image]`: the image checks run in. Citrus builds it on the runner with
-  BuildKit, keyed by the hash of its inputs (the same key as artifacts), and
-  keeps the last 3.
-- `#[caches]`: volumes kept between runs on that host.
-- Checks choose runners like they choose services: `#[on(ryzen)]`, or
-  `#[meta(linux = true)]` keeps them off a runner whose platform is not Linux.
-  A run with no requirement goes to any runner.
-
-`citrus run --remote` then needs no consumer script. The `#![runner(cmd!)]`
-escape hatch stays for setups Citrus cannot model.
-
-## What a run does
-
-1. **Pick.** Read each host's state from `citrusd` (below) — one SSH round
-   trip, under 1 s, instead of a probe per host. Choose the least loaded host
-   that fits the budget; if all are busy, queue and print the position.
-2. **Lease.** A lease is a `flock` held by `citrusd` on that host, tied to the
-   SSH connection: if the agent dies, the lease is released. The lease records
-   run id, agent, branch, start time; `citrus status` shows it.
-3. **Ship.** The snapshot is the set of files `citrus` already fingerprints.
-   Citrus sends only blobs the host does not have yet (content-addressed
-   store on the host, `~/.citrus/blobs`), then a manifest. A typical change
-   ships kilobytes instead of a full archive. Gitlinks ship as their commit
-   and are fetched on the host.
-4. **Run.** In the runner image: `citrus run --local --jobs N <checks>` on the
-   shipped tree, with `CITRUS_GIT_DIR` as today. Services start inside the
-   same container network.
-5. **Prove.** `citrusd` hashes the tree before and after; a change during the
-   run fails it with status 75 (drift), as today.
-6. **Report.** The child Citrus speaks `CITRUS_PROTOCOL=1` already; the parent
-   reads it directly. Logs stay on the host and are fetched on
-   `citrus log --full`.
-7. **Clean.** Container, network and tree are removed; the lease ends.
-
-## `citrusd`
-
-A small process Citrus starts on demand over SSH (`citrus daemon --stdio`),
-the same binary. It is not a long-lived server: it lives for the lease. It
-answers state queries, holds the lease, receives blobs, starts the container
-and streams events. Installing it is copying the binary, which `citrus` does
-itself when the versions differ (by checksum).
-
-This also closes issue #7: `citrus status` reads runner state through it,
-with no consumer status script.
+`citrus status` shows pool state; no consumer status script is needed (#7).
 
 ## Security
 
-- Only SSH. Citrus adds no listening port.
-- The shipped tree excludes what the planner already excludes (secrets,
-  local hooks, certificates); the manifest is checked against the same rules
-  on the host.
-- The container gets no host credentials. Registry access for building the
-  runner image uses the host's existing Docker login.
+- The pool is for a team that trusts each other's code: an agent runs the
+  checks of whoever submits them, inside the image when there is one.
+- Postgres with TLS and a role that can only use the `citrus` schema.
+- Snapshots go only to the repository's own remote, which every agent must be
+  able to read anyway.
 
 ## Migration in the first consumer
 
-1. Implement `runner` declarations, `citrusd`, pick/lease/ship/run/prove for
-   one host. Test against a local Docker and a container that plays a host
-   (sshd in a container) in `tests/`.
-2. Shadow: the consumer keeps `#![runner(cmd!)]`; `citrus run --remote
-   --runner ryzen` uses the built-in runner on demand. Compare time and results
-   on real changes for a few days.
-3. Switch the default; delete the builder pool, coordinator, transport,
-   snapshot proof, bundle and adapter (about 4,500 lines). The local Docker
-   host script becomes `#[hosts("local")]`.
-4. Release builds (`citrus apply`) lease the same runners, so the separate
-   release lease and the release-build lock go too.
-
-## Not in the first version
-
-- Other platforms' sandboxing (cgroups outside Docker, macOS power budgets).
-- A shared server for several people's state (issue #10).
-- Autoscaling or cloud hosts.
-
-## Open questions
-
-- Blob store garbage collection: keep blobs referenced by the last N
-  manifests per host, or a size cap?
-- Should the runner image be one per repository, or per check group
-  (Rust-only checks do not need Node)?
+1. Pool, agent, client, image execution in Citrus; tests with a Postgres in CI.
+2. A small Postgres for the pool; agents on the two builders and the Mac.
+3. Shadow: `citrus run --remote --pool` beside the current runner on real
+   changes; compare times and results.
+4. Make the pool the default; delete the builder pool, coordinator, transport,
+   snapshot proof, bundle and adapter.
+5. Release builds (`citrus apply`) take the same agents.

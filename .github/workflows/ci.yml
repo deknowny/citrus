@@ -29,3 +29,27 @@ jobs:
           git config --global user.email ci@example.invalid
           git config --global init.defaultBranch main
           cargo test --locked
+
+  pool:
+    # The pool against a real Postgres, and checks inside an image (Docker).
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: citrus
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 20
+    env:
+      CITRUS_TEST_POOL: postgres://postgres:citrus@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+          git config --global init.defaultBranch main
+          cargo test --locked --test pool -- --test-threads 1

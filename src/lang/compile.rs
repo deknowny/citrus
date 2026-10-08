@@ -993,6 +993,42 @@ pub fn compile(
                 }
                 project.pool = Some(pool);
             }
+            "image" => {
+                let fields = compiler.attr_object(attr)?;
+                let text = |key: &str| fields.get(key).and_then(Json::as_str).map(str::to_owned);
+                let Some(dockerfile) = text("dockerfile").or_else(|| text("0")) else {
+                    return Err(
+                        Error::at(attr.span, "`#![image(dockerfile = \"…\")]`").help(
+                            "#![image(dockerfile = \"ci/runner.Dockerfile\", target = \"runner\")]",
+                        ),
+                    );
+                };
+                if let Some(other) = fields
+                    .keys()
+                    .find(|key| !matches!(key.as_str(), "0" | "dockerfile" | "target" | "context"))
+                {
+                    return Err(Error::at(
+                        attr.span,
+                        format!("`#![image]` has no `{other}`"),
+                    ));
+                }
+                if !crate::lang::cargo::Files::list(&compiler.files).contains(&dockerfile) {
+                    return Err(Error::at(
+                        attr.span,
+                        format!("no file {dockerfile} in the repository"),
+                    ));
+                }
+                project.image = Some(crate::model::Image {
+                    dockerfile,
+                    target: text("target"),
+                    context: text("context").unwrap_or_else(|| ".".into()),
+                });
+            }
+            "private" => {
+                for (_, arg) in &attr.args {
+                    compiler.value(arg)?.globs(&mut project.private);
+                }
+            }
             "command" => {
                 let fields = compiler.attr_object(attr)?;
                 let text = |key: &str| {

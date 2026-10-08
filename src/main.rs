@@ -19,6 +19,7 @@ mod manifest;
 mod model;
 mod observe;
 mod plan;
+mod pool;
 mod release;
 mod repo;
 mod report;
@@ -249,6 +250,33 @@ enum Command {
         #[arg(long, default_value_t = 7)]
         days: u64,
     },
+    /// Join the pool: take checks from its queue until stopped
+    /// (CITRUS_POOL or ~/.config/citrus/pool; docs/design/runners.md).
+    Agent {
+        /// CPUs this machine gives the pool (default: all but one).
+        #[arg(long)]
+        share: Option<usize>,
+        /// Checks taken at once (default: a quarter of the share).
+        #[arg(long)]
+        slots: Option<usize>,
+        /// Extra labels checks may require (`#[meta(requires = [...])]`).
+        #[arg(long, value_delimiter = ',')]
+        labels: Vec<String>,
+        /// Name in the pool (default: the host name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Run checks of runs with an image natively (this machine has their tools).
+        #[arg(long)]
+        native: bool,
+        /// Leave the pool after this many idle seconds.
+        #[arg(long, value_name = "SECONDS")]
+        idle_exit: Option<u64>,
+    },
+    /// The pool: its agents, their load, and the checks queued and running.
+    Pool {
+        #[command(subcommand)]
+        action: Option<PoolAction>,
+    },
     #[command(hide = true)]
     Worker { run: String },
     /// Runs one check's steps (a JSON file) for a parallel worker.
@@ -352,6 +380,70 @@ enum ReleaseAction {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum PoolAction {
+    /// Let an agent finish its checks and take no more.
+    Drain { name: String },
+    /// Let a drained agent take checks again (when it runs).
+    Resume { name: String },
+}
+
+fn pool_command(action: Option<&PoolAction>, json: bool) -> Result<i32> {
+    match action {
+        Some(PoolAction::Drain { name }) => {
+            pool::set_agent_state(name, "draining")?;
+            println!("agent {name} drains: it finishes its checks and leaves");
+            return Ok(0);
+        }
+        Some(PoolAction::Resume { name }) => {
+            pool::set_agent_state(name, "ready")?;
+            println!("agent {name} takes checks again");
+            return Ok(0);
+        }
+        None => {}
+    }
+    let overview = pool::overview()?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"schema": SCHEMA, "pool": overview}))?
+        );
+        return Ok(0);
+    }
+    println!("pool {}", overview.pool);
+    for agent in &overview.agents {
+        let state = if agent.seen_seconds > 60.0 {
+            "gone".to_owned()
+        } else if agent.running > 0 {
+            format!("running {}", agent.running)
+        } else {
+            agent.state.clone()
+        };
+        println!(
+            "  {:<20} {:<12} {:>2}/{:<2} CPUs · {} at once · load {:.1} · {}",
+            agent.name,
+            state,
+            agent.share,
+            agent.cpus,
+            agent.slots,
+            agent.load,
+            agent.labels.join(",")
+        );
+    }
+    if overview.agents.is_empty() {
+        println!("  no agents: `citrus agent` on a machine joins it");
+    }
+    println!(
+        "queued {} · running {}",
+        overview.queued,
+        overview.running.len()
+    );
+    for (run, check, agent) in &overview.running {
+        println!("  {run} {check} on {agent}");
+    }
+    Ok(0)
+}
+
 fn main() {
     let cli = Cli::parse();
     let json = cli.json || (!cli.text && !std::io::stdout().is_terminal());
@@ -402,6 +494,28 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
     // A parallel worker's child needs no configuration: its steps are given.
     if let Some(Command::ExecSteps { file }) = &command {
         return exec::exec_steps(file);
+    }
+    // The pool serves any repository: no configuration is read.
+    match &command {
+        Some(Command::Agent {
+            share,
+            slots,
+            labels,
+            name,
+            native,
+            idle_exit,
+        }) => {
+            return pool::agent(&pool::AgentOptions {
+                name: name.clone(),
+                share: *share,
+                slots: *slots,
+                labels: labels.clone(),
+                native: *native,
+                idle_exit: *idle_exit,
+            });
+        }
+        Some(Command::Pool { action }) => return pool_command(action.as_ref(), json),
+        _ => {}
     }
     let command = dashed(command);
     let mut context = Context::open(profile)?;
@@ -723,6 +837,9 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             Ok(if failed { 1 } else { 0 })
         }
         Command::ExecSteps { .. } => unreachable!("handled before the configuration loads"),
+        Command::Agent { .. } | Command::Pool { .. } => {
+            unreachable!("handled before the configuration")
+        }
         Command::Worker { run } => {
             context.work(&run)?;
             Ok(0)

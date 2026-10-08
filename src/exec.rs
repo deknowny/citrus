@@ -92,6 +92,8 @@ impl Context {
                     config.status.resource_prefix = "CITRUS_RESOURCE ".into();
                     config.status.refresh_seconds = 60;
                 }
+                config.run.image = project.image.clone();
+                config.run.private = project.private.clone();
                 if !project.after_merge.is_empty() {
                     config.integrate.after_merge = project.after_merge.clone();
                 }
@@ -255,9 +257,11 @@ impl Context {
             return Ok(existing);
         }
         let explicit = !request.targets.is_empty();
-        let remote_available = !self.repo.config.run.remote.is_empty();
+        let remote_available = !self.repo.config.run.remote.is_empty() || self.uses_pool();
         if request.mode == Mode::Remote && !remote_available {
-            bail!("no remote runner: declare a `runner` in the configuration");
+            bail!(
+                "no remote runner: join a pool (CITRUS_POOL) or declare a `runner` in the configuration"
+            );
         }
         if explicit && request.mode == Mode::Remote {
             bail!("--remote runs the planned set; drop the target names or use --local");
@@ -449,6 +453,10 @@ impl Context {
     }
 
     pub fn cancel(&self, run: &Run) -> Result<()> {
+        // Queued pool checks are dropped and agents stop the running ones.
+        if self.store.fact(&format!("pool:{}", run.id))?.is_some() {
+            let _ = crate::pool::cancel(&run.id);
+        }
         if let Some(pid) = run.pid.filter(|pid| alive(*pid)) {
             // SAFETY: plain signal delivery to the worker's own process group.
             unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGTERM) };
@@ -956,6 +964,14 @@ impl Context {
         Ok(())
     }
 
+    /// `--remote` goes to the pool when one is configured and either no
+    /// runner script is declared or CITRUS_REMOTE=pool asks for it.
+    pub fn uses_pool(&self) -> bool {
+        crate::pool::url().is_some()
+            && (self.repo.config.run.remote.is_empty()
+                || std::env::var("CITRUS_REMOTE").as_deref() == Ok("pool"))
+    }
+
     fn work_remote(&self, run: &Run, targets: &[RunTarget]) -> Result<Vec<String>> {
         let config = &self.repo.config;
         let argv = config.run.remote.clone();
@@ -988,34 +1004,11 @@ impl Context {
                 .map(|path| format!("{path}\n"))
                 .collect::<String>(),
         )?;
-        // One pipe for stdout and stderr keeps the log in order.
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg("exec \"$@\" 2>&1")
-            .arg("citrus-remote")
-            .args(&argv)
-            .current_dir(&self.repo.root)
-            .env("CITRUS_CHECKS", self.manifest.export_file(&self.repo)?)
-            .env("CITRUS_TARGETS", &wanted)
-            .env("CITRUS_PATHS", &paths_file)
-            .env(
-                "CITRUS_PROFILE",
-                self.repo.config.plan.profile.clone().unwrap_or_default(),
-            )
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped());
-        // The base a run was asked to compare with (`citrus run --base`).
-        if let Some(base) = &run.base {
-            command.env("CITRUS_BASE", base);
-        }
-        let mut child = command.spawn()?;
-        let reader = BufReader::new(child.stdout.take().context("no stdout")?);
         let mut lines: Vec<String> = Vec::new();
         let mut out = std::io::stdout().lock();
         let mut passed = Vec::new();
-        for line in reader.lines() {
-            let line = strip_ansi(&line.unwrap_or_default());
+        let mut handle = |line: String| -> Result<()> {
+            let line = strip_ansi(&line);
             writeln!(out, "{line}")?;
             out.flush()?;
             lines.push(line.clone());
@@ -1037,9 +1030,45 @@ impl Context {
             } else if let Some(lane) = parse_lane(&line, &markers.progress_prefixes) {
                 self.apply_lane(run, targets, &lane, &lines, &mut passed)?;
             }
-        }
-        let status = child.wait()?;
-        let code = i64::from(status.code().unwrap_or(-1));
+            Ok(())
+        };
+        let code = if self.uses_pool() {
+            let checks: Vec<String> = targets
+                .iter()
+                .filter(|target| target.result == "pending")
+                .map(|target| target.target.clone())
+                .collect();
+            crate::pool::run(self, &run.id, &checks, &mut handle)?
+        } else {
+            // One pipe for stdout and stderr keeps the log in order.
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg("exec \"$@\" 2>&1")
+                .arg("citrus-remote")
+                .args(&argv)
+                .current_dir(&self.repo.root)
+                .env("CITRUS_CHECKS", self.manifest.export_file(&self.repo)?)
+                .env("CITRUS_TARGETS", &wanted)
+                .env("CITRUS_PATHS", &paths_file)
+                .env(
+                    "CITRUS_PROFILE",
+                    self.repo.config.plan.profile.clone().unwrap_or_default(),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped());
+            // The base a run was asked to compare with (`citrus run --base`).
+            if let Some(base) = &run.base {
+                command.env("CITRUS_BASE", base);
+            }
+            let mut child = command.spawn()?;
+            let reader = BufReader::new(child.stdout.take().context("no stdout")?);
+            for line in reader.lines() {
+                handle(line.unwrap_or_default())?;
+            }
+            let status = child.wait()?;
+            i64::from(status.code().unwrap_or(-1))
+        };
         // The runner may keep the detailed output in its own log and print only its path.
         let linked = linked_log(&lines, &config.run.linked_log_markers, &self.repo.root);
         let mut detail: Vec<String> = Vec::new();
