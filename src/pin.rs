@@ -77,9 +77,6 @@ pub fn handover() -> Result<()> {
             .exec();
         bail!("run {}: {error}", binary.display());
     }
-    if std::env::var_os("CITRUS_PINNED").is_some() {
-        return Ok(());
-    }
     let Some(root) = root() else { return Ok(()) };
     let Some(commit) = pinned_in(&root) else {
         return Ok(());
@@ -88,9 +85,11 @@ pub fn handover() -> Result<()> {
         return Ok(());
     }
     let binary = prepare(&root, &commit)?;
+    // CITRUS_BIN: every `citrus` the command starts (checks call it) runs
+    // this same build, not whichever one is first on their PATH.
     let error = Command::new(&binary)
         .args(std::env::args_os().skip(1))
-        .env("CITRUS_PINNED", &commit)
+        .env("CITRUS_BIN", &binary)
         .exec();
     bail!("run {}: {error}", binary.display())
 }
