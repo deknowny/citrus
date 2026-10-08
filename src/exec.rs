@@ -94,6 +94,7 @@ impl Context {
                 }
                 config.run.image = project.image.clone();
                 config.run.private = project.private.clone();
+                config.run.prepare = project.prepare.clone();
                 if !project.after_merge.is_empty() {
                     config.integrate.after_merge = project.after_merge.clone();
                 }

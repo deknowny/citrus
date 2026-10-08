@@ -81,6 +81,8 @@ pub struct RunConfig {
     pub image: Option<crate::model::Image>,
     /// Paths a pool snapshot never carries (`#![private]`).
     pub private: Vec<String>,
+    /// Run by a pool agent in the tree before the checks (`#![prepare]`).
+    pub prepare: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +139,7 @@ impl Default for RunConfig {
             linked_log_markers: vec!["CITRUS_LOG ".into()],
             image: None,
             private: Vec::new(),
+            prepare: Vec::new(),
         }
     }
 }

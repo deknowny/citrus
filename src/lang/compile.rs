@@ -947,13 +947,14 @@ pub fn compile(
                     compiler.value(arg)?.globs(&mut project.toolchain);
                 }
             }
-            "signals" | "free_version" | "after_merge" => {
+            "signals" | "free_version" | "after_merge" | "prepare" => {
                 let (_, arg) = attr.args.first().ok_or_else(|| {
                     Error::at(attr.span, format!("`#![{}(cmd!(\"…\"))]`", attr.name))
                 })?;
                 let argv = compiler.argv(arg)?;
                 match attr.name.as_str() {
                     "signals" => project.signals = argv,
+                    "prepare" => project.prepare = argv,
                     "free_version" => project.free_version = argv,
                     _ => project.after_merge = argv,
                 }
