@@ -271,6 +271,10 @@ enum Command {
         /// Leave the pool after this many idle seconds.
         #[arg(long, value_name = "SECONDS")]
         idle_exit: Option<u64>,
+        /// Take no new checks while another process holds this lock file
+        /// (repeatable), e.g. a release build that owns the machine.
+        #[arg(long, value_name = "FILE")]
+        pause_while_locked: Vec<std::path::PathBuf>,
     },
     /// The pool: its agents, their load, and the checks queued and running.
     Pool {
@@ -504,6 +508,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             name,
             native,
             idle_exit,
+            pause_while_locked,
         }) => {
             return pool::agent(&pool::AgentOptions {
                 name: name.clone(),
@@ -512,6 +517,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
                 labels: labels.clone(),
                 native: *native,
                 idle_exit: *idle_exit,
+                pause_while_locked: pause_while_locked.clone(),
             });
         }
         Some(Command::Pool { action }) => return pool_command(action.as_ref(), json),
