@@ -261,6 +261,14 @@ starts:
   lockfile and settings. A misspelled subcommand or package is an error
   before anything runs. Everything after `--` belongs to the test binary.
 
+- **Make** (`make [flags] targets…` in the repository's own Makefile): the
+  rules it runs (prerequisites and `$(MAKE)` in recipes), the Makefiles
+  defining them and the variables their recipes use, and the files the
+  recipes name, followed into the scripts those name (code only, files
+  only). A target the Makefiles do not define is an error before anything
+  runs. A recipe is shared by many checks, so these inputs only make a pass
+  stale (they join `#[reads]`); what selects the check stays its paths.
+
 A wrapper script is understood like the command line it stands for once the
 project says so: `#![tool("scripts/cargo-test.sh", cmd!("cargo test"))]`
 makes `run!("scripts/cargo-test.sh -p api --lib")` read as `cargo test -p api

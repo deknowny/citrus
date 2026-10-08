@@ -18,6 +18,9 @@ Breaking: a new configuration language (docs/design/language.md). Every
   packages it builds, and a misspelled subcommand or package is an error.
 - Outside the language names use `-` for `_` (`test_db` → `test-db`),
   like Cargo crate names; the command line takes either.
+- `run!("make target")` is understood: the target's Makefiles, the
+  variables and the files its recipes name join the check's fingerprint,
+  and a misspelled target is an error when the file loads.
 - `citrus fmt [--check]` is back for the new language: indentation by
   brackets, words, strings and comments untouched.
 - `#![tool("wrapper", cmd!("cargo test"))]`: a wrapper script is understood

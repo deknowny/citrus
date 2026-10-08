@@ -16,6 +16,9 @@ pub struct Understood {
     pub summary: String,
     /// Repository globs the command reads.
     pub inputs: Vec<String>,
+    /// Whether a change to the inputs selects the check (Cargo) or only
+    /// invalidates its pass (Make: recipes are shared by many checks).
+    pub selects: bool,
 }
 
 /// Repository files for the tool readers: the working tree or a commit.
@@ -90,6 +93,7 @@ pub fn understand(
     span: Span,
     files: &dyn Files,
     tools: &[(String, Vec<String>)],
+    make: &std::cell::OnceCell<Option<super::make::Makefiles>>,
 ) -> Result<Option<Understood>, Error> {
     let literal: Vec<Option<String>> = words.iter().map(CmdWord::literal).collect();
     // A declared wrapper is the command line it stands for, plus its own file.
@@ -116,8 +120,71 @@ pub fn understand(
     }
     match literal.first() {
         Some(Some(program)) if program == "cargo" => cargo(&literal[1..], span, files),
+        Some(Some(program)) if program == "make" => {
+            let Some(makefiles) = make.get_or_init(|| super::make::Makefiles::load(files)) else {
+                return Ok(None);
+            };
+            make_targets(&literal[1..], span, files, makefiles)
+        }
         _ => Ok(None),
     }
+}
+
+/// `make [flags] [VAR=value] targets…` in this repository's Makefile.
+fn make_targets(
+    args: &[Option<String>],
+    span: Span,
+    files: &dyn Files,
+    makefiles: &super::make::Makefiles,
+) -> Result<Option<Understood>, Error> {
+    let mut targets = Vec::new();
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        let Some(word) = word else {
+            return Ok(None);
+        };
+        match word.as_str() {
+            // Another directory's Makefile, or another file: not this one.
+            "-C" | "-f" | "--file" | "--directory" => return Ok(None),
+            "-j" | "-l" | "-o" | "-W" | "-I" => {
+                words.next();
+            }
+            flag if flag.starts_with('-') => {
+                if flag.starts_with("-C")
+                    || flag.starts_with("-f")
+                    || flag.starts_with("--file=")
+                    || flag.starts_with("--directory=")
+                {
+                    return Ok(None);
+                }
+            }
+            assignment if assignment.contains('=') => {}
+            target => targets.push(target.to_owned()),
+        }
+    }
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    let mut inputs: Vec<String> = Vec::new();
+    for target in &targets {
+        let Some(found) = makefiles.inputs(target, files) else {
+            let mut error = Error::at(span, format!("no Make target `{target}`"));
+            if let Some(close) = suggest(target, makefiles.targets()) {
+                error = error.help(format!("did you mean `{close}`?"));
+            }
+            return Err(error);
+        };
+        for input in found {
+            if !inputs.contains(&input) {
+                inputs.push(input);
+            }
+        }
+    }
+    Ok(Some(Understood {
+        summary: format!("make {}", targets.join(" ")),
+        inputs,
+        selects: false,
+    }))
 }
 
 fn cargo(
@@ -231,7 +298,11 @@ fn cargo(
     } else {
         format!("cargo {subcommand} -p {}", chosen.join(" -p "))
     };
-    Ok(Some(Understood { summary, inputs }))
+    Ok(Some(Understood {
+        summary,
+        inputs,
+        selects: true,
+    }))
 }
 
 /// Every `run!`/`cmd!` and every call in an expression tree, in order.

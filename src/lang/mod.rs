@@ -10,6 +10,7 @@ pub mod compile;
 pub mod interp;
 pub mod layout;
 pub mod lexer;
+pub mod make;
 pub mod parser;
 pub mod tools;
 pub mod web;

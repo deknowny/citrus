@@ -37,7 +37,9 @@ The runner runs with `CITRUS_CHECKS` set to a JSON file; `citrus targets --json`
 ```
 
 `inputs` are `#[paths]` and what its commands read (docs/design/language.md#commands),
-`extra_inputs` are `#[reads]`, `resources` are the services in `#[needs]`.
+`extra_inputs` are `#[reads]` and what its `make` targets read (their
+Makefiles and the files their recipes name), `resources` are the services
+in `#[needs]`.
 `run` is what the check runs: a body that runs one fixed command line is
 that process (`["run", program, args…]`); any other body is
 `["script", "check:<name>", <digest of its source and the functions it may call>]`.

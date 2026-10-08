@@ -408,7 +408,7 @@ fn fingerprint_matches_the_documented_format() {
         .file_name();
     assert_eq!(
         receipt.to_string_lossy(),
-        "ok-c2f42fdb9b7ef82e50e76092c108b9cd551701f1a8ff09b2bfee8895d9abbc52.pass"
+        "ok-400096b708f41a065d8a51d3a379731e4504ee69d50adf1d9c9f993518257018.pass"
     );
 }
 
@@ -500,7 +500,7 @@ fn doctor_reports_setup_problems() {
 
 #[paths("missing/*")]
 check ghost {
-    run!("make ghost")?;
+    run!("make ok")?;
 }
 
 "#,
@@ -1455,7 +1455,7 @@ environment prod;
         project.json(&["diff", "prod"]).0["diff"]["workloads"][0]["change"],
         "unchanged"
     );
-    project.write("Makefile", "ok:\n\t@echo changed\n");
+    project.write("Makefile", &MAKEFILE.replace("echo fine", "echo changed"));
     project.git(&[
         "-c",
         "user.name=t",
@@ -3004,7 +3004,7 @@ check named {
     );
     assert_eq!(
         row("named")["extra_inputs"],
-        serde_json::json!(["lib/**"]),
+        serde_json::json!(["lib/**", "Makefile"]),
         "a group it names is an input: {targets}"
     );
 }
@@ -3389,7 +3389,7 @@ check api {
     for (command, expected) in [
         ("cargo test -p apy", "did you mean `api`"),
         ("cargo tset", "did you mean `cargo test`"),
-        ("make test", "has no paths"),
+        ("make tset", "no Make target `tset`"),
     ] {
         project.write(
             "citrus.ci",

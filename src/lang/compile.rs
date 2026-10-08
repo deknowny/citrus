@@ -53,6 +53,8 @@ struct Compiler<'a> {
     shared: String,
     /// Programs declared with `#![tool]`: a wrapper and the command line it is.
     tools: Vec<(String, Vec<String>)>,
+    /// The project's Makefiles, read once when a body runs `make`.
+    make: std::cell::OnceCell<Option<super::make::Makefiles>>,
 }
 
 impl<'a> Compiler<'a> {
@@ -387,7 +389,19 @@ fn condition_in(
 
 /// What a body's commands (and the functions it calls) read, as far as
 /// Citrus understands them; whether one of them is a plain process.
-fn understood(compiler: &Compiler, body: &Block) -> Compiled<(Vec<String>, Vec<String>, bool)> {
+/// What a body's commands read.
+struct Reads {
+    /// Inputs that select the check.
+    inputs: Vec<String>,
+    /// Inputs that only make its pass stale.
+    reads: Vec<String>,
+    /// What each understood command was understood as.
+    summaries: Vec<String>,
+    /// Some command was not understood (or does not select).
+    opaque: bool,
+}
+
+fn understood(compiler: &Compiler, body: &Block) -> Compiled<Reads> {
     let mut found: Vec<&Expr> = Vec::new();
     tools::block_commands(body, &mut found);
     let mut seen_fns: Vec<String> = Vec::new();
@@ -410,6 +424,7 @@ fn understood(compiler: &Compiler, body: &Block) -> Compiled<(Vec<String>, Vec<S
         index += 1;
     }
     let mut inputs = Vec::new();
+    let mut reads: Vec<String> = Vec::new();
     let mut summaries = Vec::new();
     let mut opaque = false;
     for expr in found {
@@ -422,11 +437,27 @@ fn understood(compiler: &Compiler, body: &Block) -> Compiled<(Vec<String>, Vec<S
             }
             continue;
         };
-        match tools::understand(words, *span, &compiler.files, &compiler.tools)? {
+        match tools::understand(
+            words,
+            *span,
+            &compiler.files,
+            &compiler.tools,
+            &compiler.make,
+        )? {
             Some(found) => {
+                // A Make recipe is shared by many checks: its files make a
+                // pass stale but do not choose the check.
+                if !found.selects {
+                    opaque = true;
+                }
+                let into = if found.selects {
+                    &mut inputs
+                } else {
+                    &mut reads
+                };
                 for glob in found.inputs {
-                    if !inputs.contains(&glob) {
-                        inputs.push(glob);
+                    if !into.contains(&glob) {
+                        into.push(glob);
                     }
                 }
                 summaries.push(found.summary);
@@ -434,7 +465,12 @@ fn understood(compiler: &Compiler, body: &Block) -> Compiled<(Vec<String>, Vec<S
             None => opaque = true,
         }
     }
-    Ok((inputs, summaries, opaque))
+    Ok(Reads {
+        inputs,
+        reads,
+        summaries,
+        opaque,
+    })
 }
 
 /// Settings a group passes to its checks.
@@ -461,7 +497,12 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         ));
     }
     let (declared, via) = compiler.globs(&item.attrs, "paths")?;
-    let (inferred, summaries, opaque) = understood(compiler, body)?;
+    let Reads {
+        inputs: inferred,
+        reads: understood_reads,
+        summaries,
+        opaque,
+    } = understood(compiler, body)?;
     // Understood inputs select the check on their own only when every command
     // was understood; a plain process next to them needs `#[paths]`.
     let mut owns = declared.clone();
@@ -478,6 +519,11 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
     }
     let (mut reads, _) = compiler.globs(&item.attrs, "reads")?;
     reads.extend(from.reads.iter().cloned());
+    for glob in understood_reads {
+        if !reads.contains(&glob) {
+            reads.push(glob);
+        }
+    }
     let mut env = from.env.clone();
     env.extend(compiler.env(&item.attrs)?);
     let mut resources = from.needs.clone();
@@ -864,6 +910,7 @@ pub fn compile(
         files: tools::RepoFiles::new(root, revision),
         shared,
         tools: Vec::new(),
+        make: std::cell::OnceCell::new(),
     };
     let mut project = Project::default();
     let mut default_cache = true;
