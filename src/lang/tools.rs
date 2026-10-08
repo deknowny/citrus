@@ -31,24 +31,107 @@ pub struct RepoFiles<'a> {
     listed: Vec<String>,
 }
 
-impl<'a> RepoFiles<'a> {
-    pub fn new(root: &'a Path, revision: Option<&'a str>) -> RepoFiles<'a> {
-        let args: Vec<&str> = match revision {
-            None => vec!["ls-files", "-co", "--exclude-standard"],
-            Some(revision) => vec!["ls-tree", "-r", "--name-only", revision],
-        };
-        let listed = crate::repo::git()
+type Key = (std::path::PathBuf, Option<String>);
+
+/// Listings and revision reads, kept for the life of the process: every
+/// `run!`/`cmd!` line asks for them again, and a load must not start a git
+/// process per line and file (it did: thousands of `git show` per plan).
+#[derive(Default)]
+struct Cache {
+    listed: std::collections::HashMap<Key, Vec<String>>,
+    read: std::collections::HashMap<(Key, String), Option<String>>,
+    batch: std::collections::HashMap<std::path::PathBuf, Batch>,
+}
+
+static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+
+/// One `git cat-file --batch` per repository for reads at a revision.
+struct Batch {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl Batch {
+    fn start(root: &Path) -> Option<Batch> {
+        let mut child = crate::repo::git()
             .arg("-C")
             .arg(root)
-            .args(args)
-            .output()
-            .map(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .map(str::to_owned)
-                    .collect()
+            .args(["cat-file", "--batch"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdin = child.stdin.take()?;
+        let stdout = std::io::BufReader::new(child.stdout.take()?);
+        Some(Batch {
+            child,
+            stdin,
+            stdout,
+        })
+    }
+
+    /// The blob at `revision:path`; None when it is missing or not a blob.
+    fn read(&mut self, revision: &str, path: &str) -> std::io::Result<Option<String>> {
+        use std::io::{BufRead, Read, Write};
+        if path.contains('\n') {
+            return Ok(None);
+        }
+        writeln!(self.stdin, "{revision}:{path}")?;
+        self.stdin.flush()?;
+        let mut header = String::new();
+        self.stdout.read_line(&mut header)?;
+        let fields: Vec<&str> = header.split_whitespace().collect();
+        let [_, kind, size] = fields[..] else {
+            return Ok(None);
+        };
+        let size: usize = size
+            .parse()
+            .map_err(|_| std::io::Error::other("cat-file size"))?;
+        let mut body = vec![0; size + 1];
+        self.stdout.read_exact(&mut body)?;
+        body.pop();
+        Ok((kind == "blob").then(|| String::from_utf8_lossy(&body).into_owned()))
+    }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl<'a> RepoFiles<'a> {
+    pub fn new(root: &'a Path, revision: Option<&'a str>) -> RepoFiles<'a> {
+        let key: Key = (root.to_path_buf(), revision.map(str::to_owned));
+        let mut guard = CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = guard.get_or_insert_with(Cache::default);
+        let listed = cache
+            .listed
+            .entry(key)
+            .or_insert_with(|| {
+                let args: Vec<&str> = match revision {
+                    None => vec!["ls-files", "-co", "--exclude-standard"],
+                    Some(revision) => vec!["ls-tree", "-r", "--name-only", revision],
+                };
+                crate::repo::git()
+                    .arg("-C")
+                    .arg(root)
+                    .args(args)
+                    .output()
+                    .map(|output| {
+                        String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default()
             })
-            .unwrap_or_default();
+            .clone();
         RepoFiles {
             root,
             revision,
@@ -59,7 +142,28 @@ impl<'a> RepoFiles<'a> {
 
 impl Files for RepoFiles<'_> {
     fn read(&self, path: &str) -> Option<String> {
-        super::read(self.root, path, self.revision)
+        let Some(revision) = self.revision else {
+            return super::read(self.root, path, None);
+        };
+        let key: Key = (self.root.to_path_buf(), Some(revision.to_owned()));
+        let mut guard = CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = guard.get_or_insert_with(Cache::default);
+        if let Some(text) = cache.read.get(&(key.clone(), path.to_owned())) {
+            return text.clone();
+        }
+        let text = match cache.batch.entry(self.root.to_path_buf()) {
+            std::collections::hash_map::Entry::Occupied(mut batch) => {
+                batch.get_mut().read(revision, path).ok().flatten()
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => match Batch::start(self.root) {
+                Some(batch) => slot.insert(batch).read(revision, path).ok().flatten(),
+                None => super::read(self.root, path, Some(revision)),
+            },
+        };
+        cache.read.insert((key, path.to_owned()), text.clone());
+        text
     }
 
     fn list(&self) -> &[String] {
