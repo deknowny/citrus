@@ -45,6 +45,13 @@ pub enum Work {
     LinksCheck {
         pattern: String,
     },
+    /// A body written in language v2 (`check:name`, `step:release:name`, …);
+    /// `digest` changes with its source, `args` are the release's values.
+    Script {
+        item: String,
+        digest: String,
+        args: Vec<(String, String)>,
+    },
 }
 
 impl Work {
@@ -62,6 +69,7 @@ impl Work {
             Work::WaitFile { path, .. } => format!("wait.file {path}"),
             Work::Copy { from, to } => format!("copy {from} → {to}"),
             Work::LinksCheck { pattern } => format!("links.check {pattern}"),
+            Work::Script { item, .. } => item.clone(),
         }
     }
 
@@ -99,6 +107,14 @@ impl Work {
             Work::LinksCheck { pattern } => Work::LinksCheck {
                 pattern: apply(pattern),
             },
+            Work::Script { item, digest, args } => Work::Script {
+                item: item.clone(),
+                digest: digest.clone(),
+                args: args
+                    .iter()
+                    .map(|(key, value)| (key.clone(), apply(value)))
+                    .collect(),
+            },
         }
     }
 
@@ -121,6 +137,9 @@ impl Work {
             }
             Work::Copy { from, to } => out.extend(["copy".into(), from.clone(), to.clone()]),
             Work::LinksCheck { pattern } => out.extend(["links.check".into(), pattern.clone()]),
+            Work::Script { item, digest, .. } => {
+                out.extend(["script".into(), item.clone(), digest.clone()])
+            }
         }
         out
     }
@@ -1407,6 +1426,7 @@ pub fn execute(step: &Step, root: &Path, stdout_to_stderr: bool) -> anyhow::Resu
             }
             Ok(0)
         }
+        Work::Script { item, args, .. } => Ok(crate::lang2::run_item(root, item, args)),
         Work::LinksCheck { pattern } => {
             let files = crate::repo::Repo::discover_at(root)?.files()?;
             let mut broken = 0;
@@ -1499,6 +1519,9 @@ pub fn load_at(root: &Path, revision: Option<&str>) -> Result<Option<(Project, S
             if listed { "citrus.ci" } else { ".citrus" }
         }
     };
+    if crate::lang2::detect(root, entry, revision) {
+        return crate::lang2::load(root, entry, revision).map(Some);
+    }
     match super::load_at(root, entry, revision) {
         Ok((graph, sources)) => match compile(&graph) {
             Ok(mut project) => {

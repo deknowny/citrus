@@ -1,58 +1,79 @@
-citrus 1
+#![citrus(2)]
+#![toolchain("Cargo.lock")]
 
-# Citrus checks itself with Citrus: `citrus run` picks what a change needs.
+// Citrus checks itself with Citrus: `citrus run` picks what a change needs.
 
-project {
-  toolchain = ["Cargo.lock"]
+/// The sources every Rust check reads.
+const RUST: list<glob> = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "build.rs"];
+
+/// Unit and integration tests on throwaway Git repositories.
+#[paths(RUST, "examples/**")]
+check test {
+    std::cargo::test().arg("--locked").run()?;
 }
 
-let rust = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "build.rs"]
-
-# Unit and integration tests on throwaway Git repositories.
-check test = cargo.test() {
-  paths = rust + ["examples/**"]
+/// rustfmt and clippy with warnings as errors.
+#[paths(RUST, "rustfmt.toml")]
+check lint {
+    std::cargo::fmt().args(["--all", "--check"]).run()?;
+    std::cargo::clippy().args(["--locked", "--all-targets", "--", "-D", "warnings"]).run()?;
 }
 
-# rustfmt and clippy with warnings as errors.
-check lint = [cargo.fmt(check: true), cargo.clippy(deny: "warnings")] {
-  paths = rust + ["rustfmt.toml"]
+/// Relative links in Markdown point at existing files.
+#[paths("*.md", "docs/**", "skills/**", "examples/**")]
+check docs {
+    std::docs::check_links("**/*.md")?;
 }
 
-# Relative links in Markdown point at existing files.
-check docs = links.check("**/*.md") {
-  paths = ["*.md", "docs/**", "skills/**", "examples/**"]
+/// This repository's own configuration is valid.
+#[paths("citrus.ci")]
+#[reads(RUST)]
+check doctor {
+    std::cargo::run().args(["--quiet", "--", "doctor", "--text"]).run()?;
 }
 
-# This repository's own configuration is valid and formatted.
-check doctor = [cargo.run("doctor", "--text"), cargo.run("fmt", "--check", "--text")] {
-  paths = ["citrus.ci"]
-  reads = rust
+/// Format the code.
+task fmt {
+    std::cargo::fmt().arg("--all").run()?;
 }
 
-# Format the code.
-task fmt = cargo.fmt()
+/// GitHub: tags and the binaries the release workflow publishes.
+environment github_repo;
 
-# `citrus release start github --version X.Y.Z --approve`: tag a proven main
-# commit; the release workflow publishes the binaries and SHA256SUMS.
+/// `citrus release start github --version X.Y.Z --approve`: tag a proven main
+/// commit; the release workflow publishes the binaries and SHA256SUMS.
+#[environment(github_repo)]
 release github {
-  environment = github
+    /// Only a commit that is on origin/main, with its version and notes.
+    step main(r: Release) {
+        git(["fetch", "--quiet", "origin", "main"])?;
+        git(["merge-base", "--is-ancestor", "HEAD", "origin/main"])
+            .context("{r.commit} is not on origin/main")?;
+        let manifest = std::fs::read("Cargo.toml")?;
+        assert manifest.contains("version = \"{r.version}\""), "Cargo.toml is not at {r.version}";
+        let notes = std::fs::read("CHANGELOG.md")?;
+        assert notes.contains("## {r.version} "), "CHANGELOG.md has no section for {r.version}";
+    }
 
-  # Only a commit that is on origin/main, with its version and notes.
-  step main = [
-    run("git", "fetch", "--quiet", "origin", "main"),
-    run("git", "merge-base", "--is-ancestor", "HEAD", "origin/main"),
-    run("grep", "-q", "^version = \"{version}\"", "Cargo.toml"),
-    run("grep", "-q", "^## {version} ", "CHANGELOG.md"),
-  ]
+    #[production]
+    #[recover(push_tag)]
+    step tag(r: Release) {
+        git(["tag", "-a", "v{r.version}", "-m", "Citrus v{r.version}"])?;
+        push_tag(r)?;
+    }
 
-  step tag = [
-    run("git", "tag", "-a", "v{version}", "-m", "Citrus v{version}"),
-    run("git", "push", "--quiet", "origin", "v{version}"),
-  ] {
-    production = true
-    # The tag may exist already: only push it.
-    recover = run("git", "push", "--quiet", "origin", "v{version}")
-  }
+    step binaries(r: Release) {
+        let base = "https://github.com/deknowny/citrus/releases/download";
+        std::wait::http("{base}/v{r.version}/SHA256SUMS", 30m)?;
+    }
+}
 
-  step binaries = wait.http("https://github.com/deknowny/citrus/releases/download/v{version}/SHA256SUMS", timeout: 30m)
+/// `git` with these arguments in the repository.
+fn git(args: list<str>) -> Result<()> {
+    std::proc::Command::new("git").args(args).run()
+}
+
+/// The tag may exist already: only push it.
+fn push_tag(r: Release) -> Result<()> {
+    git(["push", "--quiet", "origin", "v{r.version}"])
 }

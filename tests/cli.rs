@@ -58,6 +58,23 @@ impl Project {
         project
     }
 
+    /// A project whose `citrus.ci` is exactly `config` (language v2).
+    fn v2(config: &str) -> Project {
+        let project = Project::new("");
+        project.write("citrus.ci", config);
+        project.git(&["add", "-A"]);
+        project.git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "v2",
+        ]);
+        project
+    }
+
     fn root(&self) -> &Path {
         self.dir.path()
     }
@@ -2864,4 +2881,165 @@ fn check_warns_about_missing_inputs_of_reused_checks_only() {
         ["check reused reuses passes, but its input `missing/**` matches no file"],
         "{checked}"
     );
+}
+
+const V2: &str = r#"#![citrus(2)]
+
+/// What the checks read.
+const SOURCES: list<glob> = ["src/**"];
+
+/// One file's text, or why it could not be read.
+fn text(file: path) -> Result<str> {
+    std::fs::read(file).context("reading {file}")
+}
+
+/// The sources say "one".
+#[paths(SOURCES)]
+check content {
+    let found = text("src/a.txt")?;
+    assert found.trim() == "one", "src/a.txt says {found.trim()}";
+}
+
+/// A program's output, judged by Citrus.
+#[paths(SOURCES)]
+check program {
+    let out = std::proc::Command::new("sh").args(["-c", "echo ready; exit 3"]).output()?;
+    let code = match out.code {
+        0 => "ok",
+        3 => "three",
+        _ => "other",
+    };
+    assert code == "three" && out.stdout.contains("ready");
+}
+"#;
+
+#[test]
+fn v2_checks_run_their_bodies_and_fail_at_the_line() {
+    let project = Project::v2(V2);
+    let (first, code) = project.json(&["run"]);
+    assert_eq!(code, 0, "{first}");
+    // The same body and inputs: proven, not run again.
+    let (second, _) = project.json(&["run"]);
+    assert!(
+        second["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["result"] == "reused"),
+        "{second}"
+    );
+    project.write("src/a.txt", "two\n");
+    let (failed, code) = project.json(&["run", "content"]);
+    assert_eq!(code, 1, "{failed}");
+    let error = failed["targets"][0]["first_error"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(error.contains("src/a.txt says two"), "{failed}");
+    let log = String::from_utf8_lossy(
+        &project
+            .citrus(&["log", failed["run"]["id"].as_str().unwrap(), "--full"])
+            .stdout,
+    )
+    .into_owned();
+    assert!(log.contains("--> citrus.ci:15:5"), "{log}");
+    // A changed body is a new check: its pass is not reused.
+    project.write("src/a.txt", "one\n");
+    project.write("citrus.ci", &V2.replace("echo ready", "echo  ready"));
+    let (rerun, _) = project.json(&["run", "program"]);
+    assert_eq!(rerun["targets"][0]["result"], "passed", "{rerun}");
+}
+
+#[test]
+fn v2_checker_explains_mistakes_before_anything_runs() {
+    let cases = [
+        (
+            "check c { let xs = [1]; for x in xs.iter() { } }",
+            "no iterators or closures",
+        ),
+        ("check c { let xs = [1]; xs.push(2); }", "`let mut`"),
+        (
+            "const fn f() -> bool { std::fs::exists(\"x\") }",
+            "not allowed in a constant or a `const fn`",
+        ),
+        ("check c { std::fs::read(\"x\"); }", "add `?`"),
+        (
+            "fn f() -> Result<int> { let x = std::env::var(\"X\")?; Ok(1) }",
+            "ok_or",
+        ),
+        (
+            "const SOURCE: list<glob> = [];\ncheck c { let x = SOURSE; }",
+            "did you mean `SOURCE`",
+        ),
+        ("fn f(x: String) -> int { 1 }", "text is `str`"),
+        ("check c { let x = 1; x = 2; }", "not mutable"),
+        (
+            "check c { let v = std::env::var(\"X\"); let s = match v { Some(x) => x }; }",
+            "add `_ => …`",
+        ),
+        ("#[pths(\"x\")]\ncheck c { }", "did you mean `#[paths]`"),
+    ];
+    for (body, expected) in cases {
+        let project = Project::v2(&format!("#![citrus(2)]\n{body}\n"));
+        let output = project.citrus(&["check", "--text"]);
+        let text = String::from_utf8_lossy(&output.stderr).into_owned()
+            + &String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success(), "{body}: accepted");
+        assert!(text.contains(expected), "{body}: {text}");
+    }
+}
+
+#[test]
+fn v2_releases_pass_the_release_to_steps_and_recover_with_a_function() {
+    let project = Project::v2(
+        r#"#![citrus(2)]
+
+environment prod;
+
+#[environment(prod)]
+#[version(initial = "1.0.0-app")]
+release app {
+    step build(r: Release) {
+        let previous = match r.previous { Some(v) => "{v}", None => "none" };
+        std::log::info("building {r.version} after {previous}");
+    }
+    #[production]
+    #[recover(reconcile)]
+    step deploy(r: Release) {
+        assert std::fs::exists("deploy-ok"), "cluster unreachable";
+    }
+}
+
+fn reconcile(r: Release) -> Result<()> {
+    std::log::info("reconciled {r.version}");
+    Ok(())
+}
+"#,
+    );
+    project.write(".gitignore", ".scratch/\ndeploy-ok\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "ignore",
+    ]);
+    let (failed, code) = project.json(&["release", "start", "app", "--approve"]);
+    assert_eq!(code, 1, "{failed}");
+    assert!(
+        step(&failed, "deploy")["first_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cluster unreachable"),
+        "{failed}"
+    );
+    project.write("deploy-ok", "");
+    let id = failed["release"]["id"].as_str().unwrap().to_owned();
+    let (resumed, code) = project.json(&["release", "resume", &id, "--approve"]);
+    assert_eq!(code, 0, "{resumed}");
+    let log = String::from_utf8_lossy(&project.citrus(&["release", "log", &id, "--full"]).stdout)
+        .into_owned();
+    assert!(log.contains("building 1.0.0-app after none"), "{log}");
 }

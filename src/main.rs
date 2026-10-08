@@ -14,6 +14,7 @@ mod doctor;
 mod exec;
 mod integrate;
 mod lang;
+mod lang2;
 mod manifest;
 mod plan;
 mod release;
@@ -2210,6 +2211,10 @@ fn fmt_command(context: &Context, check: bool, json: bool) -> Result<i32> {
     for file in &files {
         let path = context.repo.root.join(file);
         let text = std::fs::read_to_string(&path)?;
+        // Language v2 has no formatter yet: never rewrite it with v1's layout.
+        if lang2::is_v2(&text) {
+            continue;
+        }
         let formatted = lang::layout::format(&text);
         if formatted != text {
             if !check {
