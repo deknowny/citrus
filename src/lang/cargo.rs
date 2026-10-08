@@ -155,13 +155,54 @@ pub fn closure(files: &dyn Files, package: &str) -> Result<Vec<String>, String> 
             globs.insert(path.clone());
         }
     }
+    // A crate in a directory of its own owns that directory. A package at
+    // the repository root shares it with everything else, so it owns only
+    // where Cargo looks for sources, plus the paths its targets name.
+    let mut root_globs: Vec<String> = Vec::new();
     for dir in &dirs {
-        globs.insert(if dir.is_empty() {
-            "**".into()
+        if dir.is_empty() {
+            for (glob, prefix) in [
+                ("src/**", "src/"),
+                ("tests/**", "tests/"),
+                ("benches/**", "benches/"),
+                ("examples/**", "examples/"),
+                ("build.rs", "build.rs"),
+            ] {
+                if files.list().iter().any(|file| file.starts_with(prefix)) {
+                    root_globs.push(glob.to_owned());
+                }
+            }
+            for target in ["lib", "bin", "test", "bench", "example"] {
+                let entries = match root.get(target) {
+                    Some(toml::Value::Table(table)) => vec![table.clone()],
+                    Some(toml::Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|item| item.as_table().cloned())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for entry in entries {
+                    if let Some(path) = entry.get("path").and_then(|value| value.as_str()) {
+                        root_globs.push(normalize("", path));
+                    }
+                }
+            }
+            if let Some(build) = root
+                .get("package")
+                .and_then(|package| package.get("build"))
+                .and_then(|value| value.as_str())
+            {
+                root_globs.push(normalize("", build));
+            }
+            globs.extend(root_globs.iter().cloned());
         } else {
-            format!("{dir}/**")
-        });
+            globs.insert(format!("{dir}/**"));
+        }
     }
+    let covered = |path: &str| {
+        dirs.iter().any(|dir| !dir.is_empty() && within(path, dir))
+            || crate::manifest::GlobList::new(&root_globs).is_ok_and(|list| list.matches(path))
+    };
     // Sources may pull in files from outside their crate.
     for dir in &dirs {
         let prefix = if dir.is_empty() {
@@ -169,11 +210,9 @@ pub fn closure(files: &dyn Files, package: &str) -> Result<Vec<String>, String> 
         } else {
             format!("{dir}/")
         };
-        for path in files
-            .list()
-            .iter()
-            .filter(|path| path.starts_with(&prefix) && path.ends_with(".rs"))
-        {
+        for path in files.list().iter().filter(|path| {
+            path.starts_with(&prefix) && path.ends_with(".rs") && (!dir.is_empty() || covered(path))
+        }) {
             let Some(text) = files.read(path) else {
                 continue;
             };
@@ -185,12 +224,15 @@ pub fn closure(files: &dyn Files, package: &str) -> Result<Vec<String>, String> 
                     source_dir
                 };
                 let resolved = normalize(base, &reference);
-                if resolved.starts_with("../") || dirs.iter().any(|dir| within(&resolved, dir)) {
+                if resolved.starts_with("../") || covered(&resolved) {
                     continue;
                 }
+                // Only what exists: text that merely looks like a macro call
+                // (in a string or a comment) names nothing.
+                let directory = format!("{resolved}/");
                 if files.list().iter().any(|file| file == &resolved) {
                     globs.insert(resolved);
-                } else {
+                } else if files.list().iter().any(|file| file.starts_with(&directory)) {
                     globs.insert(format!("{resolved}/**"));
                 }
             }

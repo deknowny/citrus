@@ -515,7 +515,54 @@ impl<'a> Interp<'a> {
                 return Err(panic(*span, format!("no `match` arm for {}", found.text())));
             }
             Expr::Block(block) => self.block(block)?,
+            Expr::Command {
+                run,
+                env,
+                words,
+                span,
+            } => {
+                let mut argv = Vec::new();
+                for word in words {
+                    self.command_word(word, &mut argv)?;
+                }
+                let mut spec = CommandSpec {
+                    program: argv.remove(0),
+                    args: argv,
+                    ..CommandSpec::default()
+                };
+                for (key, word) in env {
+                    let mut value = Vec::new();
+                    self.command_word(word, &mut value)?;
+                    spec.env.push((key.clone(), value.join("")));
+                }
+                if *run {
+                    self.run(&spec, *span)
+                } else {
+                    Value::Command(Rc::new(spec))
+                }
+            }
         })
+    }
+
+    fn command_word(&mut self, word: &CmdWord, out: &mut Vec<String>) -> Eval<()> {
+        match word {
+            CmdWord::Word(pieces) => {
+                let mut text = String::new();
+                for piece in pieces {
+                    match piece {
+                        CmdPiece::Lit(literal) => text.push_str(literal),
+                        CmdPiece::Expr(expr) => text.push_str(&self.expr(expr)?.text()),
+                    }
+                }
+                out.push(text);
+            }
+            CmdWord::Splat(expr) => {
+                if let Value::List(items) = self.expr(expr)? {
+                    out.extend(items.iter().map(Value::text));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn matches(
@@ -743,24 +790,11 @@ impl<'a> Interp<'a> {
 
     fn std_call(&mut self, name: &str, args: Vec<Value>, span: Span) -> Eval<Value> {
         let arg = |index: usize| args.get(index).cloned().unwrap_or(Value::Unit);
-        let cargo = |sub: &str| {
-            Value::Command(Rc::new(CommandSpec {
-                program: "cargo".into(),
-                args: vec![sub.to_owned()],
-                ..CommandSpec::default()
-            }))
-        };
         Ok(match name {
             "std::proc::Command::new" => Value::Command(Rc::new(CommandSpec {
                 program: arg(0).text(),
                 ..CommandSpec::default()
             })),
-            "std::cargo::test" => cargo("test"),
-            "std::cargo::fmt" => cargo("fmt"),
-            "std::cargo::clippy" => cargo("clippy"),
-            "std::cargo::run" => cargo("run"),
-            "std::cargo::build" => cargo("build"),
-            "std::cargo::check" => cargo("check"),
             "std::fs::read" => match std::fs::read_to_string(self.root.join(arg(0).as_str())) {
                 Ok(text) => Value::Ok(Box::new(Value::str(text))),
                 Err(error) => Value::Err(Rc::new(Failure {

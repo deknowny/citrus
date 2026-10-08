@@ -19,16 +19,14 @@ The semantics are deliberately smaller.
 const RUST: list<glob> = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "build.rs"];
 
 /// Unit and integration tests on throwaway Git repositories.
-#[paths(RUST, "examples/**")]
 check test {
-    std::cargo::test().run()?;
+    run!("cargo test --locked")?;          // inputs: read from Cargo
 }
 
 /// rustfmt and clippy with warnings as errors.
-#[paths(RUST, "rustfmt.toml")]
 check lint {
-    std::cargo::fmt().arg("--check").run()?;
-    std::cargo::clippy().args(["--all-targets", "--", "-D", "warnings"]).run()?;
+    run!("cargo fmt --all --check")?;
+    run!("cargo clippy --locked --all-targets -- -D warnings")?;
 }
 ```
 
@@ -127,12 +125,44 @@ A check or step body returns `Result<()>`: falling off the end is `Ok(())`,
 `?` and a failed `assert` end it with an error, and the run reports that
 error with its place in the file.
 
+## Commands
+
+`run!("…")` runs a program and returns `Result<()>` (its output goes to the
+log); `cmd!("…")` is the same command as a `Command` for `.output()`,
+`.env()`, `.current_dir()`. The line is split into words when the file
+loads, the way a terminal would, but with no shell:
+
+- whitespace separates words, `'…'` keeps spaces inside one;
+- `{x}` is part of the word it stands in and never splits: `x{v}y` is one
+  argument whatever `v` holds;
+- `{list...}` is a word of its own and spreads a list into several;
+- leading `KEY=value` words are the command's environment;
+- `|`, `>`, `*` are plain characters: write `run!("sh -c {script}")` for a
+  shell.
+
+### Programs Citrus understands
+
+Because the line is read when the file loads, Citrus sees which program it
+starts. For the programs it knows it takes part in the plan:
+
+- **Cargo** (`cargo test|build|check|clippy|run|bench|doc|fmt|nextest`): the
+  check's inputs are the closure of the packages it builds (`-p` names them;
+  without `-p` the workspace members, or the root package) — its crates,
+  path dependencies, files their sources `include_str!`, the workspace
+  manifest, lockfile and settings. A check whose commands are all understood
+  needs no `#[paths]`; `#[paths]` adds to what is understood. A misspelled
+  subcommand or package is an error before anything runs. Everything after
+  `--` belongs to the test binary.
+
+A program Citrus does not know is a plain process: its check declares
+`#[paths]`, and `citrus check` says so. `citrus why` and `citrus targets`
+show what each command was understood as.
+
 ## The standard library (first cut)
 
 | | |
 |---|---|
-| `std::proc::Command::new(program)` | `.arg(s)`, `.args(list)`, `.env(k, v)`, `.run() -> Result<()>` (streams to the log), `.output() -> Result<Output>` (`code`, `stdout`, `stderr`) |
-| `std::cargo::test()` / `fmt()` / `clippy()` / `run()` | `cargo <sub>` as a `Command` |
+| `std::proc::Command::new(program)` | a command whose program is a value: `.arg(s)`, `.args(list)`, `.env(k, v)`, `.run() -> Result<()>`, `.output() -> Result<Output>` (`code`, `stdout`, `stderr`) |
 | `std::fs::read(path) -> Result<str>`, `exists(path) -> bool`, `glob(glob) -> list<path>` | |
 | `std::env::var(name) -> Option<str>` | |
 | `std::wait::http(url, timeout) -> Result<()>` | |

@@ -8,6 +8,7 @@ pub mod check;
 pub mod interp;
 pub mod lexer;
 pub mod parser;
+pub mod tools;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -116,7 +117,7 @@ pub fn load(
 ) -> Result<(Project, Sources), String> {
     let (program, sources) =
         parse(root, entry, revision).map_err(|(error, sources)| sources.render(&error))?;
-    compile(&program, &sources, root)
+    compile(&program, &sources, root, revision)
         .map(|project| (project, sources.clone()))
         .map_err(|error| sources.render(&error))
 }
@@ -214,7 +215,13 @@ fn release_args() -> Vec<(String, String)> {
         .collect()
 }
 
-pub fn compile(program: &Program, sources: &Sources, root: &Path) -> Result<Project, Error> {
+pub fn compile(
+    program: &Program,
+    sources: &Sources,
+    root: &Path,
+    revision: Option<&str>,
+) -> Result<Project, Error> {
+    let files = tools::RepoFiles::new(root, revision);
     let mut project = Project::default();
     let mut interp = Interp::new(program, root);
     interp
@@ -266,7 +273,8 @@ pub fn compile(program: &Program, sources: &Sources, root: &Path) -> Result<Proj
                 });
                 for inner in items {
                     let name = format!("{}.{}", item.name, inner.name);
-                    let mut check = make_check(inner, &name, &mut interp, sources, &shared)?;
+                    let mut check =
+                        make_check(inner, &name, &mut interp, sources, &shared, program, &files)?;
                     check.group = Some(item.name.clone());
                     if check.owns.is_empty() {
                         check.owns = paths.clone();
@@ -279,12 +287,21 @@ pub fn compile(program: &Program, sources: &Sources, root: &Path) -> Result<Proj
                 }
             }
             ItemKind::Check { .. } => {
-                let check = make_check(item, &item.name, &mut interp, sources, &shared)?;
+                let check = make_check(
+                    item,
+                    &item.name,
+                    &mut interp,
+                    sources,
+                    &shared,
+                    program,
+                    &files,
+                )?;
                 if check.owns.is_empty() {
-                    return Err(
-                        Error::at(item.span, format!("check {} has no paths", item.name))
-                            .help("put it in a group, or give it `#[paths(\"…\")]`"),
-                    );
+                    return Err(Error::at(
+                        item.name_span,
+                        format!("check {} has no paths", item.name),
+                    )
+                    .help("run a command Citrus understands (cargo …), put it in a group, or give it `#[paths(\"…\")]`"));
                 }
                 project.checks.push(check);
             }
@@ -396,14 +413,91 @@ pub fn compile(program: &Program, sources: &Sources, root: &Path) -> Result<Proj
     Ok(project)
 }
 
+/// What the commands of a body (and of the functions it calls) read, as far
+/// as Citrus understands them, their summaries, and whether one of them is a
+/// plain process Citrus cannot see into.
+fn understood_inputs(
+    program: &Program,
+    body: &ast::Block,
+    files: &tools::RepoFiles,
+) -> Result<(Vec<String>, Vec<String>, bool), Error> {
+    let mut found: Vec<&Expr> = Vec::new();
+    tools::block_commands(body, &mut found);
+    let mut seen_fns: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < found.len() {
+        if let Expr::Call { callee, .. } = found[index]
+            && let Expr::Path(segments, _) = &**callee
+            && segments.len() == 1
+            && !seen_fns.contains(&segments[0])
+            && let Some(ItemKind::Fn(function)) = program
+                .items
+                .iter()
+                .find(|item| item.name == segments[0])
+                .map(|item| &item.kind)
+        {
+            seen_fns.push(segments[0].clone());
+            tools::block_commands(&function.body, &mut found);
+        }
+        index += 1;
+    }
+    let mut inputs = Vec::new();
+    let mut summaries = Vec::new();
+    let mut opaque = false;
+    for expr in found {
+        let Expr::Command { words, span, .. } = expr else {
+            if let Expr::Call { callee, .. } = expr
+                && let Expr::Path(segments, _) = &**callee
+                && segments.first().is_some_and(|first| first == "std")
+            {
+                opaque = true;
+            }
+            continue;
+        };
+        match tools::understand(words, *span, files)? {
+            Some(understood) => {
+                for glob in understood.inputs {
+                    if !inputs.contains(&glob) {
+                        inputs.push(glob);
+                    }
+                }
+                summaries.push(understood.summary);
+            }
+            None => opaque = true,
+        }
+    }
+    Ok((inputs, summaries, opaque))
+}
+
 fn make_check(
     item: &Item,
     name: &str,
     interp: &mut Interp,
     sources: &Sources,
     shared: &str,
+    program: &Program,
+    files: &tools::RepoFiles,
 ) -> Result<Check, Error> {
     not_yet(item, &["needs", "after"])?;
+    let ItemKind::Check { body } = &item.kind else {
+        return Err(Error::at(item.span, "not a check"));
+    };
+    let declared = globs(interp, item, "paths")?;
+    let (inferred, summaries, opaque) = understood_inputs(program, body, files)?;
+    // Understood inputs select the check on their own only when every command
+    // was understood; a plain process next to them needs `#[paths]`.
+    let mut owns = declared.clone();
+    if !opaque || !declared.is_empty() {
+        for glob in inferred {
+            if !owns.contains(&glob) {
+                owns.push(glob);
+            }
+        }
+    }
+    let mut meta = BTreeMap::new();
+    if !summaries.is_empty() {
+        meta.insert("understood".to_owned(), serde_json::json!(summaries));
+    }
     if !crate::manifest::valid_name(name) {
         return Err(Error::at(
             item.span,
@@ -413,12 +507,12 @@ fn make_check(
     Ok(Check {
         name: name.to_owned(),
         description: item.doc.clone(),
-        owns: globs(interp, item, "paths")?,
+        owns,
         reads: globs(interp, item, "reads")?,
         cache: true,
         cache_set: cache(item, interp)?,
         resources: Vec::new(),
-        meta: BTreeMap::new(),
+        meta,
         env: Vec::new(),
         steps: vec![script(
             format!("check:{name}"),

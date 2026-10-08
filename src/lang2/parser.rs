@@ -16,6 +16,9 @@ pub struct Parser {
 
 type Parsed<T> = Result<T, Error>;
 
+/// A command line's environment and words.
+type CommandLine = (Vec<(String, CmdWord)>, Vec<CmdWord>);
+
 const KEYWORDS: &[&str] = &[
     "const",
     "fn",
@@ -822,6 +825,32 @@ impl Parser {
                     span: self.join(start),
                 })
             }
+            Tok::Ident(word)
+                if (word == "run" || word == "cmd") && matches!(self.peek_at(1), Tok::Sym("!")) =>
+            {
+                self.bump();
+                self.bump();
+                self.expect_sym("(")?;
+                let Tok::Str(parts) = self.peek().clone() else {
+                    return Err(Error::at(
+                        self.span(),
+                        format!("`{word}!` takes a command line in quotes"),
+                    )
+                    .help(format!("{word}!(\"cargo test --locked\")")));
+                };
+                let text_span = self.bump().span;
+                self.expect_sym(")")?;
+                let (env, words) = self.command_words(&parts, text_span)?;
+                if words.is_empty() {
+                    return Err(Error::at(text_span, "an empty command"));
+                }
+                Ok(Expr::Command {
+                    run: word == "run",
+                    env,
+                    words,
+                    span: self.join(start),
+                })
+            }
             Tok::Ident(word) if KEYWORDS.contains(&word.as_str()) => Err(Error::at(
                 start,
                 format!("`{word}` cannot start an expression here"),
@@ -863,6 +892,104 @@ impl Parser {
                 format!("expected an expression, found {}", self.describe()),
             )),
         }
+    }
+
+    /// Split a command line into words: whitespace separates, `'…'` keeps
+    /// spaces, `{x}` is part of the word it is in, `{xs...}` a whole word
+    /// spread from a list. No shell: `|`, `>`, `*` are plain characters.
+    fn command_words(&self, parts: &[Part], span: Span) -> Parsed<CommandLine> {
+        let mut words: Vec<CmdWord> = Vec::new();
+        let mut current: Vec<CmdPiece> = Vec::new();
+        let mut text = String::new();
+        let mut quoted = false;
+        let mut splat_pending = false;
+        let flush = |current: &mut Vec<CmdPiece>, text: &mut String, words: &mut Vec<CmdWord>| {
+            if !text.is_empty() {
+                current.push(CmdPiece::Lit(std::mem::take(text)));
+            }
+            if !current.is_empty() {
+                words.push(CmdWord::Word(std::mem::take(current)));
+            }
+        };
+        for part in parts {
+            match part {
+                Part::Lit(literal) => {
+                    for ch in literal.chars() {
+                        if splat_pending && !ch.is_whitespace() {
+                            return Err(Error::at(span, "`{list...}` must be a word of its own")
+                                .help("put a space after it"));
+                        }
+                        splat_pending = false;
+                        match ch {
+                            '\'' => quoted = !quoted,
+                            c if c.is_whitespace() && !quoted => {
+                                flush(&mut current, &mut text, &mut words)
+                            }
+                            c => text.push(c),
+                        }
+                    }
+                }
+                Part::Hole(source, offset) => {
+                    if let Some(list) = source.trim().strip_suffix("...") {
+                        if !text.is_empty() || !current.is_empty() || quoted {
+                            return Err(Error::at(span, "`{list...}` must be a word of its own"));
+                        }
+                        let expr = self.hole_expr(list, *offset)?;
+                        words.push(CmdWord::Splat(expr));
+                        splat_pending = true;
+                        continue;
+                    }
+                    if !text.is_empty() {
+                        current.push(CmdPiece::Lit(std::mem::take(&mut text)));
+                    }
+                    current.push(CmdPiece::Expr(self.hole_expr(source, *offset)?));
+                }
+            }
+        }
+        if quoted {
+            return Err(Error::at(span, "unclosed `'` in the command"));
+        }
+        flush(&mut current, &mut text, &mut words);
+        // Leading `KEY=value` words set the environment, as in a shell.
+        let mut env = Vec::new();
+        while let Some(CmdWord::Word(pieces)) = words.first() {
+            let Some(CmdPiece::Lit(first)) = pieces.first() else {
+                break;
+            };
+            let Some((key, rest)) = first.split_once('=') else {
+                break;
+            };
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                break;
+            }
+            let mut value = pieces[1..].to_vec();
+            if !rest.is_empty() {
+                value.insert(0, CmdPiece::Lit(rest.to_owned()));
+            }
+            env.push((key.to_owned(), CmdWord::Word(value)));
+            words.remove(0);
+        }
+        Ok((env, words))
+    }
+
+    fn hole_expr(&self, source: &str, offset: usize) -> Parsed<Expr> {
+        let tokens = lex(self.file, source, offset)?;
+        let mut inner = Parser {
+            tokens,
+            index: 0,
+            file: self.file,
+            no_struct: false,
+            name_span: Span::default(),
+        };
+        let expr = inner.expr()?;
+        if !inner.at_eof() {
+            return Err(Error::at(inner.span(), "unexpected text inside `{…}`"));
+        }
+        Ok(expr)
     }
 
     fn pattern(&mut self) -> Parsed<Pattern> {

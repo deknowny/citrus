@@ -146,6 +146,37 @@ pub enum Pattern {
     Variant(String, Option<Box<Pattern>>, Span),
 }
 
+/// A piece of one word of a command line: text or `{expr}`.
+#[derive(Debug, Clone)]
+pub enum CmdPiece {
+    Lit(String),
+    Expr(Expr),
+}
+
+/// One argument of `run!`/`cmd!`: pieces joined into one argument, or a
+/// list spread into several (`{flags...}`).
+#[derive(Debug, Clone)]
+pub enum CmdWord {
+    Word(Vec<CmdPiece>),
+    Splat(Expr),
+}
+
+impl CmdWord {
+    /// The word when it is plain text.
+    pub fn literal(&self) -> Option<String> {
+        match self {
+            CmdWord::Word(pieces) => pieces
+                .iter()
+                .map(|piece| match piece {
+                    CmdPiece::Lit(text) => Some(text.clone()),
+                    CmdPiece::Expr(_) => None,
+                })
+                .collect(),
+            CmdWord::Splat(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Unit(Span),
@@ -189,6 +220,14 @@ pub enum Expr {
         span: Span,
     },
     Block(Block),
+    /// `run!("…")` (runs it) or `cmd!("…")` (a `Command`), split into words
+    /// when the file loads; leading `KEY=value` words are its environment.
+    Command {
+        run: bool,
+        env: Vec<(String, CmdWord)>,
+        words: Vec<CmdWord>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -210,7 +249,8 @@ impl Expr {
             | Expr::Binary(_, _, _, span)
             | Expr::Try(_, span)
             | Expr::If { span, .. }
-            | Expr::Match { span, .. } => *span,
+            | Expr::Match { span, .. }
+            | Expr::Command { span, .. } => *span,
             Expr::Block(block) => block.span,
         }
     }

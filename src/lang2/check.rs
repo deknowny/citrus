@@ -95,8 +95,6 @@ pub fn std_fn(path: &[String]) -> Option<StdFn> {
     let f = |params: Vec<Ty>, ret: Ty, io: bool| Some(StdFn { params, ret, io });
     match joined.as_str() {
         "std::proc::Command::new" => f(vec![Ty::Str], Ty::Command, false),
-        "std::cargo::test" | "std::cargo::fmt" | "std::cargo::clippy" | "std::cargo::run"
-        | "std::cargo::build" | "std::cargo::check" => f(vec![], Ty::Command, false),
         "std::fs::read" => f(vec![Ty::Path], Ty::Result(Box::new(Ty::Str)), true),
         "std::fs::exists" => f(vec![Ty::Path], Ty::Bool, true),
         "std::fs::glob" => f(vec![Ty::Glob], Ty::List(Box::new(Ty::Path)), true),
@@ -110,12 +108,6 @@ pub fn std_fn(path: &[String]) -> Option<StdFn> {
 
 pub const STD_FUNCTIONS: &[&str] = &[
     "std::proc::Command::new",
-    "std::cargo::test",
-    "std::cargo::fmt",
-    "std::cargo::clippy",
-    "std::cargo::run",
-    "std::cargo::build",
-    "std::cargo::check",
     "std::fs::read",
     "std::fs::exists",
     "std::fs::glob",
@@ -1102,7 +1094,66 @@ impl<'a> Checker<'a> {
                 result
             }
             Expr::Block(block) => self.block(block)?,
+            Expr::Command {
+                run,
+                env,
+                words,
+                span,
+            } => {
+                if *run && self.pure_only() {
+                    return Err(Error::at(
+                        *span,
+                        "`run!` runs a program: not allowed in a constant or a `const fn`",
+                    ));
+                }
+                for word in env.iter().map(|(_, word)| word).chain(words) {
+                    self.command_word(word)?;
+                }
+                if *run { result_unit() } else { Ty::Command }
+            }
         })
+    }
+
+    fn command_word(&mut self, word: &CmdWord) -> Result<(), Error> {
+        let text_like = |ty: &Ty| {
+            matches!(
+                ty,
+                Ty::Str | Ty::Path | Ty::Glob | Ty::Int | Ty::Version | Ty::Unknown
+            )
+        };
+        match word {
+            CmdWord::Word(pieces) => {
+                for piece in pieces {
+                    if let CmdPiece::Expr(expr) = piece {
+                        let ty = self.expr(expr)?;
+                        if !text_like(&ty) {
+                            return Err(Error::at(
+                                expr.span(),
+                                format!("a {ty} cannot be an argument"),
+                            )
+                            .help(if matches!(ty, Ty::List(_)) {
+                                "spread a list into arguments: `{list...}`"
+                            } else {
+                                "pass text, a path or a number"
+                            }));
+                        }
+                    }
+                }
+            }
+            CmdWord::Splat(expr) => {
+                let ty = self.expr(expr)?;
+                match &ty {
+                    Ty::List(item) if text_like(item) => {}
+                    other => {
+                        return Err(Error::at(
+                            expr.span(),
+                            format!("`{{…...}}` spreads a list of text, not {other}"),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn pattern(

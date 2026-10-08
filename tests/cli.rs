@@ -3043,3 +3043,82 @@ fn reconcile(r: Release) -> Result<()> {
         .into_owned();
     assert!(log.contains("building 1.0.0-app after none"), "{log}");
 }
+
+#[test]
+fn v2_commands_split_like_a_terminal_without_a_shell() {
+    let project = Project::v2(
+        r#"#![citrus(2)]
+
+/// Arguments as the program sees them.
+#[paths("src/**")]
+check words {
+    let name = "two words";
+    let flags = ["-a", "-b"];
+    let out = cmd!("GREETING=hi sh -c 'printf \"%s|\" \"$GREETING\" \"$@\"' sh {name} x{name}y {flags...} 'a b' > *").output()?;
+    assert out.stdout == "hi|two words|xtwo wordsy|-a|-b|a b|>|*|", "got {out.stdout}";
+}
+"#,
+    );
+    let (run, code) = project.json(&["run"]);
+    assert_eq!(code, 0, "{run}");
+}
+
+#[test]
+fn v2_understands_cargo_commands_and_their_inputs() {
+    let project = Project::v2(
+        r#"#![citrus(2)]
+
+/// The API crate's tests: no paths, Citrus reads them from Cargo.
+check api {
+    run!("cargo test --locked -p api -- --nocapture")?;
+}
+"#,
+    );
+    project.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+    project.write(
+        "crates/api/Cargo.toml",
+        "[package]\nname = \"api\"\n\n[dependencies]\ncore = { path = \"../core\" }\n",
+    );
+    project.write("crates/core/Cargo.toml", "[package]\nname = \"core\"\n");
+    project.write("crates/web/Cargo.toml", "[package]\nname = \"web\"\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "crates",
+    ]);
+    let (targets, code) = project.json(&["targets"]);
+    assert_eq!(code, 0, "{targets}");
+    let inputs = targets["targets"][0]["inputs"].to_string();
+    assert!(
+        inputs.contains("crates/api/**") && inputs.contains("crates/core/**"),
+        "{inputs}"
+    );
+    assert!(!inputs.contains("crates/web"), "{inputs}");
+    assert_eq!(
+        targets["targets"][0]["meta"]["understood"][0],
+        "cargo test -p api"
+    );
+
+    for (command, expected) in [
+        ("cargo test -p apy", "did you mean `api`"),
+        ("cargo tset", "did you mean `cargo test`"),
+        ("make test", "has no paths"),
+    ] {
+        project.write(
+            "citrus.ci",
+            &format!("#![citrus(2)]\ncheck api {{\n    run!(\"{command}\")?;\n}}\n"),
+        );
+        let output = project.citrus(&["check", "--text"]);
+        let text = String::from_utf8_lossy(&output.stderr).into_owned()
+            + &String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.status.success() && text.contains(expected),
+            "{command}: {text}"
+        );
+    }
+}
