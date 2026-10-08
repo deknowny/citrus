@@ -698,7 +698,7 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
         "insert into citrus.agents (name, labels, container, cpus, share, slots, version, state, running, seen, started)
          values ($1, $2, $3, $4, $5, $6, $7, 'ready', 0, now(), now())
          on conflict (name) do update set labels = $2, container = $3, cpus = $4, share = $5,
-             slots = $6, version = $7, state = 'ready', running = 0, seen = now(), started = now()",
+             slots = $6, version = $7, running = 0, seen = now(), started = now()",
         &[
             &machine.name,
             &machine.labels,
@@ -725,7 +725,14 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
     );
     // The heartbeat keeps the agent in the pool and reads whether to drain.
     let stop = Arc::new(AtomicBool::new(false));
-    let draining = Arc::new(AtomicBool::new(false));
+    // A drained agent stays drained across restarts.
+    let state: String = client
+        .query_one(
+            "select state from citrus.agents where name = $1",
+            &[&machine.name],
+        )?
+        .get(0);
+    let draining = Arc::new(AtomicBool::new(state == "draining"));
     let running = Arc::new(AtomicUsize::new(0));
     let heartbeat = {
         let (url, name) = (url.clone(), machine.name.clone());
@@ -777,9 +784,10 @@ fn serve(
             maintained = Instant::now();
             maintain(client, machine)?;
         }
+        // Drained: connected, taking no work until `citrus pool resume`.
         if draining.load(Ordering::SeqCst) {
-            eprintln!("citrus agent {}: drained", machine.name);
-            return Ok(0);
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
         }
         if STOP.load(Ordering::SeqCst) {
             eprintln!("citrus agent {}: stopped", machine.name);
