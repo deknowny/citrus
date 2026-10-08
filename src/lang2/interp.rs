@@ -87,6 +87,13 @@ impl Value {
         }
     }
 
+    /// Text of a value; a list joins its items.
+    pub fn as_text(&self) -> String {
+        let mut out = Vec::new();
+        self.globs(&mut out);
+        out.join("")
+    }
+
     fn as_str(&self) -> &str {
         match self {
             Value::Str(text) | Value::Path(text) | Value::Glob(text) | Value::Version(text) => text,
@@ -133,6 +140,8 @@ pub struct Interp<'a> {
     pub fns: BTreeMap<String, &'a FnDecl>,
     pub consts: BTreeMap<String, Value>,
     pub root: &'a Path,
+    /// Environment of every program a body runs (the check's and profile's `env`).
+    pub env: Vec<(String, String)>,
     scopes: Vec<BTreeMap<String, Value>>,
 }
 
@@ -166,6 +175,7 @@ impl<'a> Interp<'a> {
             fns,
             consts: BTreeMap::new(),
             root,
+            env: Vec::new(),
             scopes: vec![BTreeMap::new()],
         }
     }
@@ -702,6 +712,7 @@ impl<'a> Interp<'a> {
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
+            .envs(self.env.iter().cloned())
             .envs(spec.env.iter().cloned())
             .current_dir(
                 spec.dir
@@ -903,6 +914,14 @@ fn binary(op: &str, a: Value, b: Value, span: Span) -> Eval<Value> {
         }
         ("+", ..) => Value::str(format!("{}{}", a.as_str(), b.as_str())),
         ("-", Value::Int(x), Value::Int(y)) => Value::Int(x - y),
+        ("-", Value::List(x), Value::List(y)) => {
+            let mut out = (**x).clone();
+            out.extend(
+                y.iter()
+                    .map(|glob| Value::Glob(format!("!{}", glob.as_str()).into())),
+            );
+            Value::List(Rc::new(out))
+        }
         ("*", Value::Int(x), Value::Int(y)) => Value::Int(x * y),
         ("/" | "%", Value::Int(_), Value::Int(0)) => return Err(panic(span, "division by zero")),
         ("/", Value::Int(x), Value::Int(y)) => Value::Int(x / y),

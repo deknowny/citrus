@@ -69,6 +69,15 @@ pub enum ItemKind {
         body: Block,
     },
     Environment,
+    /// A profile checks may belong to (`#[env(…)]` for its checks).
+    Profile,
+    /// A resource checks need; `start`/`ready` bodies when Citrus starts it.
+    Service {
+        start: Option<Block>,
+        ready: Option<Block>,
+    },
+    /// Something built from the repository (an image), for environments.
+    Artifact,
     Release {
         steps: Vec<StepDecl>,
         rollback: Option<StepDecl>,

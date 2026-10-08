@@ -123,7 +123,8 @@ impl Context {
                                 .or_insert_with(|| value.clone());
                         }
                         for step in &mut target.steps {
-                            if let crate::lang::compile::Work::Process { env, .. } = &mut step.work
+                            if let crate::lang::compile::Work::Process { env, .. }
+                            | crate::lang::compile::Work::Script { env, .. } = &mut step.work
                             {
                                 for (name, value) in &profile_env {
                                     if !env.iter().any(|(known, _)| known == name) {

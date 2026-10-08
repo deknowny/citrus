@@ -234,6 +234,9 @@ fn kind_name(kind: &ItemKind) -> &'static str {
         ItemKind::Check { .. } => "check",
         ItemKind::Task { .. } => "task",
         ItemKind::Environment => "environment",
+        ItemKind::Profile => "profile",
+        ItemKind::Service { .. } => "service",
+        ItemKind::Artifact => "artifact",
         ItemKind::Release { .. } => "release",
     }
 }
@@ -405,6 +408,9 @@ pub fn check(program: &Program) -> Result<Globals, Error> {
             globals.consts.insert(item.name.clone(), declared);
         }
     }
+    for attr in &program.inner {
+        check_attr(attr, &globals)?;
+    }
     for item in &program.items {
         check_item(item, &globals)?;
     }
@@ -459,16 +465,110 @@ fn check_item(item: &Item, globals: &Globals) -> Result<(), Error> {
                 checker.finish(&step.body, &found, &result_unit())?;
             }
         }
-        ItemKind::Const { .. } | ItemKind::Struct { .. } | ItemKind::Environment => {}
+        ItemKind::Service { start, ready } => {
+            for body in start.iter().chain(ready) {
+                let mut checker = Checker::new(globals, Phase::Run, result_unit());
+                let found = checker.block(body)?;
+                checker.finish(body, &found, &result_unit())?;
+            }
+        }
+        ItemKind::Const { .. }
+        | ItemKind::Struct { .. }
+        | ItemKind::Environment
+        | ItemKind::Profile
+        | ItemKind::Artifact => {}
     }
     Ok(())
 }
 
 /// Attribute arguments are evaluated when the file loads.
-fn check_attr(attr: &Attr, globals: &Globals) -> Result<(), Error> {
-    match attr.name.as_str() {
+/// Attributes that name items, and the kind each names.
+const NAMING: &[(&str, &[&str])] = &[
+    ("needs", &["service"]),
+    ("after", &["check"]),
+    ("covers", &["check"]),
+    ("replaces", &["check"]),
+    ("profile", &["profile"]),
+    ("environment", &["environment"]),
+    ("recover", &["fn"]),
+];
+
+/// Attributes whose arguments are configuration values (text, numbers,
+/// lists, commands, item names), checked as constants.
+const CONFIG: &[&str] = &[
+    "env",
+    "meta",
+    "limit",
+    "inputs",
+    "dockerfile",
+    "kubernetes",
+    "record",
+    "deploy",
+    "approval",
+    "checks",
+    "release_name",
+    "prepare",
+    "migrations",
+    "verify",
+    "main",
+    "toolchain",
+    "logs",
+    "receipts",
+    "signals",
+    "free_version",
+    "after_merge",
+    "runner",
+    "command",
+    "citrus",
+    "tool",
+];
+
+/// `#[when(…)]` and `#![label(…)]` hold plan conditions, compiled separately.
+const CONDITIONS: &[&str] = &["when", "label"];
+
+fn not_found(globals: &Globals, name: &str, kinds: &[&str], span: Span) -> Error {
+    let known = globals
+        .items
+        .iter()
+        .filter(|(_, kind)| kinds.contains(kind))
+        .map(|(name, _)| name.as_str());
+    let mut error = Error::at(span, format!("no {} named `{name}`", kinds.join(" or ")));
+    if let Some(close) = suggest(name, known) {
+        error = error.help(format!("did you mean `{close}`?"));
+    }
+    error
+}
+
+pub fn check_attr(attr: &Attr, globals: &Globals) -> Result<(), Error> {
+    let name = attr.name.as_str();
+    if let Some((_, kinds)) = NAMING.iter().find(|(known, _)| *known == name) {
+        for (_, arg) in &attr.args {
+            let Expr::Path(segments, span) = arg else {
+                return Err(Error::at(
+                    arg.span(),
+                    format!("`#[{name}]` takes names of {}", kinds.join(" or ")),
+                ));
+            };
+            let item = segments.join("::");
+            if !globals
+                .items
+                .get(&item)
+                .is_some_and(|kind| kinds.contains(kind))
+            {
+                return Err(not_found(globals, &item, kinds, *span));
+            }
+        }
+        return Ok(());
+    }
+    match name {
         "paths" | "reads" => {
             for (_, arg) in &attr.args {
+                // A group's name: its paths select the check too.
+                if let Expr::Path(segments, _) = arg
+                    && globals.items.get(&segments.join("::")) == Some(&"group")
+                {
+                    continue;
+                }
                 let mut checker = Checker::new(globals, Phase::Load, Ty::Unknown);
                 let ty = checker.expr(arg)?;
                 if !matches!(ty, Ty::Glob | Ty::Str | Ty::Unknown)
@@ -476,42 +576,18 @@ fn check_attr(attr: &Attr, globals: &Globals) -> Result<(), Error> {
                 {
                     return Err(Error::at(
                         arg.span(),
-                        format!("`#[{}]` takes globs, not {ty}", attr.name),
+                        format!("`#[{name}]` takes globs or group names, not {ty}"),
                     ));
                 }
             }
         }
-        "needs" | "after" | "environment" | "recover" => {
+        "cache" | "production" => {
             for (_, arg) in &attr.args {
-                let Expr::Path(segments, span) = arg else {
-                    return Err(Error::at(
-                        arg.span(),
-                        format!("`#[{}]` takes names", attr.name),
-                    ));
-                };
-                let name = segments.join("::");
-                let wanted = match attr.name.as_str() {
-                    "environment" => "environment",
-                    "recover" => "fn",
-                    "after" => "check",
-                    _ => "",
-                };
-                let found = globals.items.get(&name).copied();
-                if !wanted.is_empty() && found != Some(wanted) {
-                    let known = globals
-                        .items
-                        .iter()
-                        .filter(|(_, kind)| **kind == wanted)
-                        .map(|(name, _)| name.as_str());
-                    let mut error = Error::at(*span, format!("no {wanted} named `{name}`"));
-                    if let Some(close) = suggest(&name, known) {
-                        error = error.help(format!("did you mean `{close}`?"));
-                    }
-                    return Err(error);
-                }
+                let mut checker = Checker::new(globals, Phase::Load, Ty::Unknown);
+                let ty = checker.expr(arg)?;
+                expect(&ty, &Ty::Bool, arg.span())?;
             }
         }
-        "cache" | "production" => {}
         "version" => {
             for (key, arg) in &attr.args {
                 let mut checker = Checker::new(globals, Phase::Load, Ty::Unknown);
@@ -528,26 +604,47 @@ fn check_attr(attr: &Attr, globals: &Globals) -> Result<(), Error> {
                 }
             }
         }
+        _ if CONDITIONS.contains(&name) => {}
+        _ if CONFIG.contains(&name) => {
+            for (_, arg) in &attr.args {
+                config_value(arg, globals)?;
+            }
+        }
         other => {
-            let known = [
-                "paths",
-                "reads",
-                "cache",
-                "needs",
-                "after",
-                "environment",
-                "version",
-                "production",
-                "recover",
-            ];
+            let known = NAMING
+                .iter()
+                .map(|(name, _)| *name)
+                .chain(CONFIG.iter().copied())
+                .chain(CONDITIONS.iter().copied())
+                .chain(["paths", "reads", "cache", "production", "version"]);
             let mut error = Error::at(attr.span, format!("unknown attribute `#[{other}]`"));
-            if let Some(close) = suggest(other, known.into_iter()) {
+            if let Some(close) = suggest(other, known) {
                 error = error.help(format!("did you mean `#[{close}]`?"));
             }
             return Err(error);
         }
     }
     Ok(())
+}
+
+/// A configuration value: an item's name, or a constant expression.
+fn config_value(arg: &Expr, globals: &Globals) -> Result<(), Error> {
+    match arg {
+        Expr::Path(segments, _) if globals.items.contains_key(&segments.join("::")) => Ok(()),
+        // Bare words of a configuration (`#[approval(none)]`, `#[command(release, …)]`).
+        Expr::Path(segments, _)
+            if segments.len() == 1 && !globals.consts.contains_key(&segments[0]) =>
+        {
+            Ok(())
+        }
+        Expr::List(items, _) => items
+            .iter()
+            .try_for_each(|item| config_value(item, globals)),
+        _ => {
+            let mut checker = Checker::new(globals, Phase::Load, Ty::Unknown);
+            checker.expr(arg).map(|_| ())
+        }
+    }
 }
 
 fn expect(found: &Ty, wanted: &Ty, span: Span) -> Result<(), Error> {
@@ -989,6 +1086,17 @@ impl<'a> Checker<'a> {
                         },
                         _ => return Err(Error::at(*span, format!("cannot add {a} and {b}"))),
                     },
+                    "-" if matches!((&a, &b), (Ty::List(_), Ty::List(_))) => {
+                        // `paths - excluded`: the globs of the right side become exclusions.
+                        let text = |ty: &Ty| matches!(ty, Ty::List(item) if matches!(**item, Ty::Glob | Ty::Str | Ty::Unknown));
+                        if !text(&a) || !text(&b) {
+                            return Err(Error::at(
+                                *span,
+                                format!("`-` removes globs from globs, not {b} from {a}"),
+                            ));
+                        }
+                        Ty::List(Box::new(Ty::Glob))
+                    }
                     _ => match (&a, &b) {
                         (Ty::Int, Ty::Int) => Ty::Int,
                         _ => {

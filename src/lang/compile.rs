@@ -51,6 +51,9 @@ pub enum Work {
         item: String,
         digest: String,
         args: Vec<(String, String)>,
+        /// Environment of every program the body runs (check and profile `env`).
+        #[serde(default)]
+        env: Vec<(String, String)>,
     },
 }
 
@@ -107,10 +110,19 @@ impl Work {
             Work::LinksCheck { pattern } => Work::LinksCheck {
                 pattern: apply(pattern),
             },
-            Work::Script { item, digest, args } => Work::Script {
+            Work::Script {
+                item,
+                digest,
+                args,
+                env,
+            } => Work::Script {
                 item: item.clone(),
                 digest: digest.clone(),
                 args: args
+                    .iter()
+                    .map(|(key, value)| (key.clone(), apply(value)))
+                    .collect(),
+                env: env
                     .iter()
                     .map(|(key, value)| (key.clone(), apply(value)))
                     .collect(),
@@ -1426,7 +1438,9 @@ pub fn execute(step: &Step, root: &Path, stdout_to_stderr: bool) -> anyhow::Resu
             }
             Ok(0)
         }
-        Work::Script { item, args, .. } => Ok(crate::lang2::run_item(root, item, args)),
+        Work::Script {
+            item, args, env, ..
+        } => Ok(crate::lang2::run_item(root, item, args, env)),
         Work::LinksCheck { pattern } => {
             let files = crate::repo::Repo::discover_at(root)?.files()?;
             let mut broken = 0;

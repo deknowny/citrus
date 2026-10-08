@@ -306,12 +306,37 @@ impl Parser {
                 };
                 Ok(self.finish(name, doc, attrs, kind, item_start))
             }
-            "environment" => {
+            "environment" | "profile" | "artifact" => {
                 self.bump();
-                let (name, name_span) = self.ident("an environment name")?;
+                let (name, name_span) = self.ident(&format!("a {keyword} name"))?;
                 self.name_span = name_span;
                 self.expect_sym(";")?;
-                Ok(self.finish(name, doc, attrs, ItemKind::Environment, item_start))
+                let kind = match keyword.as_str() {
+                    "environment" => ItemKind::Environment,
+                    "profile" => ItemKind::Profile,
+                    _ => ItemKind::Artifact,
+                };
+                Ok(self.finish(name, doc, attrs, kind, item_start))
+            }
+            "service" => {
+                self.bump();
+                let (name, name_span) = self.ident("a service name")?;
+                self.name_span = name_span;
+                let (mut start, mut ready) = (None, None);
+                if !self.eat_sym(";") {
+                    self.expect_sym("{")?;
+                    while !self.at_sym("}") && !self.at_eof() {
+                        if self.eat_word("start") {
+                            start = Some(self.block()?);
+                        } else if self.eat_word("ready") {
+                            ready = Some(self.block()?);
+                        } else {
+                            return Err(Error::at(self.span(), format!("expected `start {{ … }}` or `ready {{ … }}`, found {}", self.describe())));
+                        }
+                    }
+                    self.expect_sym("}")?;
+                }
+                Ok(self.finish(name, doc, attrs, ItemKind::Service { start, ready }, item_start))
             }
             "release" => {
                 self.bump();
@@ -344,7 +369,7 @@ impl Parser {
             .help(if other == "let" {
                 "a value shared by items is `const NAME = …;`"
             } else {
-                "items: const, fn, struct, group, check, task, environment, release"
+                "items: const, fn, struct, group, check, task, profile, service, artifact, environment, release"
             })),
         }
     }
