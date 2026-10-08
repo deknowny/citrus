@@ -938,6 +938,16 @@ pub fn compile(
         };
         match attr.name.as_str() {
             "citrus" => {}
+            // Read by every `citrus` before it loads anything (src/pin.rs).
+            "pin" => {
+                let commit = first(&mut compiler)?.as_text();
+                if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(Error::at(
+                        attr.span,
+                        "`#![pin(…)]` takes a full 40-character commit",
+                    ));
+                }
+            }
             "main" => project.base = Some(first(&mut compiler)?.as_text()),
             "logs" => project.logs = Some(first(&mut compiler)?.as_text()),
             "receipts" => project.receipts = Some(first(&mut compiler)?.as_text()),

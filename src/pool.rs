@@ -1424,6 +1424,14 @@ fn fetch_binary(client: &mut Client, commit: &str, platform: &str, to: &Path) ->
     Ok(true)
 }
 
+/// A published build of `commit` for `platform`, written to `to`; false when
+/// there is no pool or it holds none.
+pub fn fetch_published(commit: &str, platform: &str, to: &Path) -> Result<bool> {
+    let Some(url) = url() else { return Ok(false) };
+    let mut client = connect(&url)?;
+    fetch_binary(&mut client, commit, platform, to)
+}
+
 /// Publish a Citrus build to the pool under the commit it reports
 /// (`citrus --version`) and `platform` (default: this machine's).
 pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, String, String)> {
@@ -1451,7 +1459,13 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
         .unwrap_or_else(|| format!("{}-{}", os_label(), arch()));
     let data = std::fs::read(file)?;
     let sha = hex::encode(Sha256::digest(&data));
-    let url = url().context("no pool: set CITRUS_POOL or ~/.config/citrus/pool")?;
+    let url = url()
+        .or_else(|| {
+            std::env::var("CITRUS_AGENT_POOL")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .context("no pool: set CITRUS_POOL or ~/.config/citrus/pool")?;
     let mut client = connect(&url)?;
     client.execute(
         "insert into citrus.binaries (commit_sha, platform, sha256, data) values ($1, $2, $3, $4)
@@ -1565,6 +1579,9 @@ fn execute(
         ("CITRUS_PROTOCOL".into(), "1".into()),
         ("CITRUS_AGENT".into(), format!("pool:{}", machine.name)),
         ("CITRUS_POOL".into(), String::new()),
+        // Only `citrus pool publish` reads it: a check that builds Citrus
+        // publishes that build; nested runs stay off the pool.
+        ("CITRUS_AGENT_POOL".into(), url().unwrap_or_default()),
         ("CITRUS_POOL_SHARE".into(), machine.share.to_string()),
         // Names per-run resources (Compose projects, ports) on a shared machine.
         ("CITRUS_POOL_RUN".into(), batch.to_owned()),

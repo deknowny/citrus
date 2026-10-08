@@ -18,6 +18,7 @@ mod lang;
 mod manifest;
 mod model;
 mod observe;
+mod pin;
 mod plan;
 mod pool;
 mod release;
@@ -281,6 +282,12 @@ enum Command {
         #[command(subcommand)]
         action: Option<PoolAction>,
     },
+    /// The Citrus build this repository runs (`#![pin(…)]`)
+    #[command(name = "self")]
+    Myself {
+        #[command(subcommand)]
+        action: SelfAction,
+    },
     #[command(hide = true)]
     Worker { run: String },
     /// Runs one check's steps (a JSON file) for a parallel worker.
@@ -382,6 +389,14 @@ enum ReleaseAction {
         #[arg(long, default_value_t = 10)]
         limit: i64,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SelfAction {
+    /// Pin this repository to a Citrus commit; every `citrus` here runs it
+    Pin { commit: String },
+    /// The pinned commit and this build
+    Version,
 }
 
 #[derive(Subcommand, Debug)]
@@ -493,6 +508,10 @@ fn pool_command(action: Option<&PoolAction>, json: bool) -> Result<i32> {
 }
 
 fn main() {
+    if let Err(error) = pin::handover() {
+        eprintln!("citrus: {error:#}");
+        std::process::exit(2);
+    }
     let cli = Cli::parse();
     let json = cli.json || (!cli.text && !std::io::stdout().is_terminal());
     match execute(cli.command, json, cli.profile) {
@@ -565,6 +584,13 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             });
         }
         Some(Command::Pool { action }) => return pool_command(action.as_ref(), json),
+        Some(Command::Myself { action }) => {
+            match action {
+                SelfAction::Pin { commit } => println!("{}", pin::pin(commit)?),
+                SelfAction::Version => println!("citrus {}", pool::VERSION),
+            }
+            return Ok(0);
+        }
         _ => {}
     }
     let command = dashed(command);
@@ -887,7 +913,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             Ok(if failed { 1 } else { 0 })
         }
         Command::ExecSteps { .. } => unreachable!("handled before the configuration loads"),
-        Command::Agent { .. } | Command::Pool { .. } => {
+        Command::Agent { .. } | Command::Pool { .. } | Command::Myself { .. } => {
             unreachable!("handled before the configuration")
         }
         Command::Worker { run } => {

@@ -588,6 +588,7 @@ const CONFIG: &[&str] = &[
     "command",
     "citrus",
     "tool",
+    "pin",
 ];
 
 /// `#[when(…)]` and `#![label(…)]` hold plan conditions, compiled separately.

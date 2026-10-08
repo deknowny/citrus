@@ -1,5 +1,6 @@
 #![citrus(2)]
 #![toolchain("Cargo.lock")]
+#![image(dockerfile = "ci/pool.Dockerfile", context = "ci")]
 
 // Citrus checks itself with Citrus: `citrus run` picks what a change needs.
 
@@ -30,6 +31,16 @@ check docs {
 #[reads(RUST)]
 check doctor {
     run!("cargo run --quiet -- doctor --text")?;
+}
+
+/// The build agents and launchers take: published to the pool under its
+/// commit (`citrus pool publish` refuses a build of a changed tree). On a
+/// pool agent that is the Linux build; run locally, this machine's.
+#[paths(RUST)]
+check build {
+    run!("cargo build --quiet --locked --profile fast")?;
+    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or("target");
+    run!("{target}/fast/citrus pool publish {target}/fast/citrus")?;
 }
 
 /// Format the code.
