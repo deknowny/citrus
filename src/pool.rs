@@ -616,6 +616,9 @@ pub struct AgentOptions {
     pub native: bool,
     /// Exit after this many seconds without work (tests, one-off helpers).
     pub idle_exit: Option<u64>,
+    /// Take no new checks while another process holds a lock on one of
+    /// these files (a release build owning this machine).
+    pub pause_while_locked: Vec<PathBuf>,
 }
 
 struct Machine {
@@ -789,6 +792,19 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
     );
     // The heartbeat keeps the agent in the pool and reads whether to drain.
     let stop = Arc::new(AtomicBool::new(false));
+    // Checks a previous process of this agent claimed died with it.
+    let orphans = client.execute(
+        "update citrus.jobs set state = 'queued', agent = null, claimed = null
+         where agent = $1 and state = 'claimed'",
+        &[&machine.name],
+    )?;
+    if orphans > 0 {
+        eprintln!(
+            "citrus agent {}: {orphans} checks of a previous run of this agent back in the queue",
+            machine.name
+        );
+        notify(&mut client, "citrus_jobs", "")?;
+    }
     // A drained agent stays drained across restarts.
     let state: String = client
         .query_one(
@@ -843,6 +859,7 @@ fn serve(
     client.batch_execute("listen citrus_jobs")?;
     let mut idle_since = Instant::now();
     let mut maintained = Instant::now() - Duration::from_secs(3600);
+    let mut paused = false;
     loop {
         if maintained.elapsed() >= Duration::from_secs(60) {
             maintained = Instant::now();
@@ -857,6 +874,19 @@ fn serve(
             eprintln!("citrus agent {}: stopped", machine.name);
             return Ok(0);
         }
+        if let Some(path) = options.pause_while_locked.iter().find(|path| held(path)) {
+            if !paused {
+                eprintln!(
+                    "citrus agent {}: paused while {} is held",
+                    machine.name,
+                    path.display()
+                );
+                paused = true;
+            }
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+        paused = false;
         let claimed = claim(client, machine)?;
         if let Some((run, checks)) = claimed {
             running.store(checks.len(), Ordering::SeqCst);
@@ -913,6 +943,21 @@ fn serve(
             .next()?;
         while client.notifications().iter().next()?.is_some() {}
     }
+}
+
+/// Whether another process holds a `flock` on `path` (a missing file is free).
+fn held(path: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // SAFETY: flock on a descriptor this function owns.
+    let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if free {
+        // SAFETY: as above; releases the probe lock at once.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    }
+    !free
 }
 
 #[derive(Debug, Clone)]
@@ -1632,6 +1677,22 @@ mod tests {
     fn machine_files_are_found_by_the_repository_name() {
         assert!(machine_files("https://github.com/o/garvis-app.git").ends_with("garvis-app"));
         assert!(machine_files("git@github.com:o/garvis-app").ends_with("garvis-app"));
+    }
+
+    #[test]
+    fn a_held_lock_is_seen_and_a_free_one_is_not() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("release.lock");
+        assert!(!held(&path), "a missing file is free");
+        let holder = std::fs::File::create(&path).unwrap();
+        assert!(!held(&path));
+        // SAFETY: flock on a descriptor the test owns.
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) };
+        assert!(held(&path));
+        // SAFETY: as above.
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) };
+        assert!(!held(&path));
     }
 
     #[test]
