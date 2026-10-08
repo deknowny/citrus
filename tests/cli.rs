@@ -3829,3 +3829,25 @@ group slow {
         "overlapped: {one:?} {two:?}"
     );
 }
+
+#[test]
+fn a_run_streams_its_protocol_for_an_outer_citrus() {
+    let project = Project::new("");
+    let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        .args(["run", "ok", "--local", "--text"])
+        .current_dir(project.root())
+        .env("CITRUS_PROTOCOL", "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("CITRUS_TARGET target=ok status=START"),
+        "{text}"
+    );
+    assert!(text.contains("fine"), "{text}");
+    assert!(
+        text.contains("CITRUS_TARGET target=ok status=PASS"),
+        "{text}"
+    );
+}

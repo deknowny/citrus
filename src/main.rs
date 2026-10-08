@@ -717,8 +717,41 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
 fn wait_for(context: &Context, id: &str, json: bool) -> Result<Run> {
     let mut seen: Vec<(String, String)> = Vec::new();
     let mut shown_note = String::new();
+    // CITRUS_PROTOCOL=1: the run log on stdout as it grows, so a Citrus that
+    // runs this one as its runner sees CITRUS_TARGET lines and output live.
+    let protocol = std::env::var("CITRUS_PROTOCOL").is_ok_and(|value| value == "1");
+    let mut offset: u64 = 0;
+    let mut stream = |run: &Run, finished: bool| {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let Ok(mut file) = std::fs::File::open(&run.log) else {
+            return;
+        };
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return;
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            return;
+        }
+        // Whole lines only, unless the run is over.
+        let end = if finished {
+            bytes.len()
+        } else {
+            bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1)
+        };
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(&bytes[..end]);
+        let _ = out.flush();
+        offset += end as u64;
+    };
     loop {
         let run = context.reconcile(context.store.run(id)?.context("unknown run")?)?;
+        if protocol {
+            stream(&run, run.finished());
+        }
         for target in context.store.targets(id)? {
             let key = (target.target.clone(), target.result.clone());
             if !seen.contains(&key) && target.result != "pending" {
