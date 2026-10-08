@@ -582,6 +582,8 @@ const CONFIG: &[&str] = &[
     "free_version",
     "after_merge",
     "runner",
+    "image",
+    "private",
     "command",
     "citrus",
     "tool",

@@ -77,6 +77,10 @@ pub struct RunConfig {
     /// Markers followed by the path of a fuller log the remote runner keeps;
     /// Citrus reads target results and errors from that file too.
     pub linked_log_markers: Vec<String>,
+    /// The image pool agents run the checks in (`#![image]`).
+    pub image: Option<crate::model::Image>,
+    /// Paths a pool snapshot never carries (`#![private]`).
+    pub private: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +135,8 @@ impl Default for RunConfig {
             acquired_prefixes: vec!["CITRUS_RUNNING".into()],
             stage_prefix: "CITRUS_STAGE ".into(),
             linked_log_markers: vec!["CITRUS_LOG ".into()],
+            image: None,
+            private: Vec::new(),
         }
     }
 }
