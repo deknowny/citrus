@@ -1670,6 +1670,9 @@ fn execute(
         command
             .arg("-v")
             .arg(format!("{}:/usr/local/bin/citrus-pool:ro", exe.display()))
+            // Checks call `citrus` like anywhere else.
+            .arg("-v")
+            .arg(format!("{}:/usr/local/bin/citrus:ro", exe.display()))
             .args(["-v", "/var/run/docker.sock:/var/run/docker.sock"])
             .arg("-w")
             .arg(&tree);
@@ -1701,6 +1704,13 @@ fn execute(
         command.args(&argv[1..]).current_dir(&tree);
         for (key, value) in &env {
             command.env(key, value);
+        }
+        // Checks call `citrus` like anywhere else: this run's build first.
+        if let Some(dir) = exe.parent() {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![dir.to_path_buf()];
+            paths.extend(std::env::split_paths(&path));
+            command.env("PATH", std::env::join_paths(paths)?);
         }
         command.env_remove("CITRUS_POOL");
     }
