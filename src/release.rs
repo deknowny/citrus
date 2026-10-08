@@ -42,7 +42,8 @@ fn proven() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Version {
-    /// Version to start from when Citrus has no passed release of this unit yet.
+    /// Version to start from, and the floor of every later one: raising it
+    /// starts a new line.
     pub initial: String,
     /// What the version is for (the images it names); default: the unit's name.
     #[serde(default)]
@@ -155,6 +156,59 @@ pub fn bump(version: &str) -> Option<String> {
     Some(format!("{}.{}.{}{suffix}", parts[0], parts[1], parts[2]))
 }
 
+/// The version a release of a unit starts reserving from: the one after
+/// `previous`, but never below `initial`, which also opens a new line
+/// (`initial = "1.0.0"` moves a unit off an older numbering for good).
+pub fn next_version(previous: &str, initial: &str) -> Option<String> {
+    if previous.is_empty() {
+        return Some(initial.to_owned());
+    }
+    let next = bump(previous)?;
+    Some(match (core(&next), core(initial)) {
+        (Some(next_core), Some(floor)) if next_core < floor => initial.to_owned(),
+        _ => next,
+    })
+}
+
+/// `1.2.3-suffix` → `[1, 2, 3]`.
+fn core(version: &str) -> Option<Vec<u64>> {
+    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    core.split('.').map(|part| part.parse().ok()).collect()
+}
+
+/// A passed release is tagged `<unit>/v<version>` on its commit, and the tag
+/// is pushed; a missing remote or a failed push leaves the local tag.
+fn tag_release(context: &Context, release: &Release, version: &str) {
+    let tag = format!("{}/v{version}", release.unit);
+    let existing = context
+        .repo
+        .git(&["rev-parse", "--verify", "-q", &format!("{tag}^{{commit}}")])
+        .unwrap_or_default();
+    if existing.is_empty() {
+        let message = format!("{} {version}", release.unit);
+        if let Err(error) = context
+            .repo
+            .git(&["tag", "-a", &tag, &release.commit, "-m", &message])
+        {
+            println!("warning: could not tag {tag}: {error:#}");
+            return;
+        }
+    } else if existing != release.commit {
+        println!(
+            "warning: tag {tag} already names {existing}, not {}",
+            release.commit
+        );
+        return;
+    }
+    match context
+        .repo
+        .git(&["push", "-q", "origin", &format!("refs/tags/{tag}")])
+    {
+        Ok(_) => println!("tagged {tag}"),
+        Err(error) => println!("tagged {tag} locally; push failed: {error:#}"),
+    }
+}
+
 #[derive(Debug)]
 pub struct Start {
     pub unit: String,
@@ -180,8 +234,7 @@ pub fn dry_run(
     let previous = previous_version(context, unit_name, unit)?;
     let next = match (given, &unit.version) {
         (Some(version), _) => version.to_owned(),
-        (None, Some(spec)) if previous.is_empty() => spec.initial.clone(),
-        (None, Some(_)) => bump(&previous).unwrap_or_default(),
+        (None, Some(spec)) => next_version(&previous, &spec.initial).unwrap_or_default(),
         (None, None) => String::new(),
     };
     let plan = crate::plan::compute(repo, &context.manifest, None)?;
@@ -546,12 +599,8 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
                 .version
                 .as_ref()
                 .context("version step without `version`")?;
-            let start = if release.previous.is_empty() {
-                spec.initial.clone()
-            } else {
-                bump(&release.previous)
-                    .with_context(|| format!("cannot bump version {}", release.previous))?
-            };
+            let start = next_version(&release.previous, &spec.initial)
+                .with_context(|| format!("cannot bump version {}", release.previous))?;
             let free_version = context
                 .project
                 .as_ref()
@@ -624,6 +673,9 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
     }
     context.store.finish_release(id, "passed", "")?;
     context.store.unlock_environment(&release.environment, id)?;
+    if release.kind == "release" && !version.is_empty() {
+        tag_release(context, &release, &version);
+    }
     Ok(())
 }
 
@@ -634,6 +686,22 @@ pub fn steps_of(context: &Context, id: &str) -> Result<Vec<ReleaseStep>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_is_the_floor_of_the_next_version() {
+        assert_eq!(next_version("", "1.0.0").as_deref(), Some("1.0.0"));
+        assert_eq!(next_version("0.49.302", "1.0.0").as_deref(), Some("1.0.0"));
+        assert_eq!(
+            next_version("0.49.258-clyer", "1.0.0").as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(next_version("1.0.0", "1.0.0").as_deref(), Some("1.0.1"));
+        assert_eq!(next_version("1.2.9", "1.0.0").as_deref(), Some("1.2.10"));
+        assert_eq!(
+            next_version("0.49.258-clyer", "0.49.265-clyer").as_deref(),
+            Some("0.49.265-clyer")
+        );
+    }
 
     #[test]
     fn bumps_patch_and_keeps_suffix() {
