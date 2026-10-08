@@ -7,4 +7,5 @@ reused), `citrus wait last` after a lost session instead of re-running,
 `citrus log last` for the first error instead of reading raw logs,
 a `check` in the Citrus configuration for a new check instead of a wrapper script,
 `citrus integrate --push` to bring in the base branch and publish,
-`citrus tasks` / `citrus note` instead of asking other agents about their work.
+`citrus tasks`, `citrus task <title> [--blocked … --needs …]` and `citrus agree`
+instead of asking other agents about their work.

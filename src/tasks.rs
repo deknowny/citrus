@@ -1,5 +1,5 @@
-//! Every worktree of the clone as a task: where it is, what it runs, what its
-//! owner wants others to know.
+//! Every worktree of the clone as a task: where it is, what it runs, what it
+//! is doing and what blocks it (`citrus task`).
 
 use std::path::Path;
 
@@ -20,8 +20,9 @@ pub struct Task {
     pub behind: Option<u64>,
     /// Seconds since the last commit.
     pub idle: Option<i64>,
-    pub note: Option<String>,
-    pub note_agent: Option<String>,
+    /// What it is doing and what blocks it, when its owner said so.
+    #[serde(flatten)]
+    pub info: Option<crate::state::TaskInfo>,
     pub last_run: Option<String>,
     pub last_run_state: Option<String>,
     pub running: bool,
@@ -32,7 +33,7 @@ pub struct Task {
 pub fn list(context: &Context, base: &str) -> Result<Vec<Task>> {
     let repo = &context.repo;
     let listing = repo.git(&["worktree", "list", "--porcelain"])?;
-    let notes = context.store.task_notes()?;
+    let infos = context.store.task_infos()?;
     let runs = context.store.latest_runs()?;
     let here = context.worktree();
     let base_commit = repo
@@ -76,7 +77,7 @@ pub fn list(context: &Context, base: &str) -> Result<Vec<Task>> {
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
             .map(|time| now() as i64 - time);
-        let note = notes.iter().find(|(worktree, ..)| *worktree == path);
+        let info = infos.iter().find(|info| info.worktree == path).cloned();
         let run = runs.iter().find(|run| run.worktree == path);
         tasks.push(Task {
             name: Path::new(&path)
@@ -89,8 +90,7 @@ pub fn list(context: &Context, base: &str) -> Result<Vec<Task>> {
             ahead,
             behind,
             idle,
-            note: note.map(|(_, text, ..)| text.clone()),
-            note_agent: note.map(|(_, _, agent, _)| agent.clone()),
+            info,
             last_run: run.map(|run| run.id.clone()),
             last_run_state: run.map(|run| run.state.clone()),
             running: run.is_some_and(|run| !run.finished()),
@@ -102,7 +102,7 @@ pub fn list(context: &Context, base: &str) -> Result<Vec<Task>> {
         (
             !task.current,
             !task.running,
-            task.note.is_none(),
+            task.info.is_none(),
             task.ahead.unwrap_or(0) == 0,
             task.idle.unwrap_or(i64::MAX),
         )
@@ -114,6 +114,6 @@ pub fn list(context: &Context, base: &str) -> Result<Vec<Task>> {
 pub fn active(task: &Task) -> bool {
     task.current
         || task.running
-        || task.note.is_some()
+        || task.info.is_some()
         || (task.ahead.unwrap_or(0) > 0 && task.idle.unwrap_or(i64::MAX) < 3 * 86400)
 }

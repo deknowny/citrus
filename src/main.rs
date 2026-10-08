@@ -136,12 +136,44 @@ enum Command {
         #[arg(long)]
         base: Option<String>,
     },
-    /// Tell others what this worktree is doing or waiting for (shown in status and tasks).
-    Note {
-        #[arg(value_name = "TEXT")]
-        message: Vec<String>,
+    /// Say what this worktree's task is doing and what blocks it (shown in status and tasks).
+    Task {
+        /// What it is doing, in a line.
+        #[arg(value_name = "TITLE")]
+        title: Vec<String>,
+        /// What it may change: products, files, systems.
+        #[arg(long)]
+        scope: Option<String>,
+        /// The action it cannot take yet (with --needs).
+        #[arg(long)]
+        blocked: Option<String>,
+        /// The decision or data that action needs, and from whom.
+        #[arg(long)]
+        needs: Option<String>,
+        /// Where the proof lives: logs, runs, links.
+        #[arg(long)]
+        evidence: Option<String>,
+        #[arg(long)]
+        clear_blocker: bool,
+        /// Forget the task's description.
         #[arg(long)]
         clear: bool,
+    },
+    /// Record a decision between tasks: who does what, when it is reopened.
+    Agree {
+        /// A short lowercase slug naming it.
+        key: String,
+        #[arg(long)]
+        terms: String,
+        /// What makes it open again.
+        #[arg(long)]
+        reopen: String,
+        /// Where the decision was made.
+        #[arg(long)]
+        evidence: String,
+        /// The revision read before changing it (0 for a new one).
+        #[arg(long, default_value_t = 0)]
+        revision: i64,
     },
     /// Declared checks with their inputs and last result.
     Targets,
@@ -350,27 +382,64 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             integrate_command(&mut context, base, push, !no_run, json)
         }
         Command::Tasks { all, base } => tasks_command(&context, all, base, json),
-        Command::Note { message, clear } => {
-            let text = if clear {
-                String::new()
-            } else {
-                message.join(" ")
+        Command::Task {
+            title,
+            scope,
+            blocked,
+            needs,
+            evidence,
+            clear_blocker,
+            clear,
+        } => {
+            let change = state::TaskChange {
+                title: (!title.is_empty()).then(|| title.join(" ")),
+                scope,
+                blocked,
+                needs,
+                evidence,
+                clear_blocker,
+                clear,
             };
-            if text.is_empty() && !clear {
-                anyhow::bail!("write the note, or --clear");
-            }
-            context
+            let info = context
                 .store
-                .set_task_note(&context.worktree(), &text, &exec::agent())?;
+                .update_task(&context.worktree(), &change, &exec::agent())?;
             if json {
                 println!(
                     "{}",
-                    json!({"schema": SCHEMA, "worktree": context.worktree(), "note": text})
+                    serde_json::to_string_pretty(&json!({"schema": SCHEMA, "task": info}))?
                 );
-            } else if text.is_empty() {
-                println!("note cleared");
+            } else if clear {
+                println!("task description cleared");
             } else {
-                println!("note set; others see it in citrus status and citrus tasks");
+                println!("{}", describe_task(&info));
+            }
+            Ok(0)
+        }
+        Command::Agree {
+            key,
+            terms,
+            reopen,
+            evidence,
+            revision,
+        } => {
+            let agreement = context.store.agree(
+                &key,
+                [&terms, &reopen, &evidence],
+                revision,
+                &exec::agent(),
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "agreement": agreement})
+                    )?
+                );
+            } else {
+                println!(
+                    "agreement {} · revision {}",
+                    agreement.key, agreement.revision
+                );
             }
             Ok(0)
         }
@@ -689,13 +758,12 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
         .filter(|decision| decision.result != "reused")
         .count();
     let shared = resources::observe(context)?;
-    let notes: Vec<(String, String, String, i64)> = context
+    // What other tasks said in the last day: their work and blockers.
+    let others: Vec<state::TaskInfo> = context
         .store
-        .task_notes()?
+        .task_infos()?
         .into_iter()
-        .filter(|(worktree, _, _, updated)| {
-            *worktree != context.worktree() && now() as i64 - updated < 86400
-        })
+        .filter(|info| info.worktree != context.worktree() && now() as i64 - info.updated < 86400)
         .take(5)
         .collect();
     let mut warnings = Vec::new();
@@ -725,7 +793,7 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
             "active_runs": active.iter().map(run_brief).collect::<Vec<_>>(),
             "last_run": last.as_ref().map(run_brief),
             "resources": shared,
-            "notes": notes.iter().map(|(worktree, text, agent, updated)| json!({"worktree": worktree, "note": text, "agent": agent, "seconds_ago": now() as i64 - updated})).collect::<Vec<_>>(),
+            "tasks": others,
             "warnings": warnings,
             "next": next,
         });
@@ -795,13 +863,18 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
             );
         }
     }
-    if !notes.is_empty() {
-        println!("notes from other tasks:");
-        for (worktree, text, agent, updated) in &notes {
-            let name = worktree.rsplit('/').next().unwrap_or(worktree);
+    if !others.is_empty() {
+        println!("other tasks:");
+        for info in &others {
+            let name = std::path::Path::new(&info.worktree)
+                .file_name()
+                .map_or(info.worktree.clone(), |name| {
+                    name.to_string_lossy().into_owned()
+                });
             println!(
-                "  {name} · {agent} · {} ago: {text}",
-                age(now() as i64 - updated)
+                "  {name}: {} ({} ago)",
+                describe_task(info),
+                age(now() as i64 - info.updated)
             );
         }
     }
@@ -1220,11 +1293,15 @@ fn overview(context: &mut Context, json: bool) -> Result<i32> {
         ),
         (
             "citrus tasks",
-            "every worktree: branch, unmerged commits, runs, notes",
+            "every worktree: branch, unmerged commits, runs, what it does; agreements",
         ),
         (
-            "citrus note <text>",
-            "tell others what this worktree is doing or waiting for",
+            "citrus task <title> [--blocked … --needs …]",
+            "say what this worktree does and what blocks it",
+        ),
+        (
+            "citrus agree <key> --terms … --reopen … --evidence …",
+            "record who does what between tasks",
         ),
         ("citrus targets", "declared checks and their last result"),
         (
@@ -1495,7 +1572,7 @@ fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool)
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"schema": SCHEMA, "base": base, "total": tasks.len(), "tasks": shown})
+                &json!({"schema": SCHEMA, "base": base, "total": tasks.len(), "tasks": shown, "agreements": context.store.agreements()?})
             )?
         );
         return Ok(0);
@@ -1532,14 +1609,44 @@ fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool)
             "{marker} {:<36} {:<34} {ahead:>9} · {idle}{run}",
             task.name, task.branch
         );
-        if let Some(note) = &task.note {
+        if let Some(info) = &task.info {
+            println!("      {} — {}", describe_task(info), info.agent);
+        }
+    }
+    let agreements = context.store.agreements()?;
+    if !agreements.is_empty() {
+        println!("agreements:");
+        for agreement in &agreements {
             println!(
-                "      “{note}” — {}",
-                task.note_agent.as_deref().unwrap_or("?")
+                "  {} (revision {}, {}): {}",
+                agreement.key, agreement.revision, agreement.owner, agreement.terms
             );
+            println!("      reopen: {}", agreement.reopen);
         }
     }
     Ok(0)
+}
+
+/// A task's description in a line: what it does, what blocks it.
+fn describe_task(info: &state::TaskInfo) -> String {
+    let mut parts = Vec::new();
+    if !info.title.is_empty() {
+        parts.push(format!("“{}”", info.title));
+    }
+    if !info.scope.is_empty() {
+        parts.push(format!("scope: {}", info.scope));
+    }
+    if !info.blocked.is_empty() {
+        parts.push(format!("blocked: {} — needs: {}", info.blocked, info.needs));
+    }
+    if !info.evidence.is_empty() {
+        parts.push(format!("evidence: {}", info.evidence));
+    }
+    if parts.is_empty() {
+        "(no description)".to_owned()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 fn targets_command(context: &Context, json: bool) -> Result<i32> {

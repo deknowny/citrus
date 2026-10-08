@@ -53,6 +53,9 @@ Every element does something, names are bare, data is quoted:
   `CITRUS_RUNNING`, `CITRUS_STAGE`, `CITRUS_LOG`, `CITRUS_RESOURCE`) and get
   `CITRUS_BASE`; their prefix settings are gone (docs/protocol.md).
 - Run logs live in `.git/citrus/logs`, not the work tree.
+- `citrus note` is `citrus task <title> [--scope] [--blocked … --needs …]
+  [--evidence]`: what a worktree does and what blocks it. `citrus agree`
+  records agreements between tasks with revisions; `citrus tasks` lists both.
 - The release placeholder `next` is `version` in the version command.
 
 Breaking: `citrus.ci` is the only configuration. Citrus no longer reads

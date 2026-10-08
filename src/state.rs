@@ -50,10 +50,23 @@ CREATE TABLE IF NOT EXISTS evidence (
     detail TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (target, kind, key)
 );
-CREATE TABLE IF NOT EXISTS task_notes (
+CREATE TABLE IF NOT EXISTS tasks (
     worktree TEXT PRIMARY KEY,
-    text TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    scope TEXT NOT NULL DEFAULT '',
+    blocked TEXT NOT NULL DEFAULT '',
+    needs TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
     agent TEXT NOT NULL,
+    updated INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agreements (
+    key TEXT PRIMARY KEY,
+    terms TEXT NOT NULL,
+    reopen TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    owner TEXT NOT NULL,
     updated INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS releases (
@@ -148,6 +161,43 @@ pub struct RunTarget {
     pub exit: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_error: Option<String>,
+}
+
+/// What a task is doing and what blocks it (`citrus task`).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TaskInfo {
+    pub worktree: String,
+    pub title: String,
+    pub scope: String,
+    pub blocked: String,
+    pub needs: String,
+    pub evidence: String,
+    pub agent: String,
+    pub updated: i64,
+}
+
+/// Fields `citrus task` sets; `None` keeps the stored value.
+#[derive(Debug, Default)]
+pub struct TaskChange {
+    pub title: Option<String>,
+    pub scope: Option<String>,
+    pub blocked: Option<String>,
+    pub needs: Option<String>,
+    pub evidence: Option<String>,
+    pub clear_blocker: bool,
+    pub clear: bool,
+}
+
+/// A decision between tasks: who does what, and when it is reopened.
+#[derive(Debug, Clone, Serialize)]
+pub struct Agreement {
+    pub key: String,
+    pub terms: String,
+    pub reopen: String,
+    pub evidence: String,
+    pub revision: i64,
+    pub owner: String,
+    pub updated: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -466,31 +516,186 @@ impl Store {
         Ok(())
     }
 
-    /// What a worktree's owner wants others to know (intent, blocker); empty clears it.
-    pub fn set_task_note(&self, worktree: &str, text: &str, agent: &str) -> Result<()> {
-        if text.trim().is_empty() {
-            self.conn.execute(
-                "DELETE FROM task_notes WHERE worktree = ?1",
-                params![worktree],
-            )?;
-        } else {
-            self.conn.execute(
-                "INSERT INTO task_notes (worktree, text, agent, updated) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (worktree) DO UPDATE SET text = ?2, agent = ?3, updated = ?4",
-                params![worktree, text.trim(), agent, now() as i64],
-            )?;
+    /// What a worktree's task is doing, and what blocks it. Given fields
+    /// replace the stored ones; `clear` forgets the task's description.
+    pub fn update_task(
+        &self,
+        worktree: &str,
+        change: &TaskChange,
+        agent: &str,
+    ) -> Result<TaskInfo> {
+        let mut info = self
+            .task_infos()?
+            .into_iter()
+            .find(|info| info.worktree == worktree)
+            .unwrap_or(TaskInfo {
+                worktree: worktree.to_owned(),
+                ..TaskInfo::default()
+            });
+        if change.clear {
+            self.conn
+                .execute("DELETE FROM tasks WHERE worktree = ?1", params![worktree])?;
+            return Ok(TaskInfo {
+                worktree: worktree.to_owned(),
+                ..TaskInfo::default()
+            });
         }
-        Ok(())
+        for (field, value) in [
+            (&mut info.title, &change.title),
+            (&mut info.scope, &change.scope),
+            (&mut info.blocked, &change.blocked),
+            (&mut info.needs, &change.needs),
+            (&mut info.evidence, &change.evidence),
+        ] {
+            if let Some(value) = value {
+                anyhow::ensure!(
+                    value.chars().count() <= 1000
+                        && !value
+                            .chars()
+                            .any(|c| c.is_control() && c != '\n' && c != '\t'),
+                    "a task field holds at most 1000 characters of text"
+                );
+                *field = value.trim().to_owned();
+            }
+        }
+        if change.clear_blocker {
+            info.blocked.clear();
+            info.needs.clear();
+        }
+        anyhow::ensure!(
+            info.blocked.is_empty() == info.needs.is_empty(),
+            "a blocker names both the blocked action (--blocked) and what it needs (--needs)"
+        );
+        info.agent = agent.to_owned();
+        info.updated = now() as i64;
+        self.conn.execute(
+            "INSERT INTO tasks (worktree, title, scope, blocked, needs, evidence, agent, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (worktree) DO UPDATE SET title = ?2, scope = ?3, blocked = ?4, needs = ?5,
+                 evidence = ?6, agent = ?7, updated = ?8",
+            params![
+                info.worktree,
+                info.title,
+                info.scope,
+                info.blocked,
+                info.needs,
+                info.evidence,
+                info.agent,
+                info.updated
+            ],
+        )?;
+        Ok(info)
     }
 
-    /// (worktree, text, agent, updated)
-    pub fn task_notes(&self) -> Result<Vec<(String, String, String, i64)>> {
+    /// Every described task, newest first.
+    pub fn task_infos(&self) -> Result<Vec<TaskInfo>> {
         let mut statement = self.conn.prepare(
-            "SELECT worktree, text, agent, updated FROM task_notes ORDER BY updated DESC",
+            "SELECT worktree, title, scope, blocked, needs, evidence, agent, updated FROM tasks ORDER BY updated DESC",
         )?;
         Ok(statement
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok(TaskInfo {
+                    worktree: row.get(0)?,
+                    title: row.get(1)?,
+                    scope: row.get(2)?,
+                    blocked: row.get(3)?,
+                    needs: row.get(4)?,
+                    evidence: row.get(5)?,
+                    agent: row.get(6)?,
+                    updated: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Record or revise an agreement between tasks. `revision` is the one the
+    /// caller read: a concurrent revision is refused, not overwritten; the
+    /// same content again changes nothing.
+    pub fn agree(
+        &self,
+        key: &str,
+        content: [&str; 3],
+        revision: i64,
+        owner: &str,
+    ) -> Result<Agreement> {
+        anyhow::ensure!(
+            !key.is_empty()
+                && key.len() <= 64
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && !key.starts_with('-'),
+            "an agreement key is a short lowercase slug"
+        );
+        let [terms, reopen, evidence] = content;
+        anyhow::ensure!(
+            !terms.trim().is_empty() && !reopen.trim().is_empty() && !evidence.trim().is_empty(),
+            "an agreement keeps its terms, when to reopen it and the evidence of the decision"
+        );
+        let previous = self
+            .agreements()?
+            .into_iter()
+            .find(|agreement| agreement.key == key);
+        if let Some(previous) = &previous
+            && previous.terms == terms.trim()
+            && previous.reopen == reopen.trim()
+            && previous.evidence == evidence.trim()
+        {
+            return Ok(previous.clone());
+        }
+        let current = previous.as_ref().map_or(0, |previous| previous.revision);
+        anyhow::ensure!(
+            revision == current,
+            "agreement {key} is at revision {current}: read it (citrus tasks) and pass --revision {current}"
+        );
+        let agreement = Agreement {
+            key: key.to_owned(),
+            terms: terms.trim().to_owned(),
+            reopen: reopen.trim().to_owned(),
+            evidence: evidence.trim().to_owned(),
+            revision: current + 1,
+            owner: owner.to_owned(),
+            updated: now() as i64,
+        };
+        let changed = self.conn.execute(
+            "INSERT INTO agreements (key, terms, reopen, evidence, revision, owner, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (key) DO UPDATE SET terms = ?2, reopen = ?3, evidence = ?4, revision = ?5,
+                 owner = ?6, updated = ?7
+             WHERE agreements.revision = ?8",
+            params![
+                agreement.key,
+                agreement.terms,
+                agreement.reopen,
+                agreement.evidence,
+                agreement.revision,
+                agreement.owner,
+                agreement.updated,
+                current
+            ],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "agreement {key} changed meanwhile: read it again"
+        );
+        Ok(agreement)
+    }
+
+    pub fn agreements(&self) -> Result<Vec<Agreement>> {
+        let mut statement = self.conn.prepare(
+            "SELECT key, terms, reopen, evidence, revision, owner, updated FROM agreements ORDER BY key",
+        )?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(Agreement {
+                    key: row.get(0)?,
+                    terms: row.get(1)?,
+                    reopen: row.get(2)?,
+                    evidence: row.get(3)?,
+                    revision: row.get(4)?,
+                    owner: row.get(5)?,
+                    updated: row.get(6)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }

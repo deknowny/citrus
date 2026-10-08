@@ -35,8 +35,12 @@ commands in `next`.
    `citrus check`; `citrus do <task>` runs a task.
 7. **Bring in the base branch** — `citrus integrate` (merge, keep what is still
    proven, re-check the rest); `citrus integrate --push` to publish when green.
-8. **Other tasks** — `citrus tasks` shows every worktree; `citrus note <text>`
-   tells the others what you are doing or waiting for (instead of a message).
+8. **Other tasks** — `citrus tasks` shows every worktree and the agreements
+   between tasks. `citrus task "<title>" --scope …` says what you are doing;
+   `--blocked "<action>" --needs "<decision or data, from whom>"` what you wait
+   for (`--clear-blocker` when it is resolved). `citrus agree <key> --terms …
+   --reopen … --evidence …` records who does what (`--revision N` to change
+   one you read). Instead of messages.
 9. **Release** — `citrus release` lists units; `citrus release start <unit>
    --dry-run` shows the exact commands; `citrus release start <unit> --approve`
    runs them. After a failure or a lost session: `citrus release resume <id>

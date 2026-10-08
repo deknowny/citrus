@@ -659,7 +659,7 @@ fn integrate_reports_conflicts_and_needs_a_clean_tree() {
 }
 
 #[test]
-fn tasks_and_notes_show_other_worktrees() {
+fn tasks_say_what_other_worktrees_do_and_need() {
     let project = Project::new("");
     let other = project.root().with_extension("second");
     project.git(&[
@@ -670,27 +670,105 @@ fn tasks_and_notes_show_other_worktrees() {
         "second",
         other.to_str().unwrap(),
     ]);
-    let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
-        .args(["note", "waiting for the schema change", "--json"])
-        .current_dir(&other)
-        .env("CITRUS_AGENT", "agent-b")
-        .env_remove("CLAUDECODE")
-        .env_remove("CODEX_THREAD_ID")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let (tasks, _) = project.json(&["tasks", "--all", "--base", "main"]);
-    let list = tasks["tasks"].as_array().unwrap();
-    assert_eq!(list.len(), 2, "{tasks}");
-    let second = list.iter().find(|task| task["branch"] == "second").unwrap();
-    assert_eq!(second["note"], "waiting for the schema change");
-    assert_eq!(second["note_agent"], "agent-b");
-    let (status, _) = project.json(&["status"]);
-    assert_eq!(
-        status["notes"][0]["note"], "waiting for the schema change",
-        "{status}"
+    let citrus = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_citrus"))
+            .args(args)
+            .arg("--json")
+            .current_dir(&other)
+            .env("CITRUS_AGENT", "agent-b")
+            .env_remove("CLAUDECODE")
+            .env_remove("CODEX_THREAD_ID")
+            .output()
+            .unwrap()
+    };
+    assert!(
+        citrus(&["task", "Schema change", "--scope", "migrations"])
+            .status
+            .success()
     );
-    project.json(&["note", "--clear"]);
+    // A blocker names both the blocked action and what it needs.
+    assert!(!citrus(&["task", "--blocked", "deploy"]).status.success());
+    assert!(
+        citrus(&["task", "--blocked", "deploy", "--needs", "owner approval"])
+            .status
+            .success()
+    );
+    let (tasks, _) = project.json(&["tasks", "--all", "--base", "main"]);
+    let second = tasks["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["branch"] == "second")
+        .unwrap()
+        .clone();
+    assert_eq!(second["title"], "Schema change", "{tasks}");
+    assert_eq!(second["scope"], "migrations");
+    assert_eq!(second["needs"], "owner approval");
+    assert_eq!(second["agent"], "agent-b");
+    let (status, _) = project.json(&["status"]);
+    assert_eq!(status["tasks"][0]["blocked"], "deploy", "{status}");
+    assert!(citrus(&["task", "--clear-blocker"]).status.success());
+    let (status, _) = project.json(&["status"]);
+    assert_eq!(status["tasks"][0]["blocked"], "", "{status}");
+    assert_eq!(status["tasks"][0]["title"], "Schema change");
+}
+
+#[test]
+fn agreements_keep_revisions_and_refuse_stale_updates() {
+    let project = Project::new("");
+    let agree = |revision: &str, terms: &str| {
+        project.json(&[
+            "agree",
+            "release-owner",
+            "--terms",
+            terms,
+            "--reopen",
+            "the owner changes",
+            "--evidence",
+            "thread 42",
+            "--revision",
+            revision,
+        ])
+    };
+    let (first, code) = agree("0", "Task A releases the backend");
+    assert_eq!(code, 0, "{first}");
+    assert_eq!(first["agreement"]["revision"], 1);
+    // The same content again changes nothing.
+    assert_eq!(
+        agree("0", "Task A releases the backend").0["agreement"]["revision"],
+        1
+    );
+    // A change must name the revision it read.
+    let (stale, code) = agree("0", "Task B releases the backend");
+    assert_ne!(code, 0);
+    assert!(
+        stale["error"].as_str().unwrap().contains("--revision 1"),
+        "{stale}"
+    );
+    assert_eq!(
+        agree("1", "Task B releases the backend").0["agreement"]["revision"],
+        2
+    );
+    let (tasks, _) = project.json(&["tasks"]);
+    assert_eq!(
+        tasks["agreements"][0]["terms"], "Task B releases the backend",
+        "{tasks}"
+    );
+    assert!(
+        project
+            .json(&[
+                "agree",
+                "Bad Key",
+                "--terms",
+                "t",
+                "--reopen",
+                "r",
+                "--evidence",
+                "e"
+            ])
+            .0["error"]
+            .is_string()
+    );
 }
 
 #[test]
