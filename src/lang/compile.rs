@@ -51,6 +51,8 @@ struct Compiler<'a> {
     files: tools::RepoFiles<'a>,
     /// What every body depends on besides itself: functions, constants, structs.
     shared: String,
+    /// Programs declared with `#![tool]`: a wrapper and the command line it is.
+    tools: Vec<(String, Vec<String>)>,
 }
 
 impl<'a> Compiler<'a> {
@@ -420,7 +422,7 @@ fn understood(compiler: &Compiler, body: &Block) -> Compiled<(Vec<String>, Vec<S
             }
             continue;
         };
-        match tools::understand(words, *span, &compiler.files)? {
+        match tools::understand(words, *span, &compiler.files, &compiler.tools)? {
             Some(found) => {
                 for glob in found.inputs {
                     if !inputs.contains(&glob) {
@@ -861,6 +863,7 @@ pub fn compile(
         interp,
         files: tools::RepoFiles::new(root, revision),
         shared,
+        tools: Vec::new(),
     };
     let mut project = Project::default();
     let mut default_cache = true;
@@ -892,6 +895,24 @@ pub fn compile(
                     "free_version" => project.free_version = argv,
                     _ => project.after_merge = argv,
                 }
+            }
+            "tool" => {
+                let [(None, program), (None, command)] = attr.args.as_slice() else {
+                    return Err(Error::at(
+                        attr.span,
+                        "`#![tool(\"path/to/wrapper\", cmd!(\"cargo test\"))]`",
+                    ));
+                };
+                let program = compiler.value(program)?.as_text();
+                let program = program.trim_start_matches("./").to_owned();
+                if !crate::lang::cargo::Files::list(&compiler.files).contains(&program) {
+                    return Err(Error::at(
+                        attr.span,
+                        format!("no file {program} in the repository"),
+                    ));
+                }
+                let argv = compiler.argv(command)?;
+                compiler.tools.push((program, argv));
             }
             "runner" => {
                 let mut pool = Pool::default();
@@ -931,7 +952,7 @@ pub fn compile(
             }
             other => {
                 return Err(Error::at(attr.span, format!("unknown project attribute `#![{other}]`")).help(
-                    "project attributes: citrus, main, toolchain, logs, receipts, cache, signals, free_version, after_merge, runner, command, label",
+                    "project attributes: citrus, main, toolchain, logs, receipts, cache, signals, free_version, after_merge, runner, tool, command, label",
                 ));
             }
         }

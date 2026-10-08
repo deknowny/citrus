@@ -117,12 +117,7 @@ fn edited_checks(repo: &Repo, manifest: &Manifest, before: &str) -> Vec<String> 
 
 /// The checks that changes to exactly `paths` would select; `before` is the
 /// revision those changes start from (for manifest edits).
-pub fn for_paths(
-    repo: &Repo,
-    manifest: &Manifest,
-    paths: &[String],
-    before: &str,
-) -> Result<Plan> {
+pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
     let mut plan = for_paths_all(repo, manifest, paths, before)?;
     narrow(&mut plan, repo, manifest);
     Ok(plan)

@@ -89,8 +89,31 @@ pub fn understand(
     words: &[CmdWord],
     span: Span,
     files: &dyn Files,
+    tools: &[(String, Vec<String>)],
 ) -> Result<Option<Understood>, Error> {
     let literal: Vec<Option<String>> = words.iter().map(CmdWord::literal).collect();
+    // A declared wrapper is the command line it stands for, plus its own file.
+    let program = literal
+        .first()
+        .and_then(|word| word.as_deref())
+        .map(|word| word.trim_start_matches("./").to_owned());
+    if let Some((wrapper, argv)) = program
+        .as_ref()
+        .and_then(|program| tools.iter().find(|(wrapper, _)| wrapper == program))
+    {
+        let mut expanded: Vec<Option<String>> = argv.iter().cloned().map(Some).collect();
+        expanded.extend(literal[1..].iter().cloned());
+        return Ok(match expanded.first() {
+            Some(Some(program)) if program == "cargo" => {
+                cargo(&expanded[1..], span, files)?.map(|mut found| {
+                    found.summary = format!("{wrapper} = {}", found.summary);
+                    found.inputs.push(wrapper.clone());
+                    found
+                })
+            }
+            _ => None,
+        });
+    }
     match literal.first() {
         Some(Some(program)) if program == "cargo" => cargo(&literal[1..], span, files),
         _ => Ok(None),

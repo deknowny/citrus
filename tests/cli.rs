@@ -3346,6 +3346,46 @@ check api {
         "cargo test -p api"
     );
 
+    // A wrapper declared as a Cargo command line is understood like it.
+    project.write(
+        "scripts/cargo-test.sh",
+        "#!/bin/sh\nexec cargo test \"$@\"\n",
+    );
+    project.write(
+        "citrus.ci",
+        r#"#![citrus(2)]
+#![tool("scripts/cargo-test.sh", cmd!("cargo test"))]
+
+check api {
+    run!("SQLX_OFFLINE=true ./scripts/cargo-test.sh -p api --lib")?;
+}
+"#,
+    );
+    project.git(&["add", "-A"]);
+    let (targets, code) = project.json(&["targets"]);
+    assert_eq!(code, 0, "{targets}");
+    let inputs = targets["targets"][0]["inputs"].to_string();
+    assert!(
+        inputs.contains("crates/api/**")
+            && inputs.contains("crates/core/**")
+            && inputs.contains("scripts/cargo-test.sh"),
+        "{inputs}"
+    );
+    assert_eq!(
+        targets["targets"][0]["meta"]["understood"][0],
+        "scripts/cargo-test.sh = cargo test -p api"
+    );
+    project.write(
+        "citrus.ci",
+        "#![citrus(2)]\n#![tool(\"scripts/missing.sh\", cmd!(\"cargo test\"))]\n",
+    );
+    let output = project.citrus(&["check", "--text"]);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no file scripts/missing.sh"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     for (command, expected) in [
         ("cargo test -p apy", "did you mean `api`"),
         ("cargo tset", "did you mean `cargo test`"),
@@ -3479,4 +3519,58 @@ fn a_misspelled_check_fails() -> Result<()> {
     );
     let output = project.citrus(&["test", "nothing-like-this"]);
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn deps_finds_files_the_compiler_read_outside_the_inputs() {
+    let project = Project::v2(
+        r#"#![citrus(2)]
+
+check api {
+    run!("cargo check -p api")?;
+}
+"#,
+    );
+    project.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+    );
+    project.write(
+        "crates/api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    // A path Citrus cannot read when the file loads: only the compiler knows it.
+    project.write(
+        "crates/api/src/lib.rs",
+        "pub const MESSAGE: &str = include_str!(concat!(\"../../../shared/\", \"msg.txt\"));\n",
+    );
+    project.write("shared/msg.txt", "hello\n");
+    project.git(&["add", "-A"]);
+    let target = project.root().join("target");
+    let built = Command::new("cargo")
+        .args(["check", "-q", "-p", "api"])
+        .current_dir(project.root())
+        .env("CARGO_TARGET_DIR", &target)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let output = project.citrus(&["deps", "--text"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("✗ api reads shared/msg.txt (crate crates/api/src/lib.rs)"),
+        "{text}"
+    );
+    project.write(
+        "citrus.ci",
+        "#![citrus(2)]\n\n#[reads(\"shared/**\")]\ncheck api {\n    run!(\"cargo check -p api\")?;\n}\n",
+    );
+    let output = project.citrus(&["deps", "--text"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("1 checks understood as Cargo"), "{text}");
 }

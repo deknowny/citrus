@@ -8,6 +8,7 @@
 
 mod apply;
 mod config;
+mod depinfo;
 mod deploy;
 mod dockerfile;
 mod doctor;
@@ -215,6 +216,13 @@ enum Command {
     Check,
     /// Run the configuration's `#[test]` functions (plans of example changes).
     Test { filter: Option<String> },
+    /// Compare what the compiler read (Cargo dep-info) with the inputs Citrus
+    /// inferred for checks it understood as Cargo; run it after a build.
+    Deps {
+        /// Cargo's target directory (default: CARGO_TARGET_DIR, else target).
+        #[arg(long)]
+        target_dir: Option<std::path::PathBuf>,
+    },
     /// Run a task declared in citrus.ci (no name: list the tasks).
     Do { task: Option<String> },
     /// Check that this repository is set up so Citrus can be trusted.
@@ -434,6 +442,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
         Command::Stats { days } => stats(&context, days, json),
         Command::Check => check_command(&context, json),
         Command::Test { filter } => test_command(&context, filter.as_deref(), json),
+        Command::Deps { target_dir } => deps_command(&context, target_dir, json),
         Command::Do { task } => do_command(&context, task, json),
         Command::Integrate { base, push, no_run } => {
             integrate_command(&mut context, base, push, !no_run, json)
@@ -2271,6 +2280,56 @@ fn test_command(context: &Context, filter: Option<&str>, json: bool) -> Result<i
         return Ok(2);
     }
     Ok(i32::from(failed > 0))
+}
+
+fn deps_command(
+    context: &Context,
+    target_dir: Option<std::path::PathBuf>,
+    json: bool,
+) -> Result<i32> {
+    let root = &context.repo.root;
+    let target = target_dir
+        .or_else(|| std::env::var_os("CARGO_TARGET_DIR").map(Into::into))
+        .map(|dir| {
+            if dir.is_absolute() {
+                dir
+            } else {
+                root.join(dir)
+            }
+        })
+        .unwrap_or_else(|| root.join("target"));
+    if !target.is_dir() {
+        anyhow::bail!(
+            "no Cargo target directory at {}: build first, or pass --target-dir",
+            target.display()
+        );
+    }
+    let report = depinfo::verify(root, &target, &context.manifest)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"schema": SCHEMA, "deps": report}))?
+        );
+    } else {
+        for missing in &report.missing {
+            println!(
+                "✗ {} reads {} (crate {}), not among its inputs",
+                missing.check, missing.file, missing.crate_root
+            );
+        }
+        println!(
+            "{} checks understood as Cargo, {} compiled crates, {} files outside their inputs",
+            report.checks.len(),
+            report.crates,
+            report.missing.len()
+        );
+        if !report.missing.is_empty() {
+            println!(
+                "next: add them with #[reads(…)], or keep the check from reuse with #[cache(false)]"
+            );
+        }
+    }
+    Ok(i32::from(!report.missing.is_empty()))
 }
 
 fn citrus_lang_tests(

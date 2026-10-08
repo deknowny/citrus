@@ -87,6 +87,7 @@ the plan stays deterministic and `citrus why` can explain it.
 #![free_version(cmd!("scripts/registry.sh free-version"))]  // docs/releases.md
 #![after_merge(cmd!("scripts/after-merge.sh --since {{before}}"))]
 #![runner(cmd!("make remote-check"), status = cmd!("make builders-status"))]
+#![tool("scripts/cargo-test.sh", cmd!("cargo test"))]   // a wrapper Citrus understands
 #![label("scope-main", only(main))]          // a named condition reported with the plan
 #![command("release", "make deploy", "Roll out the verified release")]
 ```
@@ -256,9 +257,21 @@ starts:
   lockfile and settings. A misspelled subcommand or package is an error
   before anything runs. Everything after `--` belongs to the test binary.
 
+A wrapper script is understood like the command line it stands for once the
+project says so: `#![tool("scripts/cargo-test.sh", cmd!("cargo test"))]`
+makes `run!("scripts/cargo-test.sh -p api --lib")` read as `cargo test -p api
+--lib`, with the script itself among the inputs.
+
 A program Citrus does not know is a plain process: its check declares
 `#[paths]`. `citrus why` and `citrus targets` show what each command was
 understood as.
+
+`citrus deps` checks the inference against the compiler after a build: every
+repository file a crate read (Cargo's dep-info, and build scripts'
+`rerun-if-changed`) must be among the inputs of each understood check that
+builds that crate. It exits 1 and names the file otherwise. Procedural macros
+that read files without telling the compiler (SQLx's offline data) are not
+seen: declare those with `#[reads(…)]`.
 
 ## Tests
 

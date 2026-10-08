@@ -85,20 +85,17 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
                     );
                 }
                 // `make("x")` steps need an `x:` rule.
-                let rules = target
-                    .steps
-                    .iter()
-                    .filter_map(|step| match &step.work {
-                        crate::model::Work::Process { argv, .. }
-                            if argv.first().map(String::as_str) == Some("make") =>
-                        {
-                            argv.iter()
-                                .skip(1)
-                                .find(|part| !part.starts_with('-') && !part.contains('='))
-                                .cloned()
-                        }
-                        _ => None,
-                    });
+                let rules = target.steps.iter().filter_map(|step| match &step.work {
+                    crate::model::Work::Process { argv, .. }
+                        if argv.first().map(String::as_str) == Some("make") =>
+                    {
+                        argv.iter()
+                            .skip(1)
+                            .find(|part| !part.starts_with('-') && !part.contains('='))
+                            .cloned()
+                    }
+                    _ => None,
+                });
                 for rule in rules {
                     match defined(context, &rule) {
                         Ok(false) => note(

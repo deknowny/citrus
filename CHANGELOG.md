@@ -18,6 +18,10 @@ Breaking: a new configuration language (docs/design/language.md). Every
   packages it builds, and a misspelled subcommand or package is an error.
 - Outside the language names use `-` for `_` (`test_db` → `test-db`),
   like Cargo crate names; the command line takes either.
+- `#![tool("wrapper", cmd!("cargo test"))]`: a wrapper script is understood
+  like the command line it stands for.
+- `citrus deps` compares the files the compiler read (dep-info, build
+  scripts' `rerun-if-changed`) with the inputs inferred for Cargo checks.
 - `#[test] fn` states what a change would run (`std::plan::of`,
   `std::plan::change(…).profile(…).env(…).plan()`); `citrus test` runs them
   in one process. A failed `==`/`!=` assertion shows both sides.
