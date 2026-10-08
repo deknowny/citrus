@@ -103,7 +103,9 @@ fn build_scripts(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)
             .ok()
             .and_then(|table| Some(table.get("package")?.get("name")?.as_str()?.to_owned()));
         if let Some(name) = name {
-            let dir = manifest.trim_end_matches("Cargo.toml").trim_end_matches('/');
+            let dir = manifest
+                .trim_end_matches("Cargo.toml")
+                .trim_end_matches('/');
             dirs.insert(name.replace('-', "_"), dir.to_owned());
         }
     }
@@ -118,7 +120,9 @@ fn build_scripts(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)
                 continue;
             };
             let dir_name = entry.file_name().to_string_lossy().into_owned();
-            let name = dir_name.rsplit_once('-').map_or(dir_name.as_str(), |(name, _)| name);
+            let name = dir_name
+                .rsplit_once('-')
+                .map_or(dir_name.as_str(), |(name, _)| name);
             let Some(package) = dirs.get(&name.replace('-', "_")) else {
                 continue;
             };
@@ -131,7 +135,11 @@ fn build_scripts(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)
     let mut crates = Vec::new();
     for (dir, (_, output)) in newest {
         let text = std::fs::read_to_string(&output)?;
-        let package_root = if dir.is_empty() { root.to_path_buf() } else { root.join(&dir) };
+        let package_root = if dir.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&dir)
+        };
         let mut files = vec![if dir.is_empty() {
             "Cargo.toml".to_owned()
         } else {

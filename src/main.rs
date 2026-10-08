@@ -216,6 +216,12 @@ enum Command {
     Check,
     /// Run the configuration's `#[test]` functions (plans of example changes).
     Test { filter: Option<String> },
+    /// Lay out the .ci files: indentation by brackets, no trailing spaces.
+    Fmt {
+        /// Change nothing; exit 1 and name the files that need formatting.
+        #[arg(long)]
+        check: bool,
+    },
     /// Compare what the compiler read (Cargo dep-info) with the inputs Citrus
     /// inferred for checks it understood as Cargo; run it after a build.
     Deps {
@@ -442,6 +448,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
         Command::Stats { days } => stats(&context, days, json),
         Command::Check => check_command(&context, json),
         Command::Test { filter } => test_command(&context, filter.as_deref(), json),
+        Command::Fmt { check } => fmt_command(&context, check, json),
         Command::Deps { target_dir } => deps_command(&context, target_dir, json),
         Command::Do { task } => do_command(&context, task, json),
         Command::Integrate { base, push, no_run } => {
@@ -2280,6 +2287,47 @@ fn test_command(context: &Context, filter: Option<&str>, json: bool) -> Result<i
         return Ok(2);
     }
     Ok(i32::from(failed > 0))
+}
+
+fn fmt_command(context: &Context, check: bool, json: bool) -> Result<i32> {
+    let root = &context.repo.root;
+    let mut changed = Vec::new();
+    for file in lang::config_files(root) {
+        let path = root.join(&file);
+        let text = std::fs::read_to_string(&path).with_context(|| format!("read {file}"))?;
+        let formatted = lang::layout::format(&text);
+        if formatted != text {
+            if !check {
+                std::fs::write(&path, &formatted).with_context(|| format!("write {file}"))?;
+            }
+            changed.push(file);
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({"schema": SCHEMA, "check": check, "files": changed})
+            )?
+        );
+    } else if changed.is_empty() {
+        println!("✓ formatted");
+    } else {
+        for file in &changed {
+            println!(
+                "{} {file}",
+                if check {
+                    "✗ needs formatting:"
+                } else {
+                    "formatted"
+                }
+            );
+        }
+        if check {
+            println!("next: citrus fmt");
+        }
+    }
+    Ok(i32::from(check && !changed.is_empty()))
 }
 
 fn deps_command(

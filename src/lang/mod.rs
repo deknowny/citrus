@@ -8,6 +8,7 @@ pub mod cargo;
 pub mod check;
 pub mod compile;
 pub mod interp;
+pub mod layout;
 pub mod lexer;
 pub mod parser;
 pub mod tools;
@@ -169,6 +170,19 @@ fn read(root: &Path, relative: &str, revision: Option<&str>) -> Option<String> {
 }
 
 /// The configuration files: `citrus.ci`, or `.citrus/*.ci` (project.ci first).
+/// The configuration files of the project at `root`, in load order.
+pub fn config_files(root: &Path) -> Vec<String> {
+    let entry = if root.join("citrus.ci").exists() {
+        "citrus.ci"
+    } else {
+        ".citrus"
+    };
+    files(root, entry, None)
+        .into_iter()
+        .filter(|file| root.join(file).is_file())
+        .collect()
+}
+
 fn files(root: &Path, entry: &str, revision: Option<&str>) -> Vec<String> {
     if entry != ".citrus" {
         return vec![entry.to_owned()];

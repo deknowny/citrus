@@ -18,6 +18,8 @@ Breaking: a new configuration language (docs/design/language.md). Every
   packages it builds, and a misspelled subcommand or package is an error.
 - Outside the language names use `-` for `_` (`test_db` → `test-db`),
   like Cargo crate names; the command line takes either.
+- `citrus fmt [--check]` is back for the new language: indentation by
+  brackets, words, strings and comments untouched.
 - `#![tool("wrapper", cmd!("cargo test"))]`: a wrapper script is understood
   like the command line it stands for.
 - `citrus deps` compares the files the compiler read (dep-info, build

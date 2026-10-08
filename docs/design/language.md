@@ -38,7 +38,11 @@ A project is `citrus.ci` at the repository root, or `.citrus/*.ci` (one
 file per product, `project.ci` first) — not both. Every file starts with
 `#![citrus(2)]`. All files share **one namespace**: moving an item from one
 file to another changes nothing. `//` is a comment; `///` above an item is
-its description (`citrus why`, `citrus targets`, `citrus`).
+its description (`citrus why`, `citrus targets`, `citrus`). `citrus fmt`
+lays files out: four spaces a bracket level (a line opening several, like
+`#[paths([`, is one level), a continued expression (`.context(…)`, `&&`)
+one more, no trailing spaces, at most one blank line; `--check` only names
+the files it would change.
 
 ## Decisions
 
