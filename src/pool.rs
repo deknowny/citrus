@@ -128,6 +128,9 @@ fn migrate(client: &mut Client) -> Result<()> {
             line text not null,
             at timestamptz not null default now()
         );
+        -- Readers follow by transaction, not by id: an id taken by a
+        -- transaction that commits later would otherwise be skipped.
+        alter table citrus.events add column if not exists tx xid8 not null default pg_current_xact_id();
         create index if not exists events_by_run on citrus.events (run, id);
         create index if not exists jobs_queued on citrus.jobs (state) where state = 'queued';
         commit;",
@@ -346,16 +349,22 @@ fn follow(
     on_line: &mut dyn FnMut(String) -> Result<()>,
 ) -> Result<i64> {
     client.batch_execute("listen citrus_events")?;
-    let mut last: i64 = 0;
+    // Every transaction below the snapshot's xmin has ended: lines of
+    // transactions in [cursor, xmin) are final and read once, in order.
+    let mut cursor = "0".to_owned();
     let mut checked = Instant::now() - Duration::from_secs(60);
     loop {
+        let horizon: String = client
+            .query_one("select pg_snapshot_xmin(pg_current_snapshot())::text", &[])?
+            .get(0);
         for row in client.query(
-            "select id, line from citrus.events where run = $1 and id > $2 order by id limit 5000",
-            &[&id, &last],
+            "select line from citrus.events
+             where run = $1 and tx >= $2::text::xid8 and tx < $3::text::xid8 order by tx, id",
+            &[&id, &cursor, &horizon],
         )? {
-            last = row.get(0);
-            on_line(row.get(1))?;
+            on_line(row.get(0))?;
         }
+        cursor = horizon;
         if checked.elapsed() >= Duration::from_secs(5) {
             checked = Instant::now();
             for (run, check, agent) in requeue_stale(client)? {
@@ -374,11 +383,12 @@ fn follow(
             .get(0);
         if open == 0 {
             // Lines written after the last check settled.
+            // Agents settle a check after its lines commit: nothing is in flight.
             for row in client.query(
-                "select id, line from citrus.events where run = $1 and id > $2 order by id",
-                &[&id, &last],
+                "select line from citrus.events where run = $1 and tx >= $2::text::xid8 order by tx, id",
+                &[&id, &cursor],
             )? {
-                on_line(row.get(1))?;
+                on_line(row.get(0))?;
             }
             let failed: i64 = client
                 .query_one(
