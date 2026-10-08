@@ -69,7 +69,7 @@ pub fn integrate(context: &mut Context, base: &str) -> Result<Integration> {
         return Ok(result);
     }
     let snapshot_before = repo.snapshot()?;
-    let merge = std::process::Command::new("git")
+    let merge = crate::repo::git()
         .arg("-C")
         .arg(&repo.root)
         .args(["merge", "--no-edit", "--quiet", base])

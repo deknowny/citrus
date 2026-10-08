@@ -86,7 +86,7 @@ impl Repo {
     }
 
     pub fn files(&self) -> Result<Vec<String>> {
-        let output = Command::new("git")
+        let output = git()
             .arg("-C")
             .arg(&self.root)
             .args([
@@ -133,7 +133,7 @@ impl Repo {
             fs::copy(&current, &index)?;
         }
         let run = |args: &[&str]| -> Result<String> {
-            let output = Command::new("git")
+            let output = git()
                 .arg("-C")
                 .arg(&self.root)
                 .args(args)
@@ -163,6 +163,17 @@ impl Repo {
 
 /// Create `path` and missing parents readable by the owner only: logs and
 /// state may hold command output, and tools often refuse group-readable state.
+/// `git` for Citrus's own questions. With CITRUS_GIT_DIR set (a snapshot
+/// recorded outside the tree, as on a builder), Citrus reads that repository
+/// while the programs its checks run still see no Git checkout.
+pub fn git() -> Command {
+    let mut command = Command::new("git");
+    if let Some(dir) = std::env::var_os("CITRUS_GIT_DIR").filter(|dir| !dir.is_empty()) {
+        command.env("GIT_DIR", dir);
+    }
+    command
+}
+
 pub fn private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new()
@@ -173,7 +184,7 @@ pub fn private_dir(path: &Path) -> Result<()> {
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git").arg("-C").arg(dir).args(args).output()?;
+    let output = git().arg("-C").arg(dir).args(args).output()?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",

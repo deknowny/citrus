@@ -1,7 +1,5 @@
 //! `citrus doctor`: is this repository set up so Citrus can be trusted?
 
-use std::process::Command;
-
 use serde::Serialize;
 
 use crate::exec::Context;
@@ -122,7 +120,7 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
     // Logs inside the tree change the source snapshot unless Git ignores them.
     if let Some(dir) = &config.log_dir {
         let probe = format!("{}/probe.log", dir.trim_end_matches('/'));
-        let ignored = Command::new("git")
+        let ignored = crate::repo::git()
             .arg("-C")
             .arg(&context.repo.root)
             .args(["check-ignore", "-q", "--no-index", &probe])

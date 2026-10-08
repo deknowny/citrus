@@ -1530,7 +1530,7 @@ fn push_with_retries(
 ) -> Result<std::process::Output> {
     let mut delay = 2;
     loop {
-        let output = std::process::Command::new("git")
+        let output = crate::repo::git()
             .arg("-C")
             .arg(&context.repo.root)
             .args([

@@ -1042,7 +1042,7 @@ impl<'a> Interp<'a> {
             "std::fs::exists" => Value::Bool(self.root.join(arg(0).as_str()).exists()),
             "std::fs::glob" => {
                 let pattern = arg(0).text();
-                let listed = Command::new("git")
+                let listed = crate::repo::git()
                     .args(["ls-files", "-co", "--exclude-standard"])
                     .current_dir(self.root)
                     .output()

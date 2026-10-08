@@ -89,7 +89,7 @@ fn compiled(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)>> {
 /// What build scripts said they read (`cargo:rerun-if-changed=`), as crates
 /// rooted at the package's `Cargo.toml`. Paths are relative to the package.
 fn build_scripts(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)>> {
-    let listed = std::process::Command::new("git")
+    let listed = crate::repo::git()
         .args(["ls-files", "-co", "--exclude-standard", "*Cargo.toml"])
         .current_dir(root)
         .output()?;

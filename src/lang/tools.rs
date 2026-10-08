@@ -37,7 +37,7 @@ impl<'a> RepoFiles<'a> {
             None => vec!["ls-files", "-co", "--exclude-standard"],
             Some(revision) => vec!["ls-tree", "-r", "--name-only", revision],
         };
-        let listed = std::process::Command::new("git")
+        let listed = crate::repo::git()
             .arg("-C")
             .arg(root)
             .args(args)

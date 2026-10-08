@@ -527,7 +527,7 @@ pub fn load_at(root: &Path, revision: Option<&str>) -> Result<Option<(Project, S
         None if root.join("citrus.ci").exists() => "citrus.ci",
         None => ".citrus",
         Some(revision) => {
-            let listed = std::process::Command::new("git")
+            let listed = crate::repo::git()
                 .arg("-C")
                 .arg(root)
                 .args(["cat-file", "-e", &format!("{revision}:citrus.ci")])

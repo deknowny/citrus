@@ -158,7 +158,7 @@ pub fn is_v2(text: &str) -> bool {
 fn read(root: &Path, relative: &str, revision: Option<&str>) -> Option<String> {
     match revision {
         None => std::fs::read_to_string(root.join(relative)).ok(),
-        Some(revision) => std::process::Command::new("git")
+        Some(revision) => crate::repo::git()
             .arg("-C")
             .arg(root)
             .args(["show", &format!("{revision}:{relative}")])
@@ -197,7 +197,7 @@ fn files(root: &Path, entry: &str, revision: Option<&str>) -> Vec<String> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
-        Some(revision) => std::process::Command::new("git")
+        Some(revision) => crate::repo::git()
             .arg("-C")
             .arg(root)
             .args(["ls-tree", "--name-only", &format!("{revision}:.citrus")])

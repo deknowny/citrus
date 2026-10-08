@@ -3851,3 +3851,62 @@ fn a_run_streams_its_protocol_for_an_outer_citrus() {
         "{text}"
     );
 }
+
+#[test]
+fn a_snapshot_without_git_runs_with_an_outside_repository() {
+    let snapshot = tempfile::tempdir().unwrap();
+    let repository = tempfile::tempdir().unwrap();
+    let root = snapshot.path();
+    fs::write(
+        root.join("citrus.ci"),
+        r#"#![citrus(2)]
+
+/// The checks' programs see no Git checkout here.
+#[paths("src/**")]
+check nogit {
+    run!("sh -c 'if git rev-parse --git-dir >/dev/null 2>&1; then exit 1; fi; echo no-git-here'")?;
+}
+"#,
+    )
+    .unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("src/a.txt"), "a\n").unwrap();
+    let git_dir = repository.path().join("snapshot.git");
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_DIR", &git_dir)
+            .env("GIT_WORK_TREE", root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "core.worktree", root.to_str().unwrap()]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "snapshot",
+    ]);
+    assert!(!root.join(".git").exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        .args(["run", "nogit", "--local", "--text"])
+        .current_dir(root)
+        .env("CITRUS_GIT_DIR", &git_dir)
+        .env("CITRUS_PROTOCOL", "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("no-git-here"), "{text}");
+}
