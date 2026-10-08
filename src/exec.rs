@@ -638,7 +638,26 @@ impl Context {
                 Some(format!("no check `{}` in the configuration", target.target));
             self.store.update_target(&run.id, &current)?;
         }
+        self.stop_services(&started_services)?;
         Ok(passed)
+    }
+
+    /// Stop what the run started, last first, whatever the checks did.
+    fn stop_services(&self, started: &[String]) -> Result<()> {
+        let services = self.project.iter().flat_map(|project| &project.services);
+        let services: Vec<&crate::model::Service> = services.collect();
+        for name in started.iter().rev() {
+            let Some(service) = services.iter().find(|service| &service.name == name) else {
+                continue;
+            };
+            for step in &service.stop {
+                println!("── {}  (service {} stop)", step.label, service.name);
+                if crate::model::execute(step, &self.repo.root, false)? != 0 {
+                    println!("service {} did not stop cleanly", service.name);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Up to `jobs` checks at once, each in its own `citrus exec-steps`
@@ -658,6 +677,7 @@ impl Context {
             .collect();
         // Services the pending checks need, started in declaration order.
         let mut failed_services: Vec<String> = Vec::new();
+        let mut started_services: Vec<String> = Vec::new();
         for service in &services {
             let needed = pending.iter().any(|target| {
                 self.manifest
@@ -668,6 +688,7 @@ impl Context {
             if !needed {
                 continue;
             }
+            started_services.push(service.name.clone());
             for step in service.start.iter().chain(&service.ready) {
                 println!("── {}  (service {})", step.label, service.name);
                 if crate::model::execute(step, &self.repo.root, false)? != 0 {
@@ -879,6 +900,7 @@ impl Context {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
+        self.stop_services(&started_services)?;
         Ok(passed)
     }
 

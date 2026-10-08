@@ -258,6 +258,8 @@ pub struct Service {
     pub description: Option<String>,
     pub start: Vec<Step>,
     pub ready: Vec<Step>,
+    /// Run when the run is over, whatever its result.
+    pub stop: Vec<Step>,
     pub limit: Option<i64>,
 }
 

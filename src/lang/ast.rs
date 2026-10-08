@@ -71,10 +71,12 @@ pub enum ItemKind {
     Environment,
     /// A profile checks may belong to (`#[env(…)]` for its checks).
     Profile,
-    /// A resource checks need; `start`/`ready` bodies when Citrus starts it.
+    /// A resource checks need; `start`/`ready` bodies when Citrus starts it,
+    /// `stop` when the run is over.
     Service {
         start: Option<Block>,
         ready: Option<Block>,
+        stop: Option<Block>,
     },
     /// Something built from the repository (an image), for environments.
     Artifact,

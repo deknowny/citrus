@@ -3910,3 +3910,46 @@ check nogit {
     );
     assert!(text.contains("no-git-here"), "{text}");
 }
+
+#[test]
+fn a_service_stops_when_the_run_is_over() {
+    let project = Project::v2(
+        r#"#![citrus(2)]
+
+/// A database for the checks.
+service database {
+    start { run!("sh -c 'echo started >> service.log'")?; }
+    ready { run!("test -f service.log")?; }
+    stop { run!("sh -c 'echo stopped >> service.log'")?; }
+}
+
+#[paths("src/**")]
+#[needs(database)]
+group db {
+    check reads {
+        run!("grep -q started service.log")?;
+    }
+
+    check breaks {
+        run!("false")?;
+    }
+}
+"#,
+    );
+    for jobs in ["1", "2"] {
+        let _ = fs::remove_file(project.root().join("service.log"));
+        let (run, code) = project.json(&[
+            "run",
+            "--local",
+            "--force",
+            "--jobs",
+            jobs,
+            "db.reads",
+            "db.breaks",
+        ]);
+        assert_eq!(code, 1, "{run}");
+        assert_eq!(target(&run, "db.reads")["result"], "passed", "{run}");
+        let log = fs::read_to_string(project.root().join("service.log")).unwrap();
+        assert_eq!(log, "started\nstopped\n", "jobs {jobs}: {run}");
+    }
+}

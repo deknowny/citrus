@@ -172,10 +172,12 @@ exclusive conditions (`#[when(only(clyer))]`, `#[when(!only(clyer))]`).
 #[env(SQLX_OFFLINE = "true")]
 profile fast;
 
-/// A disposable PostgreSQL, started once before the checks that need it.
+/// A disposable PostgreSQL, started once before the checks that need it and
+/// stopped when the run is over, whatever its result.
 service database {
     start { run!("docker compose up -d postgres")?; }
     ready { std::wait::tcp("localhost:5432", 1m)?; }
+    stop { run!("docker compose down")?; }
 }
 
 /// Headless browsers the runner hands out; at most two at a time.

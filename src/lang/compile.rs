@@ -1026,7 +1026,7 @@ pub fn compile(
                 let env = compiler.env(&item.attrs)?;
                 project.profile_env.push((dash(&item.name), env));
             }
-            ItemKind::Service { start, ready } => {
+            ItemKind::Service { start, ready, stop } => {
                 let limit = match item.attr("limit").and_then(|attr| attr.args.first()) {
                     Some((_, arg)) => match compiler.value(arg)? {
                         Value::Int(limit) => Some(limit),
@@ -1056,11 +1056,23 @@ pub fn compile(
                         )]
                     })
                     .unwrap_or_default();
+                let stop = stop
+                    .as_ref()
+                    .map(|body| {
+                        vec![compiler.script(
+                            format!("service-stop:{}", dash(&item.name)),
+                            body.span,
+                            Vec::new(),
+                            Vec::new(),
+                        )]
+                    })
+                    .unwrap_or_default();
                 project.services.push(Service {
                     name: dash(&item.name),
                     description: item.doc.clone(),
                     start,
                     ready,
+                    stop,
                     limit,
                 });
             }

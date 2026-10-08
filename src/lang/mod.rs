@@ -423,13 +423,14 @@ fn find_body<'a>(
                     }
                 }
             }
-            (ItemKind::Service { start, ready }, "service-start" | "service-ready")
-                if compile::dash(&item.name) == name =>
-            {
-                let body = if kind == "service-start" {
-                    start
-                } else {
-                    ready
+            (
+                ItemKind::Service { start, ready, stop },
+                "service-start" | "service-ready" | "service-stop",
+            ) if compile::dash(&item.name) == name => {
+                let body = match kind {
+                    "service-start" => start,
+                    "service-ready" => ready,
+                    _ => stop,
                 };
                 if let Some(body) = body {
                     return Some((body, None));

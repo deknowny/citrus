@@ -327,7 +327,7 @@ impl Parser {
                 self.bump();
                 let (name, name_span) = self.ident("a service name")?;
                 self.name_span = name_span;
-                let (mut start, mut ready) = (None, None);
+                let (mut start, mut ready, mut stop) = (None, None, None);
                 if !self.eat_sym(";") {
                     self.expect_sym("{")?;
                     while !self.at_sym("}") && !self.at_eof() {
@@ -335,13 +335,15 @@ impl Parser {
                             start = Some(self.block()?);
                         } else if self.eat_word("ready") {
                             ready = Some(self.block()?);
+                        } else if self.eat_word("stop") {
+                            stop = Some(self.block()?);
                         } else {
-                            return Err(Error::at(self.span(), format!("expected `start {{ … }}` or `ready {{ … }}`, found {}", self.describe())));
+                            return Err(Error::at(self.span(), format!("expected `start {{ … }}`, `ready {{ … }}` or `stop {{ … }}`, found {}", self.describe())));
                         }
                     }
                     self.expect_sym("}")?;
                 }
-                Ok(self.finish(name, doc, attrs, ItemKind::Service { start, ready }, item_start))
+                Ok(self.finish(name, doc, attrs, ItemKind::Service { start, ready, stop }, item_start))
             }
             "release" => {
                 self.bump();

@@ -522,8 +522,8 @@ fn check_item_in(item: &Item, globals: &Globals, group: Option<&str>) -> Result<
                 checker.finish(&step.body, &found, &result_unit())?;
             }
         }
-        ItemKind::Service { start, ready } => {
-            for body in start.iter().chain(ready) {
+        ItemKind::Service { start, ready, stop } => {
+            for body in start.iter().chain(ready).chain(stop) {
                 let mut checker = Checker::new(globals, Phase::Run, result_unit());
                 let found = checker.block(body)?;
                 checker.finish(body, &found, &result_unit())?;
