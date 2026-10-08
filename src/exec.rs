@@ -435,6 +435,33 @@ impl Context {
             Some(pid) => !alive(pid),
             None => now() as i64 - run.started > 60,
         };
+        // A pool run goes on without its local worker: follow it again.
+        let reattached: u32 = self
+            .store
+            .fact(&format!("pool-reattached:{}", run.id))?
+            .and_then(|(value, _)| value.parse().ok())
+            .unwrap_or(0);
+        if lost
+            && reattached < 3
+            && crate::pool::url().is_some()
+            && self.store.fact(&format!("pool:{}", run.id))?.is_some()
+        {
+            self.store.set_fact(
+                &format!("pool-reattached:{}", run.id),
+                &(reattached + 1).to_string(),
+            )?;
+            let output = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&run.log)?;
+            let pid = self
+                .spawn_detached(&["worker", &run.id], output)
+                .context("follow the pool run again")?;
+            self.store.set_pid(&run.id, pid)?;
+            self.store
+                .set_note(&run.id, "the worker stopped; following the pool run again")?;
+            return self.store.run(&run.id)?.context("run disappeared");
+        }
         if lost {
             self.store.set_note(
                 &run.id,

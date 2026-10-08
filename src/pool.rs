@@ -48,8 +48,7 @@ pub fn url() -> Option<String> {
         let value = value.trim().to_owned();
         return (!value.is_empty()).then_some(value);
     }
-    let home = std::env::var_os("HOME")?;
-    let text = std::fs::read_to_string(Path::new(&home).join(".config/citrus/pool")).ok()?;
+    let text = std::fs::read_to_string(home().join(".config/citrus/pool")).ok()?;
     text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
@@ -320,6 +319,18 @@ pub fn run(
         );
     }
     let mut client = connect(&url)?;
+    // Queued before (a worker that stopped): follow it, from its first line.
+    if let Some(row) = client.query_opt("select ref_name from citrus.runs where id = $1", &[&id])? {
+        let refname: String = row.get(0);
+        on_line(format!("CITRUS_STAGE following {id} in the pool again"))?;
+        let outcome = follow(&mut client, id, on_line);
+        let _ = client.execute(
+            "update citrus.runs set state = 'closed', closed = now() where id = $1 and state = 'open'",
+            &[&id],
+        );
+        delete_ref(&context.repo, &refname);
+        return outcome;
+    }
     on_line(format!(
         "CITRUS_STAGE recording the snapshot for the pool {}",
         redact(&url)
@@ -618,6 +629,23 @@ fn load_average() -> f32 {
     if read >= 1 { values[0] as f32 } else { 0.0 }
 }
 
+/// HOME, or the account's home directory when a service manager leaves it unset.
+fn home() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home);
+    }
+    // SAFETY: getpwuid returns a pointer into static storage or null; the
+    // directory string is copied before any other call can overwrite it.
+    unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        if !entry.is_null() && !(*entry).pw_dir.is_null() {
+            let dir = std::ffi::CStr::from_ptr((*entry).pw_dir);
+            return PathBuf::from(dir.to_string_lossy().into_owned());
+        }
+    }
+    PathBuf::from("/tmp")
+}
+
 fn cache_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("CITRUS_AGENT_CACHE").filter(|value| !value.is_empty()) {
         return PathBuf::from(dir);
@@ -625,8 +653,7 @@ fn cache_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
         return PathBuf::from(dir).join("citrus/agent");
     }
-    let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-    PathBuf::from(home).join(".cache/citrus/agent")
+    home().join(".cache/citrus/agent")
 }
 
 fn short_hash(text: &str) -> String {
@@ -683,7 +710,7 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
         "insert into citrus.agents (name, labels, container, cpus, share, slots, version, state, running, seen, started)
          values ($1, $2, $3, $4, $5, $6, $7, 'ready', 0, now(), now())
          on conflict (name) do update set labels = $2, container = $3, cpus = $4, share = $5,
-             slots = $6, version = $7, state = 'ready', running = 0, seen = now(), started = now()",
+             slots = $6, version = $7, running = 0, seen = now(), started = now()",
         &[
             &machine.name,
             &machine.labels,
@@ -710,7 +737,14 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
     );
     // The heartbeat keeps the agent in the pool and reads whether to drain.
     let stop = Arc::new(AtomicBool::new(false));
-    let draining = Arc::new(AtomicBool::new(false));
+    // A drained agent stays drained across restarts.
+    let state: String = client
+        .query_one(
+            "select state from citrus.agents where name = $1",
+            &[&machine.name],
+        )?
+        .get(0);
+    let draining = Arc::new(AtomicBool::new(state == "draining"));
     let running = Arc::new(AtomicUsize::new(0));
     let heartbeat = {
         let (url, name) = (url.clone(), machine.name.clone());
@@ -762,9 +796,10 @@ fn serve(
             maintained = Instant::now();
             maintain(client, machine)?;
         }
+        // Drained: connected, taking no work until `citrus pool resume`.
         if draining.load(Ordering::SeqCst) {
-            eprintln!("citrus agent {}: drained", machine.name);
-            return Ok(0);
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
         }
         if STOP.load(Ordering::SeqCst) {
             eprintln!("citrus agent {}: stopped", machine.name);
@@ -988,10 +1023,7 @@ fn machine_files(repo: &str) -> PathBuf {
     let root = std::env::var_os("CITRUS_AGENT_FILES")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()))
-                .join(".config/citrus/files")
-        });
+        .unwrap_or_else(|| home().join(".config/citrus/files"));
     root.join(name)
 }
 
@@ -1265,10 +1297,15 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
         for dir in [&tree, &mirror] {
             command.arg("-v").arg(format!("{0}:{0}", dir.display()));
         }
-        // Caches kept between runs, at a path images can name in ENV.
-        command
-            .arg("-v")
-            .arg(format!("{}:/citrus-cache", shared.display()));
+        // Caches kept between runs, at a path images can name in ENV. Docker
+        // Desktop shares host folders through a file system on which mmap
+        // (linkers, databases) fails with SIGBUS: there the cache is a volume.
+        let cache = if std::env::consts::OS == "linux" {
+            shared.to_string_lossy().into_owned()
+        } else {
+            format!("citrus-cache-{}", short_hash(&run.repo))
+        };
+        command.arg("-v").arg(format!("{cache}:/citrus-cache"));
         command
             .arg("-v")
             .arg(format!("{}:/usr/local/bin/citrus-pool:ro", exe.display()))

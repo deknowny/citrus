@@ -382,7 +382,7 @@ enum ReleaseAction {
 
 #[derive(Subcommand, Debug)]
 enum PoolAction {
-    /// Let an agent finish its checks and take no more.
+    /// Let an agent finish its checks and take no more (it stays connected).
     Drain { name: String },
     /// Let a drained agent take checks again (when it runs).
     Resume { name: String },
@@ -392,7 +392,7 @@ fn pool_command(action: Option<&PoolAction>, json: bool) -> Result<i32> {
     match action {
         Some(PoolAction::Drain { name }) => {
             pool::set_agent_state(name, "draining")?;
-            println!("agent {name} drains: it finishes its checks and leaves");
+            println!("agent {name} drains: it finishes its checks and takes no more");
             return Ok(0);
         }
         Some(PoolAction::Resume { name }) => {

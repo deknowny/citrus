@@ -196,17 +196,32 @@ fn checks_run_on_the_agents_that_fit_them() {
         .output()
         .unwrap();
     let run = json(&output);
-    assert_eq!(output.status.code(), Some(1), "{run}");
-    assert_eq!(result(&run, "seen")["result"], "passed", "{run}");
-    assert_eq!(result(&run, "special")["result"], "passed", "{run}");
-    assert_eq!(result(&run, "prepared")["result"], "passed", "{run}");
-    assert_eq!(result(&run, "broken")["result"], "failed", "{run}");
+    let log = citrus(
+        &project,
+        &pool,
+        &cache,
+        &[
+            "log",
+            run["run"]["id"].as_str().unwrap_or("last"),
+            "--full",
+            "--text",
+        ],
+    )
+    .output()
+    .unwrap();
+    let shown = || format!("{run}\n{}", String::from_utf8_lossy(&log.stdout));
+    assert_eq!(output.status.code(), Some(1), "{}", shown());
+    assert_eq!(result(&run, "seen")["result"], "passed", "{}", shown());
+    assert_eq!(result(&run, "special")["result"], "passed", "{}", shown());
+    assert_eq!(result(&run, "prepared")["result"], "passed", "{}", shown());
+    assert_eq!(result(&run, "broken")["result"], "failed", "{}", shown());
     assert!(
         result(&run, "broken")["first_error"]
             .as_str()
             .unwrap_or_default()
             .contains("broken thing"),
-        "{run}"
+        "{}",
+        shown()
     );
 
     // The snapshot ref is gone from the remote once the run is over.
@@ -415,4 +430,74 @@ fn a_stopped_agent_hands_its_checks_back() {
         String::from_utf8_lossy(&log.stdout)
     );
     assert!(second.wait().unwrap().success());
+}
+
+/// The local worker of a pool run dies; `citrus wait` follows the pool run again.
+#[test]
+fn a_lost_worker_follows_the_pool_run_again() {
+    let Ok(pool) = std::env::var("CITRUS_TEST_POOL") else {
+        eprintln!("CITRUS_TEST_POOL is not set: pool tests skipped");
+        return;
+    };
+    let work = tempfile::tempdir().unwrap();
+    let project = work.path().join("project");
+    let origin = work.path().join("origin.git");
+    let cache = work.path().join("agents");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("citrus.ci"),
+        "#![citrus(2)]\n\n#[paths(\"src/**\")]\ncheck slow {\n    run!(\"sleep 3\")?;\n}\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/a.txt"), "one\n").unwrap();
+    git(&project, &["init", "-q", "-b", "main"]);
+    git(&project, &["add", "-A"]);
+    git(
+        &project,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    git(
+        work.path(),
+        &["init", "-q", "--bare", "-b", "main", "origin.git"],
+    );
+    git(
+        &project,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&project, &["push", "-q", "-u", "origin", "main"]);
+    fs::write(project.join("src/a.txt"), "two\n").unwrap();
+
+    let mut worker = agent(&project, &pool, &cache.join("one"), "steady", "plain");
+    let started = json(
+        &citrus(
+            &project,
+            &pool,
+            &cache,
+            &["run", "--remote", "--detach", "--json"],
+        )
+        .output()
+        .unwrap(),
+    );
+    let id = started["run"]["id"].as_str().unwrap().to_owned();
+    let pid = started["run"]["pid"].as_i64().unwrap();
+    // Let it queue the check, then kill the local worker and its group.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    // SAFETY: plain signal delivery to the worker this test started.
+    unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let output = citrus(&project, &pool, &cache, &["wait", &id, "--json"])
+        .output()
+        .unwrap();
+    let run = json(&output);
+    assert_eq!(output.status.code(), Some(0), "{run}");
+    assert_eq!(result(&run, "slow")["result"], "passed", "{run}");
+    assert!(worker.wait().unwrap().success());
 }
