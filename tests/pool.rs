@@ -8,6 +8,19 @@ use std::process::{Child, Command, Output, Stdio};
 
 use serde_json::Value;
 
+/// The citrus under test, without the environment of a Citrus that runs these
+/// tests: a pool agent sets CITRUS_PROTOCOL, CITRUS_BIN, CITRUS_AGENT_POOL…
+fn citrus_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_citrus"));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("CITRUS_") && name != "CITRUS_TEST_POOL" {
+            command.env_remove(&key);
+        }
+    }
+    command
+}
+
 /// The tests share one database and its queue: one at a time.
 static POOL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -56,7 +69,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn citrus(dir: &Path, pool: &str, cache: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_citrus"));
+    let mut command = citrus_command();
     command
         .args(args)
         .current_dir(dir)
@@ -128,7 +141,7 @@ fn checks_run_on_the_agents_that_fit_them() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A clean pool: this test owns the database.
-    let reset = Command::new(env!("CARGO_BIN_EXE_citrus"))
+    let reset = citrus_command()
         .args(["pool", "--json"])
         .env("CITRUS_POOL", &pool)
         .output()
@@ -242,7 +255,7 @@ fn checks_run_on_the_agents_that_fit_them() {
     );
 
     let overview = json(
-        &Command::new(env!("CARGO_BIN_EXE_citrus"))
+        &citrus_command()
             .args(["pool", "--json"])
             .env("CITRUS_POOL", &pool)
             .output()
@@ -407,7 +420,7 @@ fn a_stopped_agent_hands_its_checks_back() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let overview = json(
-            &Command::new(env!("CARGO_BIN_EXE_citrus"))
+            &citrus_command()
                 .args(["pool", "--json"])
                 .env("CITRUS_POOL", &pool)
                 .output()
@@ -573,7 +586,7 @@ fn a_killed_agent_takes_its_checks_back_when_it_restarts() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let overview = json(
-            &Command::new(env!("CARGO_BIN_EXE_citrus"))
+            &citrus_command()
                 .args(["pool", "--json"])
                 .env("CITRUS_POOL", &pool)
                 .output()
@@ -657,7 +670,7 @@ fn a_long_check_does_not_hold_the_agent() {
         .unwrap();
     let running = || -> Vec<String> {
         let overview = json(
-            &Command::new(env!("CARGO_BIN_EXE_citrus"))
+            &citrus_command()
                 .args(["pool", "--json"])
                 .env("CITRUS_POOL", &pool)
                 .output()
@@ -721,7 +734,7 @@ fn a_published_build_is_held_by_commit_and_platform() {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     for _ in 0..2 {
-        let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        let output = citrus_command()
             .args(["pool", "publish", "--platform", "linux-x86_64"])
             .arg(&fake)
             .env("CITRUS_POOL", &pool)
@@ -734,7 +747,7 @@ fn a_published_build_is_held_by_commit_and_platform() {
         );
     }
     let listed = json(
-        &Command::new(env!("CARGO_BIN_EXE_citrus"))
+        &citrus_command()
             .args(["pool", "binaries", "--json"])
             .env("CITRUS_POOL", &pool)
             .output()
