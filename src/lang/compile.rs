@@ -1051,7 +1051,7 @@ pub fn compile(
             }
             other => {
                 return Err(Error::at(attr.span, format!("unknown project attribute `#![{other}]`")).help(
-                    "project attributes: citrus, main, toolchain, logs, receipts, cache, signals, free_version, after_merge, runner, tool, command, label",
+                    "project attributes: citrus, main, toolchain, logs, receipts, cache, signals, free_version, after_merge, runner, image, private, prepare, tool, command, label",
                 ));
             }
         }
