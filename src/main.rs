@@ -415,7 +415,7 @@ enum PoolAction {
     },
     /// The Citrus builds the pool holds, newest first.
     Binaries,
-    /// Write the pool's build of a commit to a file, for installers.
+    /// Write the pool's build of a commit to a file (installers).
     Fetch {
         commit: String,
         to: std::path::PathBuf,
