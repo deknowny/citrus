@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 /// This build: a run asks agents for an executor of exactly this commit.
@@ -621,6 +621,7 @@ pub struct AgentOptions {
     pub pause_while_locked: Vec<PathBuf>,
 }
 
+#[derive(Clone)]
 struct Machine {
     name: String,
     share: usize,
@@ -839,7 +840,7 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
             Ok(())
         })
     };
-    let result = serve(&mut client, &machine, options, &draining, &running);
+    let result = serve(&mut client, &url, &machine, options, &draining, &running);
     stop.store(true, Ordering::SeqCst);
     let _ = heartbeat.join();
     let _ = client.execute(
@@ -849,30 +850,49 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
     result
 }
 
+/// Claims checks while slots are free and runs each batch on its own thread:
+/// a long check holds only its own slot, and every result is reported as it
+/// comes, not when the slowest check of its batch ends.
 fn serve(
     client: &mut Client,
+    url: &str,
     machine: &Machine,
     options: &AgentOptions,
     draining: &AtomicBool,
     running: &AtomicUsize,
 ) -> Result<i32> {
     client.batch_execute("listen citrus_jobs")?;
+    let free = Arc::new(AtomicUsize::new(machine.slots));
+    let fatal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut idle_since = Instant::now();
     let mut maintained = Instant::now() - Duration::from_secs(3600);
     let mut paused = false;
-    loop {
+    let mut batches = 0usize;
+    let result = loop {
+        workers.retain(|worker| !worker.is_finished());
+        running.store(
+            machine.slots - free.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        if let Some(error) = fatal.lock().unwrap().take() {
+            break Err(anyhow::anyhow!(error));
+        }
+        if !workers.is_empty() {
+            idle_since = Instant::now();
+        }
         if maintained.elapsed() >= Duration::from_secs(60) {
             maintained = Instant::now();
             maintain(client, machine)?;
+        }
+        if STOP.load(Ordering::SeqCst) {
+            eprintln!("citrus agent {}: stopped", machine.name);
+            break Ok(0);
         }
         // Drained: connected, taking no work until `citrus pool resume`.
         if draining.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(2));
             continue;
-        }
-        if STOP.load(Ordering::SeqCst) {
-            eprintln!("citrus agent {}: stopped", machine.name);
-            return Ok(0);
         }
         if let Some(path) = options.pause_while_locked.iter().find(|path| held(path)) {
             if !paused {
@@ -887,61 +907,129 @@ fn serve(
             continue;
         }
         paused = false;
-        let claimed = claim(client, machine)?;
+        let limit = free.load(Ordering::SeqCst);
+        let claimed = if limit > 0 {
+            claim(client, machine, limit)?
+        } else {
+            None
+        };
         if let Some((run, checks)) = claimed {
-            running.store(checks.len(), Ordering::SeqCst);
-            let outcome = execute(client, machine, &run, &checks);
-            running.store(0, Ordering::SeqCst);
-            if let Err(error) = &outcome
-                && error.downcast_ref::<Stopped>().is_some()
-            {
-                // Another agent takes them; nothing ran to completion here.
-                client.execute(
-                    "update citrus.jobs set state = 'queued', agent = null, claimed = null
-                     where run = $1 and agent = $2 and state = 'claimed'",
-                    &[&run.id, &machine.name],
-                )?;
+            free.fetch_sub(checks.len(), Ordering::SeqCst);
+            batches += 1;
+            let batch = format!("{}-{batches}", run.id);
+            let (url, machine) = (url.to_owned(), machine.clone());
+            let (free, fatal) = (free.clone(), fatal.clone());
+            workers.push(std::thread::spawn(move || {
+                if let Err(error) = work(&url, &machine, &run, &checks, &batch, &free) {
+                    *fatal.lock().unwrap() = Some(format!("{error:#}"));
+                }
+            }));
+            idle_since = Instant::now();
+            continue;
+        }
+        if workers.is_empty()
+            && let Some(limit) = options.idle_exit
+            && idle_since.elapsed() >= Duration::from_secs(limit)
+        {
+            break Ok(0);
+        }
+        let _ = client
+            .notifications()
+            .timeout_iter(Duration::from_secs(if limit > 0 { 5 } else { 1 }))
+            .next()?;
+        while client.notifications().iter().next()?.is_some() {}
+    };
+    // STOP kills the executors; their checks go back to the queue.
+    for worker in workers {
+        let _ = worker.join();
+    }
+    running.store(0, Ordering::SeqCst);
+    result
+}
+
+/// One claimed batch on its own connection. Its slots come back as its
+/// checks end; an error only when the pool itself cannot be reached.
+fn work(
+    url: &str,
+    machine: &Machine,
+    run: &RunRow,
+    checks: &[String],
+    batch: &str,
+    free: &AtomicUsize,
+) -> Result<()> {
+    let mut released: Vec<String> = Vec::new();
+    let outcome = (|| -> Result<()> {
+        let mut client = retry_connect(url)?;
+        let outcome = execute(
+            &mut client,
+            machine,
+            run,
+            checks,
+            batch,
+            free,
+            &mut released,
+        );
+        let rest: Vec<String> = checks
+            .iter()
+            .filter(|check| !released.contains(check))
+            .cloned()
+            .collect();
+        if let Err(error) = &outcome
+            && error.downcast_ref::<Stopped>().is_some()
+        {
+            // Another agent takes them; nothing ran to completion here.
+            client.execute(
+                "update citrus.jobs set state = 'queued', agent = null, claimed = null
+                 where run = $1 and agent = $2 and state = 'claimed' and check_name = any($3)",
+                &[&run.id, &machine.name, &rest],
+            )?;
+            if !rest.is_empty() {
                 emit(
-                    client,
+                    &mut client,
                     &run.id,
                     &machine.name,
                     &[format!(
                         "CITRUS_STAGE {} stopped: {} back in the queue",
                         machine.name,
-                        checks.join(", ")
+                        rest.join(", ")
                     )],
                 )?;
-                notify(client, "citrus_jobs", &run.id)?;
-                continue;
             }
-            if let Err(error) = outcome {
-                // The checks fail with the reason; the agent stays.
-                let line = format!("citrus agent {}: {error:#}", machine.name);
-                eprintln!("{line}");
-                emit(client, &run.id, &machine.name, &[line])?;
-                for check in &checks {
-                    emit(
-                        client,
-                        &run.id,
-                        &machine.name,
-                        &[format!("CITRUS_TARGET target={check} status=FAIL exit=125")],
-                    )?;
-                }
-                settle(client, &run.id, &checks, &BTreeMap::new())?;
+            notify(&mut client, "citrus_jobs", &run.id)?;
+            return Ok(());
+        }
+        if let Err(error) = outcome {
+            // The checks fail with the reason; the agent stays.
+            let line = format!("citrus agent {}: {error:#}", machine.name);
+            eprintln!("{line}");
+            emit(&mut client, &run.id, &machine.name, &[line])?;
+            for check in &rest {
+                emit(
+                    &mut client,
+                    &run.id,
+                    &machine.name,
+                    &[format!("CITRUS_TARGET target={check} status=FAIL exit=125")],
+                )?;
             }
-            idle_since = Instant::now();
-            continue;
+            settle(&mut client, &run.id, &rest, &BTreeMap::new())?;
         }
-        if let Some(limit) = options.idle_exit
-            && idle_since.elapsed() >= Duration::from_secs(limit)
-        {
-            return Ok(0);
+        Ok(())
+    })();
+    free.fetch_add(checks.len() - released.len(), Ordering::SeqCst);
+    outcome
+}
+
+fn retry_connect(url: &str) -> Result<Client> {
+    let mut attempt = 0;
+    loop {
+        match connect(url) {
+            Ok(client) => return Ok(client),
+            Err(error) if attempt >= 5 => return Err(error),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_secs(2));
+            }
         }
-        let _ = client
-            .notifications()
-            .timeout_iter(Duration::from_secs(5))
-            .next()?;
-        while client.notifications().iter().next()?.is_some() {}
     }
 }
 
@@ -972,8 +1060,12 @@ struct RunRow {
     prepare: Vec<String>,
 }
 
-/// Take up to `slots` checks of the oldest run this machine can run.
-fn claim(client: &mut Client, machine: &Machine) -> Result<Option<(RunRow, Vec<String>)>> {
+/// Take up to `limit` checks of the oldest run this machine can run.
+fn claim(
+    client: &mut Client,
+    machine: &Machine,
+    limit: usize,
+) -> Result<Option<(RunRow, Vec<String>)>> {
     let fits = "case when r.image is null then j.requires <@ $1::text[]
                      else ($3 and j.requires <@ $2::text[]) or ($4 and j.requires <@ $1::text[]) end";
     let query = format!(
@@ -990,7 +1082,7 @@ fn claim(client: &mut Client, machine: &Machine) -> Result<Option<(RunRow, Vec<S
          returning j.run, j.check_name"
     );
     let native = machine.native || !machine.docker;
-    let slots = machine.slots as i64;
+    let slots = limit as i64;
     let rows = retry(|| {
         client.query(
             &query,
@@ -1088,7 +1180,12 @@ fn git_at(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// The run's tree in a worktree of a cached mirror of its repository.
-fn checkout(machine: &Machine, run: &RunRow) -> Result<(PathBuf, PathBuf)> {
+fn checkout(machine: &Machine, run: &RunRow, batch: &str) -> Result<(PathBuf, PathBuf)> {
+    // Batches of one agent share the mirror: one fetch or worktree at a time.
+    static MIRRORS: Mutex<()> = Mutex::new(());
+    let _guard = MIRRORS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mirror = machine
         .cache
         .join("repos")
@@ -1097,10 +1194,13 @@ fn checkout(machine: &Machine, run: &RunRow) -> Result<(PathBuf, PathBuf)> {
         std::fs::create_dir_all(&mirror)?;
         git_at(&mirror, &["init", "--bare", "-q"])?;
     }
-    let tree = machine.cache.join("work").join(&run.id);
+    let tree = batch_tree(machine, run, batch);
     if !tree.join(".git").exists() {
-        let spec = format!("+{}:{}", run.refname, run.refname);
-        git_at(&mirror, &["fetch", "-q", "--no-tags", &run.repo, &spec])?;
+        let commit = format!("{}^{{commit}}", run.commit);
+        if git_at(&mirror, &["cat-file", "-e", &commit]).is_err() {
+            let spec = format!("+{}:{}", run.refname, run.refname);
+            git_at(&mirror, &["fetch", "-q", "--no-tags", &run.repo, &spec])?;
+        }
         std::fs::create_dir_all(tree.parent().context("work dir")?)?;
         let target = tree.to_string_lossy().into_owned();
         git_at(
@@ -1110,6 +1210,12 @@ fn checkout(machine: &Machine, run: &RunRow) -> Result<(PathBuf, PathBuf)> {
         overlay(&machine_files(&run.repo), &tree)?;
     }
     Ok((mirror, tree))
+}
+
+/// A batch's own tree under its run's directory (`work/<run>/<batch>`), so
+/// batches of one run on one machine never share files or test stacks.
+fn batch_tree(machine: &Machine, run: &RunRow, batch: &str) -> PathBuf {
+    machine.cache.join("work").join(&run.id).join(batch)
 }
 
 /// Files this machine adds to every tree of a repository (`#![private]`
@@ -1299,7 +1405,15 @@ fn build_image(tree: &Path, image: &crate::model::Image) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[String]) -> Result<()> {
+fn execute(
+    client: &mut Client,
+    machine: &Machine,
+    run: &RunRow,
+    checks: &[String],
+    batch: &str,
+    free: &AtomicUsize,
+    released: &mut Vec<String>,
+) -> Result<()> {
     emit(
         client,
         &run.id,
@@ -1309,13 +1423,7 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
             format!("CITRUS_STAGE {} runs {}", machine.name, checks.join(", ")),
         ],
     )?;
-    if !machine
-        .cache
-        .join("work")
-        .join(&run.id)
-        .join(".git")
-        .exists()
-    {
+    if !batch_tree(machine, run, batch).join(".git").exists() {
         emit(
             client,
             &run.id,
@@ -1326,7 +1434,7 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
             )],
         )?;
     }
-    let (mirror, tree) = checkout(machine, run)?;
+    let (mirror, tree) = checkout(machine, run, batch)?;
     let in_container = run.image.is_some() && machine.docker;
     let platform = if in_container {
         docker_platform()
@@ -1362,7 +1470,7 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
         ("CITRUS_POOL".into(), String::new()),
         ("CITRUS_POOL_SHARE".into(), machine.share.to_string()),
         // Names per-run resources (Compose projects, ports) on a shared machine.
-        ("CITRUS_POOL_RUN".into(), run.id.clone()),
+        ("CITRUS_POOL_RUN".into(), batch.to_owned()),
         // The repository's own launcher (bin/citrus) runs this build too.
         (
             "CITRUS_BIN".into(),
@@ -1403,6 +1511,13 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
             "host",
         ]);
         command.arg("--cpus").arg(machine.share.to_string());
+        // All batches together stay within the share: a cgroup (systemd
+        // slice) the agent's installer caps at it.
+        if let Some(parent) =
+            std::env::var_os("CITRUS_AGENT_CGROUP_PARENT").filter(|value| !value.is_empty())
+        {
+            command.arg("--cgroup-parent").arg(parent);
+        }
         if let Some(volume) = &tree_volume {
             let copied = Command::new("docker")
                 .args(["run", "--rm", "--entrypoint", "sh", "-v"])
@@ -1522,7 +1637,18 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
                         && status != "START"
                     {
                         let seconds = field("seconds=").and_then(|value| value.parse().ok());
-                        reported.insert(target, (status, seconds));
+                        reported.insert(target.clone(), (status, seconds));
+                        // The result is final: report it and free its slot now.
+                        if checks.contains(&target) && !released.contains(&target) {
+                            pending.push(line);
+                            emit(client, &run.id, &machine.name, &pending)?;
+                            pending.clear();
+                            flushed = Instant::now();
+                            settle(client, &run.id, std::slice::from_ref(&target), &reported)?;
+                            released.push(target);
+                            free.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
                     }
                 }
                 pending.push(line);
@@ -1581,7 +1707,12 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
         return Err(Stopped.into());
     }
     let code = status.code().unwrap_or(-1);
-    for check in checks {
+    let rest: Vec<String> = checks
+        .iter()
+        .filter(|check| !released.contains(check))
+        .cloned()
+        .collect();
+    for check in &rest {
         if !reported.contains_key(check) {
             pending.push(format!(
                 "CITRUS_TARGET target={check} status=FAIL exit={}",
@@ -1590,7 +1721,8 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
         }
     }
     emit(client, &run.id, &machine.name, &pending)?;
-    settle(client, &run.id, checks, &reported)
+    // Their slots come back in `work` once the batch is over.
+    settle(client, &run.id, &rest, &reported)
 }
 
 /// Housekeeping any agent does: requeue stale checks, close abandoned runs,

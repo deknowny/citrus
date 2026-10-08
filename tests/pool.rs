@@ -600,3 +600,101 @@ fn a_killed_agent_takes_its_checks_back_when_it_restarts() {
     assert_eq!(result(&run, "slow")["result"], "passed", "{run}");
     assert!(second.wait().unwrap().success());
 }
+
+/// A long check holds only its own slot: the other check of its batch is
+/// reported, and its slot freed, while the long one still runs.
+#[test]
+fn a_long_check_does_not_hold_the_agent() {
+    let Ok(pool) = std::env::var("CITRUS_TEST_POOL") else {
+        eprintln!("CITRUS_TEST_POOL is not set: pool tests skipped");
+        return;
+    };
+    let _serial = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let work = tempfile::tempdir().unwrap();
+    let project = work.path().join("project");
+    let origin = work.path().join("origin.git");
+    let cache = work.path().join("agents");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("citrus.ci"),
+        "#![citrus(2)]\n\n#[paths(\"src/**\")]\ncheck slow {\n    run!(\"sleep 15\")?;\n}\n\n\
+         #[paths(\"src/**\")]\ncheck fast {\n    run!(\"true\")?;\n}\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/a.txt"), "one\n").unwrap();
+    git(&project, &["init", "-q", "-b", "main"]);
+    git(&project, &["add", "-A"]);
+    git(
+        &project,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    git(
+        work.path(),
+        &["init", "-q", "--bare", "-b", "main", "origin.git"],
+    );
+    git(
+        &project,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&project, &["push", "-q", "-u", "origin", "main"]);
+    fs::write(project.join("src/a.txt"), "two\n").unwrap();
+
+    let mut agent = agent(&project, &pool, &cache.join("one"), "one", "plain");
+    let requester = citrus(&project, &pool, &cache, &["run", "--remote", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let running = || -> Vec<String> {
+        let overview = json(
+            &Command::new(env!("CARGO_BIN_EXE_citrus"))
+                .args(["pool", "--json"])
+                .env("CITRUS_POOL", &pool)
+                .output()
+                .unwrap(),
+        );
+        overview["pool"]["running"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row[1].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    // Both checks are claimed together; the fast one ends long before the
+    // slow one and leaves the running list on its own.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut seen_slow = false;
+    loop {
+        let now = running();
+        seen_slow |= now.iter().any(|check| check == "slow");
+        if seen_slow && now == ["slow"] {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = agent.kill();
+            let output = requester.wait_with_output().unwrap();
+            panic!(
+                "the fast check was not reported while the slow one ran: {now:?}\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let output = requester.wait_with_output().unwrap();
+    let run = json(&output);
+    assert_eq!(output.status.code(), Some(0), "{run}");
+    assert_eq!(result(&run, "slow")["result"], "passed", "{run}");
+    assert_eq!(result(&run, "fast")["result"], "passed", "{run}");
+    assert!(agent.wait().unwrap().success());
+}
