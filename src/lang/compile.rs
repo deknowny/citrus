@@ -1493,6 +1493,7 @@ pub fn load_at(root: &Path, revision: Option<&str>) -> Result<Option<(Project, S
                 .arg("-C")
                 .arg(root)
                 .args(["cat-file", "-e", &format!("{revision}:citrus.ci")])
+                .stderr(std::process::Stdio::null())
                 .status()
                 .is_ok_and(|status| status.success());
             if listed { "citrus.ci" } else { ".citrus" }

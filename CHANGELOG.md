@@ -11,6 +11,8 @@
 - Several processes opening a new state database at once no longer fail
   with a disk I/O error.
 - The overview no longer suggests the removed `citrus add`.
+- Reading a `.citrus/` configuration at a commit no longer prints git's
+  `path 'citrus.ci' does not exist`.
 - A check whose program cannot start fails with `cannot run <program>` in
   its first error instead of ending the run as `unknown`.
 
