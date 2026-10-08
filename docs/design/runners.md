@@ -39,9 +39,11 @@ start.
   machines takes about the time of its slowest check.
 - **The configuration says what checks need, not where they run.**
   `#[meta(linux = true)]` (and `#[requires("docker")]`) match agent labels.
-  `#![image(dockerfile = "...", target = "...")]` names the image the checks
-  run in; an agent with Docker builds it once per input hash and runs the
-  executor inside, with the snapshot and its caches mounted. An agent without
+  `#![image(dockerfile = "...", target = "...", context = "...")]` names the
+  image the checks run in; an agent with Docker builds it (Docker's cache makes
+  that cheap) and runs the executor inside, with the snapshot mounted at its
+  own path and the machine's cache for the repository at `/citrus-cache`
+  (`CITRUS_POOL_CACHE`), so the image can point Cargo, pnpm and others there. An agent without
   Docker runs natively and only takes checks that need nothing more.
 - **The executor is the requester's Citrus version.** Agents keep a cache of
   Citrus binaries by commit (built or downloaded as `bin/citrus` does) and run

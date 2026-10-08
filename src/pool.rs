@@ -1074,9 +1074,13 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
             "host",
         ]);
         command.arg("--cpus").arg(machine.share.to_string());
-        for dir in [&tree, &mirror, &shared] {
+        for dir in [&tree, &mirror] {
             command.arg("-v").arg(format!("{0}:{0}", dir.display()));
         }
+        // Caches kept between runs, at a path images can name in ENV.
+        command
+            .arg("-v")
+            .arg(format!("{}:/citrus-cache", shared.display()));
         command
             .arg("-v")
             .arg(format!("{}:/usr/local/bin/citrus-pool:ro", exe.display()))
@@ -1084,6 +1088,11 @@ fn execute(client: &mut Client, machine: &Machine, run: &RunRow, checks: &[Strin
             .arg("-w")
             .arg(&tree);
         for (key, value) in &env {
+            let value = if key == "CITRUS_POOL_CACHE" {
+                "/citrus-cache"
+            } else {
+                value
+            };
             command.arg("-e").arg(format!("{key}={value}"));
         }
         // The tree belongs to the agent's user, not the container's.
