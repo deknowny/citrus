@@ -100,7 +100,7 @@ enum Command {
         /// Run even if a proven result exists.
         #[arg(long)]
         force: bool,
-        /// Checks run at once on this machine (default: CITRUS_JOBS, else 1).
+        /// Checks run at once on this machine (default: CITRUS_JOBS, else half its CPUs).
         #[arg(long)]
         jobs: Option<usize>,
         /// Plan for exactly the changed paths in this file (one per line).
@@ -556,6 +556,12 @@ fn main() {
     }
 }
 
+/// Checks run at once on this machine when nothing says otherwise: half its
+/// CPUs (resource classes still bound heavy ones).
+fn default_jobs() -> usize {
+    std::thread::available_parallelism().map_or(1, |cpus| (cpus.get() / 2).max(1))
+}
+
 /// Names on the command line may be written as in the language (`test_db`)
 /// or as Citrus shows them (`test-db`).
 fn dashed(command: Option<Command>) -> Option<Command> {
@@ -662,7 +668,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
                         .ok()
                         .and_then(|value| value.parse().ok())
                 })
-                .unwrap_or(1)
+                .unwrap_or_else(default_jobs)
                 .max(1);
             let mode = if local {
                 Mode::Local
@@ -1869,7 +1875,11 @@ fn integrate_command(
                 mode: Mode::Auto,
                 key: None,
                 force: false,
-                jobs: 1,
+                jobs: std::env::var("CITRUS_JOBS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_else(default_jobs)
+                    .max(1),
                 paths: None,
             })?;
             let run = if run.finished() {

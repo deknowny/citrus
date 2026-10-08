@@ -1,5 +1,6 @@
-//! The Citrus build a repository pins runs its commands: `#![pin("<commit>")]`
-//! in its configuration. Any `citrus` finds that build — in the Git common
+//! The Citrus build a repository pins runs its commands: `.citrus/pin` (one
+//! commit; a file of its own, so moving it changes no configuration a plan
+//! depends on), or `#![pin("<commit>")]` in a single-file `citrus.ci`. Any `citrus` finds that build — in the Git common
 //! directory's cache, then among the pool's published builds, else it
 //! compiles it once — and hands the command over to it. `citrus self pin`
 //! moves the pin.
@@ -29,6 +30,15 @@ fn pinned(text: &str) -> Option<String> {
 
 fn is_commit(text: &str) -> bool {
     text.len() == 40 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The commit `root` pins: `.citrus/pin`, else a `#![pin]` attribute.
+fn pinned_in(root: &Path) -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string(root.join(".citrus/pin")) {
+        let commit = text.trim();
+        return is_commit(commit).then(|| commit.to_owned());
+    }
+    pinned(&std::fs::read_to_string(config_file(root)?).ok()?)
 }
 
 /// The repository around the working directory.
@@ -71,10 +81,7 @@ pub fn handover() -> Result<()> {
         return Ok(());
     }
     let Some(root) = root() else { return Ok(()) };
-    let Some(file) = config_file(&root) else {
-        return Ok(());
-    };
-    let Some(commit) = pinned(&std::fs::read_to_string(&file).unwrap_or_default()) else {
+    let Some(commit) = pinned_in(&root) else {
         return Ok(());
     };
     if crate::pool::VERSION == commit {
@@ -139,31 +146,46 @@ pub fn pin(commit: &str) -> Result<String> {
         bail!("pin a full 40-character commit, not {commit:?}");
     }
     let root = root().context("not inside a Git repository")?;
-    let file = config_file(&root).context("no citrus.ci or .citrus/project.ci")?;
-    let text = std::fs::read_to_string(&file)?;
-    let line = format!("#![pin(\"{commit}\")]");
-    let updated = if pinned(&text).is_some() {
-        text.lines()
-            .map(|existing| {
-                if pinned(existing).is_some() {
-                    line.clone()
-                } else {
-                    existing.to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n"
+    let file = if root.join(".citrus").is_dir() {
+        let file = root.join(".citrus/pin");
+        std::fs::write(&file, format!("{commit}\n"))?;
+        // A `#![pin]` attribute would contradict the file.
+        if let Some(project) = config_file(&root) {
+            let text = std::fs::read_to_string(&project)?;
+            if pinned(&text).is_some() {
+                let kept: Vec<&str> = text.lines().filter(|line| pinned(line).is_none()).collect();
+                std::fs::write(&project, kept.join("\n") + "\n")?;
+            }
+        }
+        file
     } else {
-        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
-        let at = lines
-            .iter()
-            .position(|existing| existing.trim().starts_with("#![citrus("))
-            .map_or(0, |index| index + 1);
-        lines.insert(at, line);
-        lines.join("\n") + "\n"
+        let file = config_file(&root).context("no citrus.ci or .citrus/")?;
+        let text = std::fs::read_to_string(&file)?;
+        let line = format!("#![pin(\"{commit}\")]");
+        let updated = if pinned(&text).is_some() {
+            text.lines()
+                .map(|existing| {
+                    if pinned(existing).is_some() {
+                        line.clone()
+                    } else {
+                        existing.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        } else {
+            let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            let at = lines
+                .iter()
+                .position(|existing| existing.trim().starts_with("#![citrus("))
+                .map_or(0, |index| index + 1);
+            lines.insert(at, line);
+            lines.join("\n") + "\n"
+        };
+        std::fs::write(&file, updated)?;
+        file
     };
-    std::fs::write(&file, updated)?;
     let held: Vec<String> = crate::pool::binaries()
         .unwrap_or_default()
         .into_iter()
@@ -195,6 +217,21 @@ pub fn pin(commit: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pin_file_wins_over_an_attribute() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, attr) = ("a".repeat(40), "b".repeat(40));
+        std::fs::create_dir_all(dir.path().join(".citrus")).unwrap();
+        std::fs::write(
+            dir.path().join(".citrus/project.ci"),
+            format!("#![citrus(2)]\n#![pin(\"{attr}\")]\n"),
+        )
+        .unwrap();
+        assert_eq!(pinned_in(dir.path()).as_deref(), Some(attr.as_str()));
+        std::fs::write(dir.path().join(".citrus/pin"), format!("{file}\n")).unwrap();
+        assert_eq!(pinned_in(dir.path()).as_deref(), Some(file.as_str()));
+    }
 
     #[test]
     fn reads_only_a_full_commit_pin() {
