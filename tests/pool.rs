@@ -8,6 +8,9 @@ use std::process::{Child, Command, Output, Stdio};
 
 use serde_json::Value;
 
+/// The tests share one database and its queue: one at a time.
+static POOL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const CONFIG: &str = r#"#![citrus(2)]
 #![private("secret.txt")]
 #![prepare(cmd!("sh prep.sh"))]
@@ -121,6 +124,9 @@ fn checks_run_on_the_agents_that_fit_them() {
         eprintln!("CITRUS_TEST_POOL is not set: pool tests skipped");
         return;
     };
+    let _serial = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A clean pool: this test owns the database.
     let reset = Command::new(env!("CARGO_BIN_EXE_citrus"))
         .args(["pool", "--json"])
@@ -265,6 +271,9 @@ fn checks_run_inside_the_declared_image() {
         eprintln!("CITRUS_TEST_POOL is not set: pool tests skipped");
         return;
     };
+    let _serial = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let platform = Command::new("docker")
         .args(["info", "--format", "{{.OSType}}/{{.Architecture}}"])
         .output()
@@ -349,6 +358,9 @@ fn a_stopped_agent_hands_its_checks_back() {
         eprintln!("CITRUS_TEST_POOL is not set: pool tests skipped");
         return;
     };
+    let _serial = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let work = tempfile::tempdir().unwrap();
     let project = work.path().join("project");
     let origin = work.path().join("origin.git");
@@ -439,6 +451,9 @@ fn a_lost_worker_follows_the_pool_run_again() {
         eprintln!("CITRUS_TEST_POOL is not set: pool tests skipped");
         return;
     };
+    let _serial = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let work = tempfile::tempdir().unwrap();
     let project = work.path().join("project");
     let origin = work.path().join("origin.git");
