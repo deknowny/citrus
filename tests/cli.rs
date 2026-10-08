@@ -410,6 +410,17 @@ fn fingerprint_matches_the_documented_format() {
         receipt.to_string_lossy(),
         "ok-400096b708f41a065d8a51d3a379731e4504ee69d50adf1d9c9f993518257018.pass"
     );
+    let (targets, _) = project.json(&["targets", "--fingerprints"]);
+    let ok = targets["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["target"] == "ok")
+        .unwrap();
+    assert_eq!(
+        ok["fingerprint"],
+        "400096b708f41a065d8a51d3a379731e4504ee69d50adf1d9c9f993518257018"
+    );
 }
 
 #[test]

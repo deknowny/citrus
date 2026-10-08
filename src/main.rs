@@ -185,7 +185,11 @@ enum Command {
         action: VersionAction,
     },
     /// Declared checks with their inputs and last result.
-    Targets,
+    Targets {
+        /// Also the current input fingerprint of each check that may be reused.
+        #[arg(long)]
+        fingerprints: bool,
+    },
     /// Artifacts and their input keys (at HEAD, or `--at` another revision).
     Artifacts {
         #[arg(long)]
@@ -518,7 +522,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             Ok(0)
         }
         Command::Version { action } => version_command(&context, action, json),
-        Command::Targets => targets_command(&context, json),
+        Command::Targets { fingerprints } => targets_command(&context, fingerprints, json),
         Command::Artifacts { at } => {
             let revision = context
                 .repo
@@ -1814,7 +1818,12 @@ fn describe_task(info: &state::TaskInfo) -> String {
     }
 }
 
-fn targets_command(context: &Context, json: bool) -> Result<i32> {
+fn targets_command(context: &Context, fingerprints: bool, json: bool) -> Result<i32> {
+    let files = if fingerprints {
+        Some(context.repo.files()?)
+    } else {
+        None
+    };
     let mut rows = Vec::new();
     for target in context.manifest.targets.values() {
         let last = context
@@ -1835,6 +1844,12 @@ fn targets_command(context: &Context, json: bool) -> Result<i32> {
             .map(|(check, (_, last))| {
                 let mut check = check.clone();
                 check["last_pass"] = json!(last.as_ref().map(|evidence| json!({"run": evidence.run, "seconds_ago": now() as i64 - evidence.created})));
+                if let (Some(files), Some(target)) = (&files, check["target"].as_str().and_then(|name| context.manifest.targets.get(name)))
+                    && target.cache
+                    && let Ok(found) = manifest::fingerprint(&context.repo.root, files, target, &context.repo.config.toolchain_files)
+                {
+                    check["fingerprint"] = json!(found.value);
+                }
                 check
             })
             .collect();
