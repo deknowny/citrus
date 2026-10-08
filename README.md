@@ -54,6 +54,7 @@ their results shared, reusable and short.
 | `citrus why <target>` | Why it is needed, and which inputs changed since its last pass |
 | `citrus integrate [--push]` | Merge the base branch, keep checks the incoming changes do not touch, re-check the rest, and fast-forward the base when green |
 | `citrus tasks` / `citrus task <title>` / `citrus agree <key>` | Every worktree as a task — branch, unmerged commits, runs, what it does and what blocks it — and the agreements between tasks |
+| `citrus version reserve <start> --scope …` / `check` / `source` / `list` | Release versions held by one committed source; a retry gets the same one, another source the next free one ([docs/releases.md](docs/releases.md#versions)) |
 | `citrus diff <env>` / `citrus apply <env> --approve` | What an environment runs versus what HEAD builds; build what is missing by input key and roll it out by digest ([docs/design/declarative.md](docs/design/declarative.md)) |
 | `citrus release start <unit> --approve` | Release a unit from HEAD: version → build → deploy → postcheck with gates, an environment lock, recovery of interrupted steps and rollback ([docs/releases.md](docs/releases.md)) |
 | `citrus` | What can be done here: Citrus commands plus the project's own `commands` |

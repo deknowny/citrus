@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
@@ -43,17 +42,21 @@ fn proven() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Version {
-    /// Reserves and prints the version; `{version}` is the version after the latest.
-    pub reserve: Vec<String>,
-    /// Regex-free capture: the text after this prefix on a line of the output.
-    #[serde(default = "release_prefix")]
-    pub prefix: String,
     /// Version to start from when Citrus has no passed release of this unit yet.
     pub initial: String,
+    /// What the version is for (the images it names); default: the unit's name.
+    #[serde(default)]
+    pub scope: Vec<String>,
 }
 
-fn release_prefix() -> String {
-    "RELEASE=".into()
+impl Version {
+    pub fn scope(&self, unit: &str) -> Result<Vec<String>> {
+        if self.scope.is_empty() {
+            crate::versions::scope(&[unit.to_owned()])
+        } else {
+            crate::versions::scope(&self.scope)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,17 +155,6 @@ pub fn bump(version: &str) -> Option<String> {
     Some(format!("{}.{}.{}{suffix}", parts[0], parts[1], parts[2]))
 }
 
-fn substitute(template: &[String], values: &BTreeMap<&str, String>) -> Vec<String> {
-    template
-        .iter()
-        .map(|part| {
-            values.iter().fold(part.clone(), |text, (key, value)| {
-                text.replace(&format!("{{{key}}}"), value)
-            })
-        })
-        .collect()
-}
-
 #[derive(Debug)]
 pub struct Start {
     pub unit: String,
@@ -220,7 +212,7 @@ pub fn dry_run(
     ]);
     let mut commands = Vec::new();
     if let (None, Some(spec)) = (given, &unit.version) {
-        commands.push(serde_json::json!({"step": "version", "run": substitute(&spec.reserve, &values).join(" ")}));
+        commands.push(serde_json::json!({"step": "version", "run": format!("reserve {} or the next free version for {}", values["version"], spec.scope(unit_name)?.join(","))}));
     }
     for step in &unit.steps {
         commands.push(serde_json::json!({
@@ -522,27 +514,7 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
             ])
         };
         let (works, recovering) = if state.name == "version" {
-            let spec = unit
-                .version
-                .as_ref()
-                .context("version step without [version]")?;
-            let next = if release.previous.is_empty() {
-                spec.initial.clone()
-            } else {
-                bump(&release.previous)
-                    .with_context(|| format!("cannot bump version {}", release.previous))?
-            };
-            let mut values = values(&version);
-            values.insert("version", next);
-            let argv = substitute(&spec.reserve, &values);
-            (
-                vec![Work::Process {
-                    argv,
-                    env: Vec::new(),
-                    portable: true,
-                }],
-                false,
-            )
+            (Vec::new(), false)
         } else {
             let step = steps
                 .iter()
@@ -564,38 +536,41 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
         let started = now();
         let mut code = 0;
         if state.name == "version" {
-            let Some(Work::Process { argv, .. }) = works.first() else {
-                bail!("the version step reserves with a command");
-            };
-            let (program, args) = argv.split_first().context("empty version command")?;
-            let output = Command::new(program)
-                .args(args)
-                .current_dir(&context.repo.root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .spawn()?
-                .wait_with_output()?;
-            code = i64::from(output.status.code().unwrap_or(-1));
-            let text = String::from_utf8_lossy(&output.stdout);
-            print!("{text}");
-            let prefix = &unit
+            let spec = unit
                 .version
                 .as_ref()
-                .map(|spec| spec.prefix.clone())
+                .context("version step without `version`")?;
+            let start = if release.previous.is_empty() {
+                spec.initial.clone()
+            } else {
+                bump(&release.previous)
+                    .with_context(|| format!("cannot bump version {}", release.previous))?
+            };
+            let free_version = context
+                .project
+                .as_ref()
+                .map(|project| project.free_version.clone())
                 .unwrap_or_default();
-            if code == 0 {
-                match text
-                    .lines()
-                    .rev()
-                    .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
-                {
-                    Some(found) if !found.trim().is_empty() => {
-                        version = found.trim().to_owned();
-                        context.store.set_release_version(id, &version)?;
-                    }
-                    _ => println!(
-                        "CITRUS_NOTE no line starting with {prefix:?} in the version output"
-                    ),
+            match crate::versions::reserve(
+                &context.store,
+                &context.repo.root,
+                &free_version,
+                &start,
+                &spec.scope(&release.unit)?,
+                &crate::versions::Holder {
+                    owner: &release.worktree,
+                    source: &release.commit,
+                    agent: &release.agent,
+                },
+            ) {
+                Ok(reserved) => {
+                    println!("reserved {reserved}");
+                    version = reserved;
+                    context.store.set_release_version(id, &version)?;
+                }
+                Err(error) => {
+                    println!("error: {error:#}");
+                    code = 1;
                 }
             }
         } else {
@@ -663,21 +638,5 @@ mod tests {
         assert_eq!(bump("0.49.258-clyer").as_deref(), Some("0.49.259-clyer"));
         assert_eq!(bump("1.2.9").as_deref(), Some("1.2.10"));
         assert_eq!(bump("v1"), None);
-    }
-
-    #[test]
-    fn substitutes_known_values() {
-        let values = BTreeMap::from([("version", "1.0.1".to_owned())]);
-        assert_eq!(
-            substitute(
-                &[
-                    "deploy".into(),
-                    "RELEASE={version}".into(),
-                    "{other}".into()
-                ],
-                &values
-            ),
-            vec!["deploy", "RELEASE=1.0.1", "{other}"]
-        );
     }
 }

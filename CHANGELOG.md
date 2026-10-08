@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `citrus version reserve <start> --scope a,b` holds a release version for
+  the committed source and prints it; `check`, `source` and `list` read
+  them. The project's `free_version = run(...)` hook skips versions
+  published elsewhere. Breaking: a release's `version` is now `version {
+  initial = "…" scope = [...] }` and reserves through Citrus; the command
+  form and `prefix` are gone.
+- Several processes opening a new state database at once no longer fail
+  with a disk I/O error.
+- The overview no longer suggests the removed `citrus add`.
+- A check whose program cannot start fails with `cannot run <program>` in
+  its first error instead of ending the run as `unknown`.
+
 Breaking: the configuration language is reshaped (docs/design/language.md).
 Every element does something, names are bare, data is quoted:
 

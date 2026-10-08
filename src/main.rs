@@ -22,6 +22,7 @@ mod report;
 mod resources;
 mod state;
 mod tasks;
+mod versions;
 
 use std::io::IsTerminal;
 use std::time::Duration;
@@ -175,6 +176,11 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         revision: i64,
     },
+    /// Release versions held by committed sources: reserve one, check or list them.
+    Version {
+        #[command(subcommand)]
+        action: VersionAction,
+    },
     /// Declared checks with their inputs and last result.
     Targets,
     /// Artifacts and their input keys (at HEAD, or `--at` another revision).
@@ -229,6 +235,32 @@ enum Command {
     ApplyWorker { release: String },
     #[command(hide = true)]
     RefreshResources,
+}
+
+#[derive(Subcommand, Debug)]
+enum VersionAction {
+    /// Hold the first free version at or after START for this commit and print it.
+    Reserve {
+        start: String,
+        /// What it is for: the images or packages published under it.
+        #[arg(long, required = true)]
+        scope: Vec<String>,
+    },
+    /// Fail when VERSION belongs to another worktree or commit.
+    Check {
+        version: String,
+        /// Only reservations for these names (default: what this commit holds).
+        #[arg(long)]
+        scope: Vec<String>,
+    },
+    /// Print the commit VERSION was reserved for.
+    Source { version: String },
+    /// Reserved versions, newest last.
+    List {
+        /// Only those reserved in the last N days.
+        #[arg(long)]
+        days: Option<f64>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -443,6 +475,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             }
             Ok(0)
         }
+        Command::Version { action } => version_command(&context, action, json),
         Command::Targets => targets_command(&context, json),
         Command::Artifacts { at } => {
             let revision = context
@@ -1303,11 +1336,11 @@ fn overview(context: &mut Context, json: bool) -> Result<i32> {
             "citrus agree <key> --terms … --reopen … --evidence …",
             "record who does what between tasks",
         ),
-        ("citrus targets", "declared checks and their last result"),
         (
-            "citrus add <check> --inputs …",
-            "declare a new check instead of a wrapper script",
+            "citrus version reserve <start> --scope …",
+            "hold a release version for this commit",
         ),
+        ("citrus targets", "declared checks and their last result"),
         ("citrus doctor", "is this repository set up correctly"),
     ];
     if json {
@@ -1628,6 +1661,96 @@ fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool)
 }
 
 /// A task's description in a line: what it does, what blocks it.
+fn version_command(context: &Context, action: VersionAction, json: bool) -> Result<i32> {
+    let committed = || -> Result<(String, String)> {
+        let repo = &context.repo;
+        anyhow::ensure!(
+            repo.git(&["status", "--porcelain", "--untracked-files=normal"])?
+                .is_empty(),
+            "commit the source first: a version belongs to a committed source"
+        );
+        Ok((
+            repo.root.display().to_string(),
+            repo.git(&["rev-parse", "HEAD"])?,
+        ))
+    };
+    match action {
+        VersionAction::Reserve { start, scope } => {
+            let scope = versions::scope(&scope)?;
+            let (owner, source) = committed()?;
+            let free_version = context
+                .project
+                .as_ref()
+                .map(|project| project.free_version.clone())
+                .unwrap_or_default();
+            let agent = exec::agent();
+            let version = versions::reserve(
+                &context.store,
+                &context.repo.root,
+                &free_version,
+                &start,
+                &scope,
+                &versions::Holder {
+                    owner: &owner,
+                    source: &source,
+                    agent: &agent,
+                },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "version": version, "scope": scope, "source": source})
+                    )?
+                );
+            } else {
+                println!("{version}");
+            }
+        }
+        VersionAction::Check { version, scope } => {
+            let scope = if scope.is_empty() {
+                None
+            } else {
+                Some(versions::scope(&scope)?)
+            };
+            let (owner, source) = committed()?;
+            versions::check(&context.store, &version, scope.as_deref(), &owner, &source)?;
+        }
+        VersionAction::Source { version } => {
+            println!("{}", versions::source(&context.store, &version)?);
+        }
+        VersionAction::List { days } => {
+            let since = days.map_or(0, |days| now() as i64 - (days * 86400.0) as i64);
+            let rows: Vec<_> = context
+                .store
+                .reservations(None)?
+                .into_iter()
+                .filter(|r| r.created >= since)
+                .collect();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"schema": SCHEMA, "reservations": rows}))?
+                );
+            } else {
+                for r in rows {
+                    println!(
+                        "{:<22} {} · {} · {} · {} ago",
+                        r.version,
+                        r.scope.join(","),
+                        &r.source[..r.source.len().min(8)],
+                        std::path::Path::new(&r.owner)
+                            .file_name()
+                            .map_or(r.owner.clone(), |name| name.to_string_lossy().into_owned()),
+                        age(now() as i64 - r.created),
+                    );
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
 fn describe_task(info: &state::TaskInfo) -> String {
     let mut parts = Vec::new();
     if !info.title.is_empty() {

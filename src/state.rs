@@ -108,6 +108,17 @@ CREATE TABLE IF NOT EXISTS artifact_builds (
     created INTEGER NOT NULL,
     PRIMARY KEY (artifact, key)
 );
+CREATE TABLE IF NOT EXISTS versions (
+    version TEXT NOT NULL,
+    item TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    start TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    source TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    PRIMARY KEY (version, item)
+);
 CREATE TABLE IF NOT EXISTS facts (
     name TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -200,6 +211,21 @@ pub struct Agreement {
     pub updated: i64,
 }
 
+/// A version held by one task's committed source for a set of names (the
+/// images or packages it publishes); another set may hold the same version.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Reservation {
+    pub version: String,
+    pub scope: Vec<String>,
+    /// The version asked for; a retry with the same start returns this one.
+    pub start: String,
+    /// The worktree whose task holds it.
+    pub owner: String,
+    pub source: String,
+    pub agent: String,
+    pub created: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Release {
     pub id: String,
@@ -271,6 +297,14 @@ pub struct Store {
 impl Store {
     pub fn open(dir: &Path) -> Result<Store> {
         crate::repo::private_dir(dir)?;
+        // Processes opening a new database at once must not race to create
+        // it and switch it to WAL: one sets it up while the others wait.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("state.lock"))?;
+        lock.lock()?;
         let conn = Connection::open(dir.join("state.db"))?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -695,6 +729,58 @@ impl Store {
                     revision: row.get(4)?,
                     owner: row.get(5)?,
                     updated: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Hold `reservation.version` for every name of its scope at once;
+    /// false when another reservation holds it for one of them.
+    pub fn try_reserve(&self, reservation: &Reservation) -> Result<bool> {
+        let transaction = self.conn.unchecked_transaction()?;
+        for item in &reservation.scope {
+            let inserted = transaction.execute(
+                "INSERT INTO versions (version, item, scope, start, owner, source, agent, created)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT DO NOTHING",
+                params![
+                    reservation.version,
+                    item,
+                    reservation.scope.join(","),
+                    reservation.start,
+                    reservation.owner,
+                    reservation.source,
+                    reservation.agent,
+                    reservation.created
+                ],
+            )?;
+            if inserted == 0 {
+                return Ok(false);
+            }
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Reservations, oldest first; `version` narrows them to one version.
+    pub fn reservations(&self, version: Option<&str>) -> Result<Vec<Reservation>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT version, scope, start, owner, source, agent, created FROM versions
+             WHERE ?1 IS NULL OR version = ?1 ORDER BY created, version",
+        )?;
+        Ok(statement
+            .query_map([version], |row| {
+                Ok(Reservation {
+                    version: row.get(0)?,
+                    scope: row
+                        .get::<_, String>(1)?
+                        .split(',')
+                        .map(str::to_owned)
+                        .collect(),
+                    start: row.get(2)?,
+                    owner: row.get(3)?,
+                    source: row.get(4)?,
+                    agent: row.get(5)?,
+                    created: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)

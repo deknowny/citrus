@@ -317,6 +317,9 @@ pub struct Project {
     pub labels: Vec<(String, Cond)>,
     /// Prints `SIGNAL <name>` lines for the changed paths (in CITRUS_PATHS).
     pub signals: Vec<String>,
+    /// Prints the first free version at or after CITRUS_VERSION for the names in CITRUS_SCOPE.
+    #[serde(skip)]
+    pub free_version: Vec<String>,
     #[serde(skip)]
     pub releases: BTreeMap<String, crate::release::Unit>,
     #[serde(skip)]
@@ -376,6 +379,7 @@ pub fn compile(graph: &Graph) -> Result<Project, Error> {
                         "receipts",
                         "after_merge",
                         "signals",
+                        "free_version",
                         "cache",
                     ],
                 )?;
@@ -392,6 +396,9 @@ pub fn compile(graph: &Graph) -> Result<Project, Error> {
                 }
                 if let Some(Value::Action(action)) = decl.field("signals") {
                     project.signals = argv(action)?;
+                }
+                if let Some(Value::Action(action)) = decl.field("free_version") {
+                    project.free_version = argv(action)?;
                 }
                 project.logs = optional_string(decl, "logs")?;
                 project.toolchain = strings(decl, "toolchain")?;
@@ -1338,8 +1345,19 @@ pub fn execute(step: &Step, root: &Path, stdout_to_stderr: bool) -> anyhow::Resu
                     std::io::stderr().as_fd().try_clone_to_owned()?,
                 ));
             }
-            let status = command.status()?;
-            Ok(status.code().unwrap_or(-1))
+            // A program that cannot start fails its check like a shell would
+            // (127), with the reason in the log, rather than ending the run.
+            match command.status() {
+                Ok(status) => Ok(status.code().unwrap_or(-1)),
+                Err(error) => {
+                    eprintln!("error: cannot run {program}: {error}");
+                    Ok(if error.kind() == std::io::ErrorKind::NotFound {
+                        127
+                    } else {
+                        126
+                    })
+                }
+            }
         }
         Work::WaitTcp { address, timeout } => {
             let until = deadline(*timeout);
@@ -1635,19 +1653,16 @@ fn release_json(decl: &Decl) -> Result<serde_json::Value, Error> {
     }
     none_as_word(&mut object, &["checks"]);
     if let Some(version) = value_block(decl, "version") {
-        known_fields(&version, &["initial", "prefix"])?;
-        let Some(Value::Action(reserve)) = &version.value else {
+        known_fields(&version, &["initial", "scope"])?;
+        known_children(&version, &[])?;
+        if version.value.is_some() || version.field("initial").is_none() {
             return Err(Error::at(
                 version.span,
-                "`version` is the command that reserves a version",
+                "`version` says where versions start and what they are for",
             )
-            .help(
-                "version = make(\"reserve-version\", VERSION: version) { initial = \"1.0.0\" }",
-            ));
-        };
-        let mut spec = fields_json(&version, &[])?;
-        spec.insert("reserve".into(), argv(reserve)?.into());
-        object.insert("version".into(), spec.into());
+            .help("version { initial = \"1.0.0\"  scope = [\"api-image\"] }"));
+        }
+        object.insert("version".into(), fields_json(&version, &[])?.into());
     }
     if let Some(rollback) = value_block(decl, "rollback") {
         object.insert("rollback".into(), release_step_json(&rollback)?);

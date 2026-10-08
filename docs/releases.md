@@ -11,9 +11,11 @@ release web {
   environment = web-production     # one release at a time here, across worktrees
   checks = proven                  # default; `none`: no check gate
 
-  # Reserves and prints RELEASE=<version>; `version` is the one after the latest.
-  version = make("version-reserve", START: version) {
+  # The version after the last passed release, or the first free one after
+  # it; held for this commit and the names it publishes.
+  version {
     initial = "1.4.0"
+    scope = ["web-image"]          # default: the unit's name
   }
 
   step build = make("image", VERSION: version)
@@ -33,8 +35,32 @@ release web {
 
 Values Citrus fills in: `version` (being reserved, released, or the
 rollback target), `previous` (last passed release), `commit`, `unit`; inside
-strings write `{version}`. `version` also takes `prefix` (default
-`"RELEASE="`), the text before the version in the output of its command.
+strings write `{version}`.
+
+## Versions
+
+A version belongs to one committed source and the names it publishes (its
+scope). `citrus version reserve 1.4.0 --scope web-image` holds the first free
+version at or after 1.4.0 and prints it; a retry from the same commit gets the
+same version, another commit gets the next one. Other names may use the same
+number. `citrus version check <version>` fails when the version belongs to
+another worktree or commit: put it in front of anything that publishes.
+`citrus version source <version>` prints the commit it was reserved for, and
+`citrus version list --days 2` shows recent ones. A release's `version` step
+reserves the same way.
+
+Versions published outside Citrus are reported by the project's
+`free_version` hook:
+
+```
+project {
+  # Prints the first version at or after $CITRUS_VERSION that the registry
+  # does not have for any name in $CITRUS_SCOPE (comma-separated).
+  free_version = run("scripts/registry.sh", "free-version")
+}
+```
+
+It prints the version on its last line (a `NAME=` prefix is ignored).
 
 ## Commands
 

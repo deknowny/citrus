@@ -794,8 +794,7 @@ const RELEASES: &str = r#"
 # The test app.
 release app {
   environment = prod
-  # Reserves the next free version; prints RELEASE=<version>.
-  version = run("sh", "-c", "echo reserving {version}; echo RELEASE={version}") {
+  version {
     initial = "1.0.0-app"
   }
   step build = run("sh", "-c", "echo built {version}")
@@ -810,7 +809,14 @@ release app {
 "#;
 
 fn release_project() -> Project {
-    let project = Project::new(&format!("project {{\n  main = \"main\"\n}}\n{RELEASES}"));
+    let project = Project::new(&format!(
+        "project {{\n  main = \"main\"\n  free_version = run(\"sh\", \"free.sh\")\n}}\n{RELEASES}"
+    ));
+    // The registry: 1.0.5-app is already published.
+    project.write(
+        "free.sh",
+        "if [ \"$CITRUS_VERSION\" = 1.0.5-app ]; then echo RELEASE=1.0.6-app; else echo RELEASE=$CITRUS_VERSION; fi\n",
+    );
     project.write("deploy.sh", "if [ -f .fail ]; then echo 'Error: cluster unreachable'; exit 1; fi\nif [ -f .slow ]; then sleep 30; fi\necho deployed $1\n");
     project.write(".gitignore", ".scratch/\n.fail\n.slow\n");
     project.git(&["add", "-A"]);
@@ -898,6 +904,121 @@ fn release_runs_steps_with_versions_and_gates() {
             .as_str()
             .unwrap()
             .contains("commit")
+    );
+}
+
+#[test]
+fn versions_belong_to_one_source_and_skip_taken_ones() {
+    let project = release_project();
+    let text = |args: &[&str]| {
+        let output = project.citrus(&[args, &["--text"]].concat());
+        (
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.success(),
+        )
+    };
+    let reserve = |start: &str, scope: &str| text(&["version", "reserve", start, "--scope", scope]);
+    assert_eq!(reserve("1.0.0-app", "app-image").0, "1.0.0-app");
+    // A retry of the same source gets its version back.
+    assert_eq!(reserve("1.0.0-app", "app-image").0, "1.0.0-app");
+    // Other images may use the same number; overlapping ones may not.
+    assert_eq!(reserve("1.0.0-app", "docs-image").0, "1.0.0-app");
+    assert_eq!(reserve("1.0.0-app", "web-image,app-image").0, "1.0.1-app");
+    // free_version says what is published outside Citrus.
+    assert_eq!(reserve("1.0.5-app", "app-image").0, "1.0.6-app");
+    assert!(!reserve("one", "app-image").2);
+    let head = || {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(project.root())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    assert_eq!(text(&["version", "source", "1.0.0-app"]).0, head());
+    assert!(text(&["version", "check", "1.0.0-app"]).2);
+
+    project.write("src/a.txt", "changed\n");
+    assert!(
+        reserve("2.0.0", "app-image").1.contains("commit"),
+        "a dirty source cannot hold a version"
+    );
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "change",
+    ]);
+    let (_, error, ok) = text(&["version", "check", "1.0.0-app", "--scope", "app-image"]);
+    assert!(!ok && error.contains("reserve a new version"), "{error}");
+    assert!(
+        text(&["version", "check", "9.9.9"]).2,
+        "an unreserved version passes"
+    );
+    assert_eq!(reserve("1.0.0-app", "app-image").0, "1.0.2-app");
+    let (list, _) = project.json(&["version", "list"]);
+    assert_eq!(list["reservations"].as_array().unwrap().len(), 5, "{list}");
+
+    // A release reserves its own version for its scope (the unit's name).
+    assert_eq!(project.json(&["run"]).1, 0);
+    let (release, code) = project.json(&["release", "start", "app", "--approve"]);
+    assert_eq!(code, 0, "{release}");
+    assert_eq!(release["release"]["version"], "1.0.0-app");
+    assert_eq!(text(&["version", "source", "1.0.0-app"]).0, head());
+}
+
+#[test]
+fn parallel_reservations_of_overlapping_images_get_distinct_versions() {
+    let project = release_project();
+    let children: Vec<_> = (0..8)
+        .map(|i| {
+            Command::new(env!("CARGO_BIN_EXE_citrus"))
+                .args([
+                    "version",
+                    "reserve",
+                    "3.0.0",
+                    "--scope",
+                    &format!("shared,own-{i}"),
+                    "--text",
+                ])
+                .current_dir(project.root())
+                .env("CITRUS_AGENT", "test")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let mut versions: Vec<String> = children
+        .into_iter()
+        .map(|child| {
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        })
+        .collect();
+    versions.sort();
+    versions.dedup();
+    assert_eq!(versions.len(), 8, "{versions:?}");
+}
+
+#[test]
+fn a_check_whose_program_is_missing_fails_with_the_reason() {
+    let project =
+        Project::new("check gone = run(\"no-such-program-citrus\") {\n  paths = [\"src/**\"]\n}\n");
+    let (run, code) = project.json(&["run", "gone"]);
+    assert_eq!(code, 1, "{run}");
+    let target = &run["targets"][0];
+    assert_eq!(target["result"], "failed", "{run}");
+    assert!(
+        target["first_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot run no-such-program-citrus"),
+        "{run}"
     );
 }
 

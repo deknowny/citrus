@@ -79,6 +79,8 @@ variable is a string (`group "{vpn}"`).
 project {
   main = "origin/main"   # what "changed" is measured against
   runner = builders      # where checks run unless they say otherwise
+  # Versions a registry already has (docs/releases.md#versions).
+  free_version = run("scripts/registry.sh", "free-version")
 }
 ```
 
@@ -204,9 +206,10 @@ each one in the Citrus protocol (docs/protocol.md).
 # Clyer bot backend and migrations to k3s.
 release clyer {
   environment = clyer-production
-  # Reserves and prints RELEASE=<version>.
-  version = make("release-version-reserve", RELEASE: version) {
+  # Held for this commit and these images (docs/releases.md#versions).
+  version {
     initial = "0.1.0-clyer"
+    scope = ["clyer-backend", "clyer-migrations"]
   }
   step prepare = make("release-prepare-clyer", RELEASE: version)
   step deploy = make("clyer-k3s-release-deploy", RELEASE: version) {

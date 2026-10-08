@@ -44,7 +44,9 @@ commands in `next`.
 9. **Release** — `citrus release` lists units; `citrus release start <unit>
    --dry-run` shows the exact commands; `citrus release start <unit> --approve`
    runs them. After a failure or a lost session: `citrus release resume <id>
-   --approve` (never start a second release over an `unknown` one).
+   --approve` (never start a second release over an `unknown` one). Publishing
+   by hand: `citrus version reserve <start> --scope <images>` first; the
+   version is then this commit's alone.
 10. **Is it helping** — `citrus stats`. `citrus` alone lists what can be done here.
 
 Exit codes: 0 passed or still running (`--detach`), 1 a check failed,
