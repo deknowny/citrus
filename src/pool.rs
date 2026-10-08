@@ -48,8 +48,7 @@ pub fn url() -> Option<String> {
         let value = value.trim().to_owned();
         return (!value.is_empty()).then_some(value);
     }
-    let home = std::env::var_os("HOME")?;
-    let text = std::fs::read_to_string(Path::new(&home).join(".config/citrus/pool")).ok()?;
+    let text = std::fs::read_to_string(home().join(".config/citrus/pool")).ok()?;
     text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
@@ -618,6 +617,23 @@ fn load_average() -> f32 {
     if read >= 1 { values[0] as f32 } else { 0.0 }
 }
 
+/// HOME, or the account's home directory when a service manager leaves it unset.
+fn home() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home);
+    }
+    // SAFETY: getpwuid returns a pointer into static storage or null; the
+    // directory string is copied before any other call can overwrite it.
+    unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        if !entry.is_null() && !(*entry).pw_dir.is_null() {
+            let dir = std::ffi::CStr::from_ptr((*entry).pw_dir);
+            return PathBuf::from(dir.to_string_lossy().into_owned());
+        }
+    }
+    PathBuf::from("/tmp")
+}
+
 fn cache_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("CITRUS_AGENT_CACHE").filter(|value| !value.is_empty()) {
         return PathBuf::from(dir);
@@ -625,8 +641,7 @@ fn cache_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
         return PathBuf::from(dir).join("citrus/agent");
     }
-    let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-    PathBuf::from(home).join(".cache/citrus/agent")
+    home().join(".cache/citrus/agent")
 }
 
 fn short_hash(text: &str) -> String {
@@ -988,10 +1003,7 @@ fn machine_files(repo: &str) -> PathBuf {
     let root = std::env::var_os("CITRUS_AGENT_FILES")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()))
-                .join(".config/citrus/files")
-        });
+        .unwrap_or_else(|| home().join(".config/citrus/files"));
     root.join(name)
 }
 
