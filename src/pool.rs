@@ -319,6 +319,18 @@ pub fn run(
         );
     }
     let mut client = connect(&url)?;
+    // Queued before (a worker that stopped): follow it, from its first line.
+    if let Some(row) = client.query_opt("select ref_name from citrus.runs where id = $1", &[&id])? {
+        let refname: String = row.get(0);
+        on_line(format!("CITRUS_STAGE following {id} in the pool again"))?;
+        let outcome = follow(&mut client, id, on_line);
+        let _ = client.execute(
+            "update citrus.runs set state = 'closed', closed = now() where id = $1 and state = 'open'",
+            &[&id],
+        );
+        delete_ref(&context.repo, &refname);
+        return outcome;
+    }
     on_line(format!(
         "CITRUS_STAGE recording the snapshot for the pool {}",
         redact(&url)
