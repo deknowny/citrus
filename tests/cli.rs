@@ -1873,26 +1873,26 @@ fn checks_declared_in_citrus_ci_run_their_steps_and_are_reused() {
     let project = ci_project(CI);
     project.write("src/a.txt", "ok\n");
     project.write("src/b.txt", "bad\n");
-    let (run, code) = project.json(&["run", "check_a", "check_b"]);
+    let (run, code) = project.json(&["run", "check-a", "check-b"]);
     assert_eq!(code, 1, "{run}");
-    assert_eq!(target(&run, "check_a")["result"], "passed");
+    assert_eq!(target(&run, "check-a")["result"], "passed");
     assert!(
-        target(&run, "check_b")["first_error"]
+        target(&run, "check-b")["first_error"]
             .as_str()
             .unwrap()
             .contains("src/b.txt is not ok"),
         "{run}"
     );
-    let (again, _) = project.json(&["run", "check_a"]);
-    assert_eq!(target(&again, "check_a")["result"], "reused");
+    let (again, _) = project.json(&["run", "check-a"]);
+    assert_eq!(target(&again, "check-a")["result"], "reused");
 
     // Changing what a check runs, here a function it calls, invalidates its earlier pass.
     project.write(
         "citrus.ci",
         &CI.replace("text.contains(\"ok\")", "text.trim().contains(\"ok\")"),
     );
-    let (changed, _) = project.json(&["run", "check_a"]);
-    assert_eq!(target(&changed, "check_a")["result"], "passed", "{changed}");
+    let (changed, _) = project.json(&["run", "check-a"]);
+    assert_eq!(target(&changed, "check-a")["result"], "passed", "{changed}");
 
     let (checked, code) = project.json(&["check"]);
     assert_eq!(code, 0, "{checked}");
@@ -2169,16 +2169,16 @@ check test_app {
     project.write("crates/other/src/lib.rs", "\n");
     project.commit("crates");
     assert_eq!(
-        target(&project.json(&["run", "test_app"]).0, "test_app")["result"],
+        target(&project.json(&["run", "test-app"]).0, "test-app")["result"],
         "passed"
     );
     project.write("crates/other/src/lib.rs", "// unrelated\n");
-    let (again, _) = project.json(&["run", "test_app"]);
-    assert_eq!(target(&again, "test_app")["result"], "reused", "{again}");
+    let (again, _) = project.json(&["run", "test-app"]);
+    assert_eq!(target(&again, "test-app")["result"], "reused", "{again}");
     project.write("crates/lib/src/lib.rs", "// a dependency changed\n");
-    let (changed, _) = project.json(&["run", "test_app"]);
+    let (changed, _) = project.json(&["run", "test-app"]);
     assert_eq!(
-        target(&changed, "test_app")["result"],
+        target(&changed, "test-app")["result"],
         "passed",
         "{changed}"
     );
@@ -2371,7 +2371,7 @@ check whole {
     assert_eq!(targets(&[]), serde_json::json!(["unit", "whole"]));
     assert_eq!(
         targets(&["--profile", "e2e"]),
-        serde_json::json!(["e2e_only", "slow_only", "whole"])
+        serde_json::json!(["e2e-only", "slow-only", "whole"])
     );
     let unknown = project.json(&["plan", "--profile", "nightly"]).0;
     assert!(
@@ -2450,18 +2450,18 @@ check after_backend {
     let plan = plan_for(&[("scripts/run.sh", "x\n")]);
     assert_eq!(
         plan["targets"],
-        serde_json::json!(["pipeline.contract_alone"]),
+        serde_json::json!(["pipeline.contract-alone"]),
         "{plan}"
     );
     let plan = plan_for(&[("scripts/run.sh", "y\n"), ("README.md", "x\n")]);
     assert_eq!(
         plan["targets"],
-        serde_json::json!(["pipeline.contract_main"]),
+        serde_json::json!(["pipeline.contract-main"]),
         "{plan}"
     );
     let (full, _) = project.json(&["plan"]);
     assert_eq!(
-        full["run"]["pipeline.contract_main"],
+        full["run"]["pipeline.contract-main"],
         serde_json::json!([["run", "make", "plain"]]),
         "{full}"
     );
@@ -2476,7 +2476,7 @@ check after_backend {
     let plan = plan_for(&[("crates/api/lib.rs", "x\n")]);
     assert_eq!(
         plan["targets"],
-        serde_json::json!(["backend", "after_backend"]),
+        serde_json::json!(["backend", "after-backend"]),
         "{plan}"
     );
     let plan = plan_for(&[("crates/clyer/lib.rs", "x\n")]);
@@ -2489,7 +2489,7 @@ check after_backend {
     project.commit("change");
     let (run, _) = project.json(&["run"]);
     assert_eq!(
-        target(&run, "pipeline.contract_main")["result"],
+        target(&run, "pipeline.contract-main")["result"],
         "passed",
         "{run}"
     );
@@ -2842,11 +2842,11 @@ check clyer_only {
     assert_eq!(plan_for("scripts/tool.py\n"), serde_json::json!(["tool"]));
     assert_eq!(
         plan_for("scripts/run.sh\n"),
-        serde_json::json!(["infra.contract_main"])
+        serde_json::json!(["infra.contract-main"])
     );
     assert_eq!(
         plan_for("scripts/run.sh\nclyer/bot.rs\n"),
-        serde_json::json!(["infra.contract", "clyer_only"])
+        serde_json::json!(["infra.contract", "clyer-only"])
     );
 }
 
@@ -2919,7 +2919,7 @@ check platform_only {
     };
     assert_eq!(
         plan_for("platform/lib.rs\n"),
-        serde_json::json!(["vpn.backend", "platform_only"])
+        serde_json::json!(["vpn.backend", "platform-only"])
     );
     assert_eq!(
         plan_for("vpn/backend/main.rs\n"),

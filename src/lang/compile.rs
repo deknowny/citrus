@@ -21,8 +21,18 @@ fn failure(failure: super::interp::Failure) -> Error {
 }
 
 /// An item's external name: `group::check` → `group.check`.
+/// An item's name outside the language (command line, plans, JSON): the
+/// identifier with `-` for `_`, as Cargo does for crate names.
+pub fn dash(name: &str) -> String {
+    name.replace('_', "-")
+}
+
 fn external(segments: &[String]) -> String {
-    segments.join(".")
+    segments
+        .iter()
+        .map(|segment| dash(segment))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// The source text of a span.
@@ -626,7 +636,17 @@ fn release(
         None => "proven".to_owned(),
     };
     let step = |decl: &StepDecl, item_name: String| -> crate::release::Step {
-        let recover = Compiler::names(&decl.attrs, "recover")
+        // A function's name stays as written: it is called, not shown.
+        let recover = decl
+            .attrs
+            .iter()
+            .filter(|attr| attr.name == "recover")
+            .flat_map(|attr| attr.args.iter())
+            .filter_map(|(_, arg)| match arg {
+                Expr::Path(segments, _) => Some(segments.join("::")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
             .first()
             .map(|name| {
                 vec![
@@ -637,7 +657,7 @@ fn release(
             })
             .unwrap_or_default();
         crate::release::Step {
-            name: decl.name.clone(),
+            name: dash(&decl.name),
             run: vec![
                 compiler
                     .script(item_name, decl.span, release_args(), Vec::new())
@@ -654,11 +674,16 @@ fn release(
         version,
         steps: steps
             .iter()
-            .map(|decl| step(decl, format!("step:{}:{}", item.name, decl.name)))
+            .map(|decl| {
+                step(
+                    decl,
+                    format!("step:{}:{}", dash(&item.name), dash(&decl.name)),
+                )
+            })
             .collect(),
-        rollback: rollback.map(|decl| step(decl, format!("rollback:{}", item.name))),
+        rollback: rollback.map(|decl| step(decl, format!("rollback:{}", dash(&item.name)))),
     };
-    unit.validate(&item.name)
+    unit.validate(&dash(&item.name))
         .map_err(|error| Error::at(item.span, format!("{error:#}")))?;
     Ok(unit)
 }
@@ -915,9 +940,9 @@ pub fn compile(
     for item in &program.items {
         match &item.kind {
             ItemKind::Profile => {
-                project.profiles.push(item.name.clone());
+                project.profiles.push(dash(&item.name));
                 let env = compiler.env(&item.attrs)?;
-                project.profile_env.push((item.name.clone(), env));
+                project.profile_env.push((dash(&item.name), env));
             }
             ItemKind::Service { start, ready } => {
                 let limit = match item.attr("limit").and_then(|attr| attr.args.first()) {
@@ -931,7 +956,7 @@ pub fn compile(
                     .as_ref()
                     .map(|body| {
                         vec![compiler.script(
-                            format!("service-start:{}", item.name),
+                            format!("service-start:{}", dash(&item.name)),
                             body.span,
                             Vec::new(),
                             Vec::new(),
@@ -942,7 +967,7 @@ pub fn compile(
                     .as_ref()
                     .map(|body| {
                         vec![compiler.script(
-                            format!("service-ready:{}", item.name),
+                            format!("service-ready:{}", dash(&item.name)),
                             body.span,
                             Vec::new(),
                             Vec::new(),
@@ -950,7 +975,7 @@ pub fn compile(
                     })
                     .unwrap_or_default();
                 project.services.push(Service {
-                    name: item.name.clone(),
+                    name: dash(&item.name),
                     description: item.doc.clone(),
                     start,
                     ready,
@@ -967,7 +992,7 @@ pub fn compile(
                     }
                 }
                 let inherited = Inherited {
-                    group: Some(item.name.clone()),
+                    group: Some(dash(&item.name)),
                     paths: paths.clone(),
                     reads,
                     needs: Compiler::names(&item.attrs, "needs"),
@@ -977,31 +1002,36 @@ pub fn compile(
                     when,
                 };
                 project.groups.push(Group {
-                    name: item.name.clone(),
+                    name: dash(&item.name),
                     owns: paths,
                     span: item.span,
                 });
                 for inner in items {
-                    let name = format!("{}.{}", item.name, inner.name);
+                    let name = format!("{}.{}", dash(&item.name), dash(&inner.name));
                     let compiled = check(&mut compiler, inner, &name, &inherited)?;
                     project.checks.push(compiled);
                 }
             }
             ItemKind::Check { .. } => {
-                let compiled = check(&mut compiler, item, &item.name, &Inherited::default())?;
+                let compiled = check(
+                    &mut compiler,
+                    item,
+                    &dash(&item.name),
+                    &Inherited::default(),
+                )?;
                 project.checks.push(compiled);
             }
             ItemKind::Task { body } => {
                 let step = lowered(body, &[], item.span).unwrap_or_else(|| {
                     compiler.script(
-                        format!("task:{}", item.name),
+                        format!("task:{}", dash(&item.name)),
                         item.span,
                         Vec::new(),
                         Vec::new(),
                     )
                 });
                 project.tasks.push(Task {
-                    name: item.name.clone(),
+                    name: dash(&item.name),
                     about: item.doc.clone().unwrap_or_default(),
                     steps: vec![step],
                     span: item.span,
@@ -1009,15 +1039,15 @@ pub fn compile(
             }
             ItemKind::Release { steps, rollback } => {
                 let unit = release(&mut compiler, item, steps, rollback.as_ref())?;
-                project.releases.insert(item.name.clone(), unit);
+                project.releases.insert(dash(&item.name), unit);
             }
             ItemKind::Artifact => {
                 let built = artifact(&mut compiler, item)?;
-                project.artifacts.insert(item.name.clone(), built);
+                project.artifacts.insert(dash(&item.name), built);
             }
             ItemKind::Environment => {
                 if let Some(env) = environment(&mut compiler, item)? {
-                    project.environments.insert(item.name.clone(), env);
+                    project.environments.insert(dash(&item.name), env);
                 }
             }
             ItemKind::Const { .. } | ItemKind::Fn(_) | ItemKind::Struct { .. } => {}
@@ -1030,9 +1060,9 @@ pub fn compile(
         .flat_map(|item| match &item.kind {
             ItemKind::Group { items } => items
                 .iter()
-                .map(|inner| (format!("{}.{}", item.name, inner.name), inner))
+                .map(|inner| (format!("{}.{}", dash(&item.name), dash(&inner.name)), inner))
                 .collect::<Vec<_>>(),
-            _ => vec![(item.name.clone(), item)],
+            _ => vec![(dash(&item.name), item)],
         })
         .map(|(name, item)| {
             let group = name.split_once('.').map(|(group, _)| group.to_owned());

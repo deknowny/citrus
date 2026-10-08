@@ -16,6 +16,8 @@ Breaking: a new configuration language (docs/design/language.md). Every
 - `run!("…")` and `cmd!("…")` take command lines as in a terminal, without
   a shell. Citrus understands Cargo commands: a check's inputs are the
   packages it builds, and a misspelled subcommand or package is an error.
+- Outside the language names use `-` for `_` (`test_db` → `test-db`),
+  like Cargo crate names; the command line takes either.
 - `match changed` is replaced by checks with exclusive `#[when]`;
   `citrus fmt` is removed until the language has a formatter.
 

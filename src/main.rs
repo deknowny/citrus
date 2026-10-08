@@ -341,7 +341,35 @@ fn main() {
     }
 }
 
+/// Names on the command line may be written as in the language (`test_db`)
+/// or as Citrus shows them (`test-db`).
+fn dashed(command: Option<Command>) -> Option<Command> {
+    let dash = |name: &mut String| *name = lang::compile::dash(name);
+    let mut command = command?;
+    match &mut command {
+        Command::Run { targets, .. } => targets.iter_mut().for_each(dash),
+        Command::Why { target, .. } => dash(target),
+        Command::Log {
+            target: Some(target),
+            ..
+        } => dash(target),
+        Command::Do { task: Some(task) } => dash(task),
+        Command::Diff { environment } | Command::Apply { environment, .. } => dash(environment),
+        Command::Release {
+            action:
+                Some(
+                    ReleaseAction::Start { unit, .. }
+                    | ReleaseAction::Rollback { unit, .. }
+                    | ReleaseAction::History { unit, .. },
+                ),
+        } => dash(unit),
+        _ => {}
+    }
+    Some(command)
+}
+
 fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Result<i32> {
+    let command = dashed(command);
     let mut context = Context::open(profile)?;
     let Some(command) = command else {
         return overview(&mut context, json);

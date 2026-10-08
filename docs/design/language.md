@@ -118,8 +118,10 @@ group backend {
 ```
 
 A **group** is a set of paths and the checks that protect them: a change to
-one of its paths selects its checks. A check in a group is `group.check` on
-the command line and `group::check` in the language. Checks inherit the
+one of its paths selects its checks. A check in a group is `group::check` in the
+language and `group.check` outside it. Outside the language every name is
+written with `-` for `_`, as Cargo does for crates: `service test_db` is
+`test-db` in plans, JSON and on the command line, which takes either. Checks inherit the
 group's `paths`, `reads`, `needs`, `env`, `profile`, `cache` and `when`.
 
 | Attribute | Meaning |

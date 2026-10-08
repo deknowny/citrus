@@ -341,21 +341,25 @@ fn find_body<'a>(
     for item in &program.items {
         match (&item.kind, kind) {
             (ItemKind::Check { body }, "check") | (ItemKind::Task { body }, "task")
-                if item.name == name =>
+                if compile::dash(&item.name) == name =>
             {
                 return Some((body, None));
             }
             (ItemKind::Group { items }, "check") => {
                 for inner in items {
                     if let ItemKind::Check { body } = &inner.kind
-                        && format!("{}.{}", item.name, inner.name) == name
+                        && format!(
+                            "{}.{}",
+                            compile::dash(&item.name),
+                            compile::dash(&inner.name)
+                        ) == name
                     {
                         return Some((body, None));
                     }
                 }
             }
             (ItemKind::Service { start, ready }, "service-start" | "service-ready")
-                if item.name == name =>
+                if compile::dash(&item.name) == name =>
             {
                 let body = if kind == "service-start" {
                     start
@@ -368,13 +372,13 @@ fn find_body<'a>(
             }
             (ItemKind::Release { steps, rollback }, "step" | "rollback") => {
                 let (release, step) = name.split_once(':').unwrap_or((name, "rollback"));
-                if item.name != release {
+                if compile::dash(&item.name) != release {
                     continue;
                 }
                 let decl = if kind == "rollback" {
                     rollback.as_ref()
                 } else {
-                    steps.iter().find(|decl| decl.name == step)
+                    steps.iter().find(|decl| compile::dash(&decl.name) == step)
                 };
                 if let Some(decl) = decl {
                     return Some((
