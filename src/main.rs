@@ -236,6 +236,13 @@ enum Command {
     ApplyWorker { release: String },
     #[command(hide = true)]
     RefreshResources,
+    /// Rewrite v1 `.ci` files in language v2 (one-off, removed with v1).
+    #[command(hide = true)]
+    MigrateV2 {
+        files: Vec<String>,
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -348,6 +355,9 @@ fn main() {
 }
 
 fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Result<i32> {
+    if let Some(Command::MigrateV2 { files, write }) = &command {
+        return migrate_v2(files, *write);
+    }
     let mut context = Context::open(profile)?;
     let Some(command) = command else {
         return overview(&mut context, json);
@@ -640,6 +650,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             context.work(&run)?;
             Ok(0)
         }
+        Command::MigrateV2 { .. } => unreachable!("handled before the context opens"),
         Command::RefreshResources => {
             resources::refresh(&context)?;
             Ok(0)
@@ -1662,6 +1673,38 @@ fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool)
 }
 
 /// A task's description in a line: what it does, what blocks it.
+fn migrate_v2(files: &[String], write: bool) -> Result<i32> {
+    let texts: Vec<String> = files
+        .iter()
+        .map(std::fs::read_to_string)
+        .collect::<std::io::Result<_>>()?;
+    let mut sources = lang::Sources::default();
+    for (path, text) in files.iter().zip(&texts) {
+        sources.add(path.into(), text.clone());
+    }
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let names = lang::migrate::collect(&refs)
+        .map_err(|error| anyhow::anyhow!("{}", sources.render(&error)))?;
+    let mut failed = 0;
+    for (index, (path, text)) in files.iter().zip(&texts).enumerate() {
+        let converted = match lang::migrate::migrate(text, &names) {
+            Ok(converted) => converted,
+            Err(mut error) => {
+                error.span.file = index;
+                eprint!("{}", sources.render(&error));
+                failed += 1;
+                continue;
+            }
+        };
+        if write {
+            std::fs::write(path, converted)?;
+        } else {
+            println!("// ── {path}\n{converted}");
+        }
+    }
+    Ok(i32::from(failed > 0))
+}
+
 fn version_command(context: &Context, action: VersionAction, json: bool) -> Result<i32> {
     let committed = || -> Result<(String, String)> {
         let repo = &context.repo;

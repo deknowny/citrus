@@ -162,7 +162,7 @@ pub fn artifacts(context: &Context) -> Result<BTreeMap<String, Artifact>> {
         .unwrap_or_default();
     for (name, artifact) in &artifacts {
         if artifact.inputs.is_empty() == artifact.inputs_command.is_empty() {
-            bail!("artifact {name}: set inputs to globs or to inputs_of(command)");
+            bail!("artifact {name}: give it #[inputs(\"glob\", …)] or #[inputs(cmd!(\"…\"))]");
         }
     }
     Ok(artifacts)

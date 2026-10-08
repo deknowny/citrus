@@ -436,6 +436,16 @@ impl<'a> Interp<'a> {
                 let Expr::Path(segments, _) = &**callee else {
                     return Err(panic(*span, "not a function"));
                 };
+                // Plan conditions are compiled from their source, not evaluated;
+                // so is a `const fn` that returns one.
+                if segments.len() == 1
+                    && (super::check::CONDITION_FNS.contains(&segments[0].as_str())
+                        || self.fns.get(&segments[0]).is_some_and(|function| {
+                            function.ret.as_ref().is_some_and(|ret| ret.name == "Cond")
+                        }))
+                {
+                    return Ok(Value::Unit);
+                }
                 let mut values = Vec::new();
                 for arg in args {
                     values.push(self.expr(arg)?);
@@ -485,12 +495,18 @@ impl<'a> Interp<'a> {
             }
             Expr::Unary(op, inner, span) => match (*op, self.expr(inner)?) {
                 ("!", Value::Bool(flag)) => Value::Bool(!flag),
+                // A plan condition stays a placeholder (compiled from source).
+                ("!", Value::Unit) => Value::Unit,
                 ("-", Value::Int(number)) => Value::Int(-number),
                 _ => return Err(panic(*span, format!("`{op}` on a wrong value"))),
             },
             Expr::Binary(op, left, right, span) => {
                 if *op == "&&" || *op == "||" {
-                    let first = self.expr(left)?.truthy();
+                    let first = self.expr(left)?;
+                    if first == Value::Unit {
+                        return Ok(Value::Unit);
+                    }
+                    let first = first.truthy();
                     if (*op == "&&" && !first) || (*op == "||" && first) {
                         return Ok(Value::Bool(first));
                     }
@@ -570,7 +586,13 @@ impl<'a> Interp<'a> {
                 for piece in pieces {
                     match piece {
                         CmdPiece::Lit(literal) => text.push_str(literal),
-                        CmdPiece::Expr(expr) => text.push_str(&self.expr(expr)?.text()),
+                        CmdPiece::Expr(expr) => match self.expr(expr)? {
+                            Value::Some(inner) => text.push_str(&inner.text()),
+                            Value::None => {
+                                return Err(fail(expr.span(), "this argument has no value (None)"));
+                            }
+                            value => text.push_str(&value.text()),
+                        },
                     }
                 }
                 out.push(text);

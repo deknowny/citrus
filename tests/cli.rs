@@ -12,24 +12,28 @@ struct Project {
 }
 
 const MAKEFILE: &str = "ok:\n\t@echo fine\nplain:\n\t@echo plain\nfail:\n\t@echo building; echo 'AssertionError: broken thing'; exit 1\nslow:\n\t@sleep 30\n";
-const BASE: &str = r#"citrus 1
+const BASE: &str = r#"#![citrus(2)]
 
-check ok = make("ok") {
-  paths = ["src/*.txt"]
+#[paths("src/*.txt")]
+check ok {
+    run!("make ok")?;
 }
 
-check fail = make("fail") {
-  paths = ["other/*"]
+#[paths("other/*")]
+check fail {
+    run!("make fail")?;
 }
 
-check plain = make("plain") {
-  paths = ["Makefile"]
-  cache = false
+#[paths("Makefile")]
+#[cache(false)]
+check plain {
+    run!("make plain")?;
 }
 
-check slow = make("slow") {
-  paths = ["Makefile"]
-  cache = false
+#[paths("Makefile")]
+#[cache(false)]
+check slow {
+    run!("make slow")?;
 }
 "#;
 
@@ -288,14 +292,19 @@ fn builtin_plan_selects_targets_owning_changed_paths() {
 }
 
 /// Two checks the runner `remote.sh` runs, both selected by a change in lib/.
-const ALPHA_BETA: &str = r#"
-runner builders = run("sh", "remote.sh")
+const ALPHA_BETA: &str = r#"#![runner(cmd!("sh remote.sh"))]
 
+#[paths("lib/**")]
 group lib {
-  paths = ["lib/**"]
-  check alpha = make("ok")
-  check beta = make("ok")
+    check alpha {
+        run!("make ok")?;
+    }
+
+    check beta {
+        run!("make ok")?;
+    }
 }
+
 "#;
 
 #[test]
@@ -376,7 +385,9 @@ fn remote_details_are_read_from_the_linked_log() {
 /// this value was computed by an independent implementation of that spec.
 #[test]
 fn fingerprint_matches_the_documented_format() {
-    let config = "project { toolchain = [\"rust-toolchain.toml\", \".tool-versions\"] }\n";
+    let config = r#"#![toolchain(["rust-toolchain.toml", ".tool-versions"])]
+
+"#;
     let project = Project::new(config);
     project.write("rust-toolchain.toml", "[toolchain]\nchannel = \"1\"\n");
     project.write("src/\u{e9}.txt", "unicode path\n");
@@ -397,7 +408,7 @@ fn fingerprint_matches_the_documented_format() {
         .file_name();
     assert_eq!(
         receipt.to_string_lossy(),
-        "ok-b626444adc1a561321355d57268a67907ae6ee9b450da80d37bf49319f1d1cae.pass"
+        "ok-c2f42fdb9b7ef82e50e76092c108b9cd551701f1a8ff09b2bfee8895d9abbc52.pass"
     );
 }
 
@@ -426,7 +437,9 @@ fn stats_count_reuse_and_saved_time() {
 
 #[test]
 fn status_shows_resources_without_waiting_for_them() {
-    let config = "runner builders = run(\"true\") {\n  status = run(\"sh\", \"res.sh\")\n}\n";
+    let config = r#"#![runner(cmd!("true"), status = cmd!("sh res.sh"))]
+
+"#;
     let project = Project::new(config);
     project.write("res.sh", "sleep 5\necho 'CITRUS_RESOURCE host=root@b1 state=busy operation=remote-test owner=agent-a elapsed_seconds=90'\necho 'other line'\n");
     let started = Instant::now();
@@ -482,7 +495,16 @@ fn doctor_reports_setup_problems() {
     assert_eq!(code, 0, "{healthy}");
     assert_eq!(healthy["ok"], true);
 
-    project.declare("project {\n  logs = \"logs\"\n}\n\ncheck ghost = make(\"ghost\") {\n  paths = [\"missing/*\"]\n}\n");
+    project.declare(
+        r#"#![logs("logs")]
+
+#[paths("missing/*")]
+check ghost {
+    run!("make ghost")?;
+}
+
+"#,
+    );
     let (broken, code) = project.json(&["doctor"]);
     assert_eq!(code, 1);
     let failed: Vec<&str> = broken["findings"]
@@ -586,7 +608,13 @@ fn commit_upstream(origin: &Path, path: &str, content: &str) {
 }
 
 // Changes under web/ select `web`; it is not cached, so a pass is carried by integrate.
-const WEB: &str = "check web = make(\"plain\") {\n  paths = [\"web/**\"]\n  cache = false\n}\n";
+const WEB: &str = r#"#[paths("web/**")]
+#[cache(false)]
+check web {
+    run!("make plain")?;
+}
+
+"#;
 
 #[test]
 fn integrate_keeps_checks_the_incoming_changes_do_not_touch() {
@@ -790,7 +818,9 @@ fn agreements_keep_revisions_and_refuse_stale_updates() {
 
 #[test]
 fn overview_lists_commands_and_the_project_catalog() {
-    let config = "commands release {\n  \"make deploy\" = \"ship it\"\n}\n";
+    let config = r#"#![command("release", "make deploy", "ship it")]
+
+"#;
     let project = Project::new(config);
     let (overview, code) = project.json(&[]);
     assert_eq!(code, 0, "{overview}");
@@ -807,27 +837,39 @@ fn overview_lists_commands_and_the_project_catalog() {
     assert_eq!(targets["targets"].as_array().unwrap().len(), 4);
 }
 
-const RELEASES: &str = r#"
-# The test app.
+const RELEASES: &str = r#"/// Production: one release at a time.
+environment prod;
+
+/// The test app.
+#[environment(prod)]
+#[version(initial = "1.0.0-app")]
 release app {
-  environment = prod
-  version {
-    initial = "1.0.0-app"
-  }
-  step build = run("sh", "-c", "echo built {version}")
-  step deploy = run("sh", "deploy.sh", version) {
-    production = true
-    recover = run("sh", "-c", "echo recovered {version}")
-  }
-  rollback = run("sh", "-c", "echo rolled back to {version} from {previous}") {
-    production = true
-  }
+    step build(r: Release) {
+        run!("sh -c 'echo built {r.version}'")?;
+    }
+
+    #[production]
+    #[recover(recover_app)]
+    step deploy(r: Release) {
+        run!("sh deploy.sh {r.version}")?;
+    }
+
+    #[production]
+    rollback(r: Release) {
+        run!("sh -c 'echo rolled back to {r.version} from {r.previous}'")?;
+    }
 }
+
+fn recover_app(r: Release) -> Result<()> {
+    run!("sh -c 'echo recovered {r.version}'")?;
+    Ok(())
+}
+
 "#;
 
 fn release_project() -> Project {
     let project = Project::new(&format!(
-        "project {{\n  main = \"main\"\n  free_version = run(\"sh\", \"free.sh\")\n}}\n{RELEASES}"
+        "#![main(\"main\")]\n#![free_version(cmd!(\"sh free.sh\"))]\n{RELEASES}"
     ));
     // The registry: 1.0.5-app is already published.
     project.write(
@@ -1024,8 +1066,14 @@ fn parallel_reservations_of_overlapping_images_get_distinct_versions() {
 
 #[test]
 fn a_check_whose_program_is_missing_fails_with_the_reason() {
-    let project =
-        Project::new("check gone = run(\"no-such-program-citrus\") {\n  paths = [\"src/**\"]\n}\n");
+    let project = Project::new(
+        r#"#[paths("src/**")]
+check gone {
+    run!("no-such-program-citrus")?;
+}
+
+"#,
+    );
     let (run, code) = project.json(&["run", "gone"]);
     assert_eq!(code, 1, "{run}");
     let target = &run["targets"][0];
@@ -1060,7 +1108,9 @@ fn failed_release_resumes_from_the_failed_step() {
     let log = String::from_utf8_lossy(&project.citrus(&["release", "log", &id, "--full"]).stdout)
         .into_owned();
     assert_eq!(
-        log.matches("built 1.0.0-app").count(),
+        log.lines()
+            .filter(|line| *line == "built 1.0.0-app")
+            .count(),
         1,
         "build must not repeat: {log}"
     );
@@ -1124,7 +1174,9 @@ fn interrupted_release_keeps_the_environment_and_recovers() {
 
 #[test]
 fn integrate_runs_the_after_merge_hook() {
-    let config = "project {\n  after_merge = run(\"sh\", \"-c\", \"mkdir -p .scratch && echo $0 > .scratch/hook\", before)\n}\n";
+    let config = r#"#![after_merge(cmd!("sh -c 'mkdir -p .scratch && echo $0 > .scratch/hook' {{before}}"))]
+
+"#;
     let project = Project::new(config);
     let origin = with_origin(&project);
     let before = String::from_utf8(
@@ -1148,7 +1200,7 @@ fn integrate_runs_the_after_merge_hook() {
 
     project.write(
         "citrus.ci",
-        &format!("{BASE}\nproject {{\n  after_merge = run(\"false\")\n}}\n"),
+        &format!("{BASE}\n#![after_merge(cmd!(\"false\"))]\n"),
     );
     project.git(&[
         "-c",
@@ -1188,7 +1240,11 @@ fn version_names_the_source_commit() {
 #[test]
 fn logs_and_state_are_private() {
     use std::os::unix::fs::PermissionsExt;
-    let project = Project::new("project {\n  logs = \".private/logs\"\n}\n");
+    let project = Project::new(
+        r#"#![logs(".private/logs")]
+
+"#,
+    );
     project.write(".gitignore", ".scratch/\n.private/\n");
     project.json(&["run", "ok"]);
     for dir in [".private", ".private/logs", ".git/citrus"] {
@@ -1215,24 +1271,23 @@ JSON
 fn a_release_continues_from_what_the_environment_runs() {
     let project = Project::new("");
     project.declare(
-        r#"
-artifact api {
-  inputs = ["src/**"]
-}
+        r#"#[inputs(["src/**"])]
+artifact api_image;
 
-environment prod = kubernetes(kubectl: "./kubectl.sh", namespace: "shop") {
-  record = { annotation: "example.com/release" }
-  deploy api = api
-}
+#[kubernetes(kubectl = "./kubectl.sh", namespace = "shop")]
+#[record(annotation = "example.com/release")]
+#[deploy("api", api_image)]
+environment prod;
 
+#[environment(prod)]
+#[checks(none)]
+#[version(initial = "0.1.0")]
 release api {
-  environment = prod
-  checks = none
-  version {
-    initial = "0.1.0"
-  }
-  step deploy = run("true")
+    step deploy(r: Release) {
+        run!("true")?;
+    }
 }
+
 "#,
     );
     project.write("kubectl.sh", KUBECTL);
@@ -1264,15 +1319,14 @@ release api {
 fn diff_compares_what_runs_with_what_head_would_build() {
     let project = Project::new("");
     project.declare(
-        r#"
-artifact api {
-  inputs = ["src/**"]
-}
+        r#"#[inputs(["src/**"])]
+artifact api;
 
-environment prod = kubernetes(kubectl: "./kubectl.sh", namespace: "shop") {
-  record = { annotation: "example.com/release", tag_prefix: "v" }
-  deploy api = api
-}
+#[kubernetes(kubectl = "./kubectl.sh", namespace = "shop")]
+#[record(annotation = "example.com/release", tag_prefix = "v")]
+#[deploy("api", api)]
+environment prod;
+
 "#,
     );
     project.write("kubectl.sh", KUBECTL);
@@ -1360,15 +1414,14 @@ environment prod = kubernetes(kubectl: "./kubectl.sh", namespace: "shop") {
 fn artifact_inputs_can_come_from_a_command() {
     let project = Project::new("");
     project.declare(
-        r#"
-artifact api {
-  inputs = inputs_of(run("sh", "-c", "echo src/a.txt; echo Makefile"))
-}
+        r#"#[inputs(cmd!("sh -c 'echo src/a.txt; echo Makefile'"))]
+artifact api;
 
-environment prod = kubernetes(kubectl: "./kubectl.sh") {
-  record = { annotation: "example.com/release", tag_prefix: "v" }
-  deploy api = api
-}
+#[kubernetes(kubectl = "./kubectl.sh")]
+#[record(annotation = "example.com/release", tag_prefix = "v")]
+#[deploy("api", api)]
+environment prod;
+
 "#,
     );
     project.write("kubectl.sh", KUBECTL);
@@ -1422,13 +1475,13 @@ environment prod = kubernetes(kubectl: "./kubectl.sh") {
     project.write(
         "citrus.ci",
         &text.replace(
-            "inputs = inputs_of(run(\"sh\", \"-c\", \"echo src/a.txt; echo Makefile\"))",
-            "inputs = []",
+            r#"#[inputs(cmd!("sh -c 'echo src/a.txt; echo Makefile'"))]"#,
+            "#[inputs([])]",
         ),
     );
     let error = project.json(&["artifacts"]).0;
     assert!(
-        error["error"].as_str().unwrap().contains("inputs_of"),
+        error["error"].as_str().unwrap().contains("#[inputs("),
         "{error}"
     );
 }
@@ -1487,36 +1540,27 @@ fn apply_project() -> Project {
     let project = Project::new("");
     project.declare(
         r#"
-fn image() { "echo IMAGE=registry.example/{artifact}@sha256:{key}" }
-fn logged() { run("sh", "-c", "echo {artifact} >> .kube/builds; " + image()) }
+/// The API image; builds are logged in .kube/builds.
+#[inputs("src/**")]
+#[build(provider = "command", run = cmd!("sh -c 'echo {{artifact}} >> .kube/builds; echo IMAGE=registry.example/{{artifact}}@sha256:{{key}}'"))]
+artifact api;
 
-artifact api {
-  inputs = ["src/**"]
-  build = { provider: "command", run: logged() }
-}
+/// The backup job's image.
+#[inputs("other/**")]
+#[build(provider = "command", run = cmd!("sh -c 'echo IMAGE=registry.example/{{artifact}}@sha256:{{key}}'"))]
+artifact backup;
 
-artifact backup {
-  inputs = ["other/**"]
-  build = { provider: "command", run: run("sh", "-c", image()) }
-}
+/// Database migrations, run as a Job.
+#[inputs("migrations/**")]
+#[build(provider = "command", run = cmd!("sh -c 'echo {{artifact}} >> .kube/builds; echo IMAGE=registry.example/{{artifact}}@sha256:{{key}}'"))]
+artifact migrations;
 
-artifact migrations {
-  inputs = ["migrations/**"]
-  build = { provider: "command", run: logged() }
-}
-
-environment prod = kubernetes(kubectl: "./kubectl.py", namespace: "shop") {
-  record = { annotation: "example.com/release", tag_prefix: "v" }
-  migrations = { artifact: "migrations", job: "job.yaml" }
-  deploy api = api {
-    fence = "api-lease"
-    timeout = 10s
-  }
-  deploy backup = backup {
-    kind = cronjob
-    quiesce = true
-  }
-}
+#[kubernetes(kubectl = "./kubectl.py", namespace = "shop")]
+#[record(annotation = "example.com/release", tag_prefix = "v")]
+#[migrations(artifact = migrations, job = "job.yaml")]
+#[deploy("api", api, fence = "api-lease", timeout = 10s)]
+#[deploy("backup", backup, kind = "cronjob", quiesce = true)]
+environment prod;
 "#,
     );
     project.write(
@@ -1724,7 +1768,10 @@ fn a_worker_that_dies_without_a_result_does_not_hang_wait() {
     let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
     project.write(
         "citrus.ci",
-        &text.replace("environment = prod", "environment = prod\n  checks = none"),
+        &text.replace(
+            "#[environment(prod)]",
+            "#[environment(prod)]\n#[checks(none)]",
+        ),
     );
     project.git(&[
         "-c",
@@ -1904,14 +1951,26 @@ fn doctor_flags_a_leftover_toml_configuration() {
 
 #[test]
 fn an_edited_declaration_selects_its_check() {
-    let project = Project::new("project {\n  main = \"main\"\n}\n");
+    let project = Project::new(
+        r#"#![main("main")]
+
+"#,
+    );
     project.git(&["checkout", "-q", "-b", "feature"]);
     let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
     project.write(
         "citrus.ci",
         &text.replace(
-            "check fail = make(\"fail\")",
-            "check fail = make(\"plain\")",
+            r#"check fail {
+    run!("make fail")?;
+}
+
+"#,
+            r#"check fail {
+    run!("make plain")?;
+}
+
+"#,
         ),
     );
     project.commit("fail runs plain now");
@@ -1924,15 +1983,23 @@ fn an_edited_declaration_selects_its_check() {
     assert_eq!(plan["plan"]["unmapped"], serde_json::json!([]), "{plan}");
 
     // A change outside checks maps the file to the configuration, not to every check.
-    project.declare("commands {\n  \"make deploy\" = \"ship it\"\n}\n");
+    project.declare("#![command(\"misc\", \"make deploy\", \"ship it\")]\n");
     project.commit("catalog");
     project.write(
         "citrus.ci",
         &fs::read_to_string(project.root().join("citrus.ci"))
             .unwrap()
             .replace(
-                "check fail = make(\"plain\")",
-                "check fail = make(\"fail\")",
+                r#"check fail {
+    run!("make plain")?;
+}
+
+"#,
+                r#"check fail {
+    run!("make fail")?;
+}
+
+"#,
             ),
     );
     project.commit("back");
@@ -1944,7 +2011,15 @@ fn an_edited_declaration_selects_its_check() {
 #[test]
 fn project_tools_read_the_declared_checks() {
     let project = Project::new(
-        "runner builders = run(\"sh\", \"remote.sh\")\n\ncheck e2e = make(\"plain\") {\n  paths = [\"web/**\"]\n  meta = { linux: true, snapshot: [\"assets\"] }\n}\n",
+        r#"#![runner(cmd!("sh remote.sh"))]
+
+#[paths("web/**")]
+#[meta(linux = true, snapshot = ["assets"])]
+check e2e {
+    run!("make plain")?;
+}
+
+"#,
     );
     project.write("remote.sh", "mkdir -p .scratch && cp \"$CITRUS_CHECKS\" .scratch/checks.json\necho 'CITRUS_TARGET target=e2e status=PASS exit=0'\n");
     project.commit("runner");
@@ -1964,7 +2039,7 @@ fn project_tools_read_the_declared_checks() {
     assert_eq!(e2e["meta"]["linux"], true);
     assert_eq!(
         e2e["declaration"]["run"],
-        serde_json::json!([["run", "make", "--no-print-directory", "plain"]])
+        serde_json::json!([["run", "make", "plain"]])
     );
     assert_eq!(checks["files"], serde_json::json!(["citrus.ci"]));
     let (targets, _) = project.json(&["targets"]);
@@ -1973,7 +2048,7 @@ fn project_tools_read_the_declared_checks() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| row["source"] == "citrus.ci:23"),
+            .any(|row| row["source"] == "citrus.ci:27"),
         "{targets}"
     );
 }
@@ -1981,7 +2056,11 @@ fn project_tools_read_the_declared_checks() {
 #[test]
 fn an_artifact_ignores_dockerfile_stages_it_is_not_built_from() {
     let project = Project::new(
-        "artifact api {\n  inputs = [\"Dockerfile\"]\n  dockerfile = { file: \"Dockerfile\", target: \"api\" }\n}\n",
+        r#"#[inputs(["Dockerfile"])]
+#[dockerfile("Dockerfile", target = "api")]
+artifact api;
+
+"#,
     );
     let dockerfile = "ARG V=1\nFROM a AS build\nRUN make\nFROM b AS other\nRUN other\nFROM c AS api\nCOPY --from=build /x /x\n";
     project.write("Dockerfile", dockerfile);
@@ -2013,12 +2092,18 @@ fn an_artifact_ignores_dockerfile_stages_it_is_not_built_from() {
 #[test]
 fn release_steps_run_built_in_actions_with_a_version_given_by_hand() {
     let project = Project::new(
-        r#"
+        r#"/// Where the site is published.
+environment web;
+
+#[environment(web)]
+#[checks(none)]
 release site {
-  environment = web
-  checks = none
-  step build = [copy("src/a.txt", "out/{version}.txt"), links.check("*.md")]
+    step build(r: Release) {
+        std::fs::copy("src/a.txt", "out/{r.version}.txt")?;
+        std::docs::check_links("*.md")?;
+    }
 }
+
 "#,
     );
     project.write(".gitignore", ".scratch/\nout/\n");
@@ -2050,7 +2135,13 @@ release site {
 #[test]
 fn a_cargo_closure_keeps_a_rust_check_reused_while_unrelated_crates_change() {
     let project = Project::new(
-        "check test-app = make(\"ok\") {\n  paths = [\"crates/app/**\"]\n  reads = crate(\"app\")\n}\n",
+        r#"#[paths("crates/app/**")]
+#[reads(std::paths::cargo("app"))]
+check test_app {
+    run!("make ok")?;
+}
+
+"#,
     );
     project.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
     project.write(
@@ -2064,16 +2155,16 @@ fn a_cargo_closure_keeps_a_rust_check_reused_while_unrelated_crates_change() {
     project.write("crates/other/src/lib.rs", "\n");
     project.commit("crates");
     assert_eq!(
-        target(&project.json(&["run", "test-app"]).0, "test-app")["result"],
+        target(&project.json(&["run", "test_app"]).0, "test_app")["result"],
         "passed"
     );
     project.write("crates/other/src/lib.rs", "// unrelated\n");
-    let (again, _) = project.json(&["run", "test-app"]);
-    assert_eq!(target(&again, "test-app")["result"], "reused", "{again}");
+    let (again, _) = project.json(&["run", "test_app"]);
+    assert_eq!(target(&again, "test_app")["result"], "reused", "{again}");
     project.write("crates/lib/src/lib.rs", "// a dependency changed\n");
-    let (changed, _) = project.json(&["run", "test-app"]);
+    let (changed, _) = project.json(&["run", "test_app"]);
     assert_eq!(
-        target(&changed, "test-app")["result"],
+        target(&changed, "test_app")["result"],
         "passed",
         "{changed}"
     );
@@ -2081,7 +2172,11 @@ fn a_cargo_closure_keeps_a_rust_check_reused_while_unrelated_crates_change() {
 
 #[test]
 fn checks_that_passed_quickly_run_locally_others_in_the_pool() {
-    let project = Project::new("runner builders = run(\"sh\", \"remote.sh\")\n");
+    let project = Project::new(
+        r#"#![runner(cmd!("sh remote.sh"))]
+
+"#,
+    );
     project.write(
         "remote.sh",
         "echo 'CITRUS_TARGET target=ok status=PASS exit=0 seconds=3'\n",
@@ -2126,26 +2221,12 @@ fn a_pool_that_skips_a_planned_check_does_not_pass_it() {
 }
 
 #[test]
-fn fmt_removes_aligned_columns_and_keeps_meaning() {
-    let project = Project::new(
-        "check t = make(\"ok\") {\n    paths   = [\"src/a.txt\",\"src/b.txt\"]   # note\n  cache = false\n}\n\ncheck m = match changed {\n  only(t)=>make(\"ok\")\n  _   =>  make(\"plain\")\n} {\n  paths = [\"src/*\"]\n}\n",
-    );
-    assert_eq!(project.json(&["fmt", "--check"]).1, 1);
-    let (written, code) = project.json(&["fmt"]);
-    assert_eq!(code, 0, "{written}");
-    let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
-    assert!(text.contains("check t = make(\"ok\") {\n  paths = [\"src/a.txt\", \"src/b.txt\"]  # note\n  cache = false\n}\n"), "{text}");
-    assert!(
-        text.contains("  only(t) => make(\"ok\")\n  _ => make(\"plain\")\n"),
-        "{text}"
-    );
-    assert_eq!(project.json(&["fmt", "--check"]).1, 0);
-    assert_eq!(project.json(&["check"]).0["checks"], 6);
-}
-
-#[test]
 fn a_check_the_pool_passed_is_reused_by_its_inputs() {
-    let project = Project::new("runner builders = run(\"sh\", \"remote.sh\")\n");
+    let project = Project::new(
+        r#"#![runner(cmd!("sh remote.sh"))]
+
+"#,
+    );
     project.write(
         "remote.sh",
         "echo 'CITRUS_TARGET target=ok status=START'\necho 'CITRUS_TARGET target=ok status=PASS exit=0 seconds=40'\n",
@@ -2162,7 +2243,14 @@ fn a_check_the_pool_passed_is_reused_by_its_inputs() {
 
 #[test]
 fn a_submodule_path_is_a_valid_input() {
-    let project = Project::new("check sub = make(\"ok\") {\n  paths = [\"vendor/lib\"]\n}\n");
+    let project = Project::new(
+        r#"#[paths("vendor/lib")]
+check sub {
+    run!("make ok")?;
+}
+
+"#,
+    );
     project.git(&[
         "update-index",
         "--add",
@@ -2193,8 +2281,14 @@ fn a_submodule_path_is_a_valid_input() {
 
 #[test]
 fn an_excluded_path_neither_selects_nor_invalidates_a_check() {
-    let project =
-        Project::new("check lib = make(\"ok\") {\n  paths = [\"lib/**\", \"!lib/vendor/**\"]\n}\n");
+    let project = Project::new(
+        r#"#[paths("lib/**", "!lib/vendor/**")]
+check lib {
+    run!("make ok")?;
+}
+
+"#,
+    );
     project.write("lib/a.txt", "a\n");
     project.write("lib/vendor/b.txt", "b\n");
     project.commit("lib");
@@ -2218,37 +2312,41 @@ fn an_excluded_path_neither_selects_nor_invalidates_a_check() {
 #[test]
 fn profiles_and_covered_checks_shape_the_plan() {
     let project = Project::new(
-        r#"
-project {
-  main = "main"
+        r#"#![main("main")]
+
+profile fast;
+
+profile e2e;
+
+#[paths("lib/**")]
+#[profile(fast)]
+check unit {
+    run!("make ok")?;
 }
 
-profile fast
-profile e2e
-
-check unit = make("ok") {
-  paths = ["lib/**"]
-  profile = fast
+#[paths("lib/**")]
+#[profile(e2e)]
+check e2e_only {
+    run!("make plain")?;
 }
 
-check e2e-only = make("plain") {
-  paths = ["lib/**"]
-  profile = e2e
+#[when(touched(e2e_only) && profile(e2e))]
+check slow_only {
+    run!("make ok")?;
 }
 
-check slow-only = make("ok") {
-  when = touched(e2e-only) and profile(e2e)
+#[paths("lib/**")]
+check part {
+    run!("make ok")?;
 }
 
-check part = make("ok") {
-  paths = ["lib/**"]
+/// Runs `part` itself.
+#[paths("lib/**")]
+#[covers(part)]
+check whole {
+    run!("make ok")?;
 }
 
-# Runs `part` itself.
-check whole = make("ok") {
-  paths = ["lib/**"]
-  covers = [part]
-}
 "#,
     );
     project.git(&["checkout", "-q", "-b", "feature"]);
@@ -2259,7 +2357,7 @@ check whole = make("ok") {
     assert_eq!(targets(&[]), serde_json::json!(["unit", "whole"]));
     assert_eq!(
         targets(&["--profile", "e2e"]),
-        serde_json::json!(["e2e-only", "slow-only", "whole"])
+        serde_json::json!(["e2e_only", "slow_only", "whole"])
     );
     let unknown = project.json(&["plan", "--profile", "nightly"]).0;
     assert!(
@@ -2274,43 +2372,53 @@ check whole = make("ok") {
 #[test]
 fn groups_conditions_and_signals_choose_checks() {
     let project = Project::new(
-        r#"
-project {
-  main = "main"
-  signals = run("sh", "signals.sh")
-}
+        r#"#![main("main")]
+#![signals(cmd!("sh signals.sh"))]
+#![label("scope-mixed", touched(clyer) && touched(pipeline))]
 
-# Documentation: nothing to run.
-group docs {
-  paths = ["*.md"]
-}
+/// Documentation: nothing to run.
+#[paths("*.md")]
+group docs {}
 
+#[paths("clyer/**")]
 group clyer {
-  paths = ["clyer/**"]
-  check bot = make("ok")
+    check bot {
+        run!("make ok")?;
+    }
 }
 
+#[paths("scripts/**")]
 group pipeline {
-  paths = ["scripts/**"]
-  check contract = match changed {
-    only(pipeline) => make("ok")
-    without(clyer) => make("plain")
-    _ => make("fail")
-  }
+    /// Only pipeline files changed.
+    #[when(only(pipeline))]
+    check contract_alone {
+        run!("make ok")?;
+    }
+
+    /// Pipeline and other files, but no Clyer.
+    #[when(!only(pipeline) && without(clyer))]
+    check contract_main {
+        run!("make plain")?;
+    }
+
+    /// Pipeline and Clyer files.
+    #[when(!only(pipeline) && !without(clyer))]
+    check contract {
+        run!("make fail")?;
+    }
 }
 
-check backend = make("ok") {
-  paths = ["crates/**"]
-  when = signal("product:garvis")
+#[paths("crates/**")]
+#[when(signal("product:garvis"))]
+check backend {
+    run!("make ok")?;
 }
 
-check after-backend = make("ok") {
-  when = selected(backend)
+#[when(selected(backend))]
+check after_backend {
+    run!("make ok")?;
 }
 
-label scope-mixed {
-  when = touched(clyer) and touched(pipeline)
-}
 "#,
     );
     // Paths under crates/ mean the garvis product unless they name clyer.
@@ -2328,16 +2436,19 @@ label scope-mixed {
     let plan = plan_for(&[("scripts/run.sh", "x\n")]);
     assert_eq!(
         plan["targets"],
-        serde_json::json!(["pipeline.contract"]),
+        serde_json::json!(["pipeline.contract_alone"]),
         "{plan}"
     );
-    assert_eq!(plan["arms"]["pipeline.contract"], 0, "{plan}");
     let plan = plan_for(&[("scripts/run.sh", "y\n"), ("README.md", "x\n")]);
-    assert_eq!(plan["arms"]["pipeline.contract"], 1, "{plan}");
+    assert_eq!(
+        plan["targets"],
+        serde_json::json!(["pipeline.contract_main"]),
+        "{plan}"
+    );
     let (full, _) = project.json(&["plan"]);
     assert_eq!(
-        full["run"]["pipeline.contract"],
-        serde_json::json!([["run", "make", "--no-print-directory", "plain"]]),
+        full["run"]["pipeline.contract_main"],
+        serde_json::json!([["run", "make", "plain"]]),
         "{full}"
     );
     assert_eq!(plan["unmapped"], serde_json::json!([]), "{plan}");
@@ -2347,25 +2458,24 @@ label scope-mixed {
         serde_json::json!(["clyer.bot", "pipeline.contract"]),
         "{plan}"
     );
-    assert_eq!(plan["arms"], serde_json::json!({}), "the `_` arm: {plan}");
     assert_eq!(plan["labels"], serde_json::json!(["scope-mixed"]), "{plan}");
     let plan = plan_for(&[("crates/api/lib.rs", "x\n")]);
     assert_eq!(
         plan["targets"],
-        serde_json::json!(["backend", "after-backend"]),
+        serde_json::json!(["backend", "after_backend"]),
         "{plan}"
     );
     let plan = plan_for(&[("crates/clyer/lib.rs", "x\n")]);
     assert_eq!(plan["targets"], serde_json::json!([]), "{plan}");
 
-    // The chosen arm is what runs.
+    // The selected check is what runs.
     project.git(&["checkout", "-q", "-B", "feature", "main"]);
     project.write("scripts/run.sh", "w\n");
     project.write("README.md", "w\n");
     project.commit("change");
     let (run, _) = project.json(&["run"]);
     assert_eq!(
-        target(&run, "pipeline.contract")["result"],
+        target(&run, "pipeline.contract_main")["result"],
         "passed",
         "{run}"
     );
@@ -2383,16 +2493,16 @@ label scope-mixed {
 #[test]
 fn a_signal_command_can_claim_paths_for_groups() {
     let project = Project::new(
-        r#"
-project {
-  signals = run("sh", "classify.sh")
+        r#"#![signals(cmd!("sh classify.sh"))]
+
+/// Removed code: only its removal appears in a diff.
+#[paths("old/**", "!old/keep/**")]
+group removed {
+    check contracts {
+        run!("make ok")?;
+    }
 }
 
-# Removed code: only its removal appears in a diff.
-group removed {
-  paths = ["old/**", "!old/keep/**"]
-  check contracts = make("ok")
-}
 "#,
     );
     project.write(
@@ -2434,10 +2544,17 @@ group removed {
 #[test]
 fn an_edited_ci_file_still_selects_the_checks_that_own_it() {
     let project = Project::new(
-        "project {\n  main = \"main\"\n}\n\ncheck config = make(\"ok\") {\n  paths = [\"citrus.ci\"]\n}\n",
+        r#"#![main("main")]
+
+#[paths("citrus.ci")]
+check config {
+    run!("make ok")?;
+}
+
+"#,
     );
     project.git(&["checkout", "-q", "-b", "feature"]);
-    project.declare("# a comment\n");
+    project.declare("// a comment\n");
     project.commit("comment");
     let (plan, _) = project.json(&["plan"]);
     assert_eq!(
@@ -2448,24 +2565,31 @@ fn an_edited_ci_file_still_selects_the_checks_that_own_it() {
 }
 
 #[test]
-fn a_cargo_command_written_by_hand_points_at_the_built_in() {
-    let project = Project::new("task fmt = run(\"cargo\", \"fmt\")\n");
-    let (checked, _) = project.json(&["check"]);
-    let warning = checked["warnings"][0]["message"].as_str().unwrap();
-    assert!(warning.contains("cargo.fmt(…)"), "{checked}");
-}
-
-#[test]
 fn a_citrus_directory_holds_one_file_per_product() {
     let project = Project::new("");
     fs::remove_file(project.root().join("citrus.ci")).unwrap();
     project.write(
         ".citrus/project.ci",
-        "citrus 1\n\nproject {\n  main = \"main\"\n}\n\nlet sources = [\"src/*.txt\"]\n",
+        r#"#![citrus(2)]
+#![main("main")]
+
+const SOURCES = ["src/*.txt"];
+
+"#,
     );
     project.write(
         ".citrus/app.ci",
-        "citrus 1\n\n# The app: its sources and tests.\ngroup app {\n  paths = sources\n  check unit = make(\"ok\")\n}\n",
+        r#"#![citrus(2)]
+
+/// The app: its sources and tests.
+#[paths(SOURCES)]
+group app {
+    check unit {
+        run!("make ok")?;
+    }
+}
+
+"#,
     );
     project.commit("directory");
     let (targets, code) = project.json(&["targets"]);
@@ -2490,7 +2614,13 @@ fn a_citrus_directory_holds_one_file_per_product() {
 #[test]
 fn a_comment_above_a_declaration_describes_it() {
     let project = Project::new(
-        "# Reads the logs back.\ncheck logs = make(\"ok\") {\n  paths = [\"logs/**\"]\n}\n",
+        r#"/// Reads the logs back.
+#[paths("logs/**")]
+check logs {
+    run!("make ok")?;
+}
+
+"#,
     );
     let (targets, _) = project.json(&["targets"]);
     let logs = targets["targets"]
@@ -2512,28 +2642,59 @@ fn names_refer_to_declarations() {
             .to_owned()
     };
     let missing = error(
-        "profile e2e\n\ncheck db = make(\"ok\") {\n  paths = [\"src/**\"]\n  profile = e3\n}\n",
+        r#"profile e2e;
+
+#[paths("src/**")]
+#[profile(e3)]
+check db {
+    run!("make ok")?;
+}
+
+"#,
     );
     assert!(
-        missing.contains("no profile `e3`") && missing.contains("did you mean `e2e`?"),
+        missing.contains("no profile named `e3`") && missing.contains("did you mean `e2e`?"),
         "{missing}"
     );
-    let service =
-        error("check db = make(\"ok\") {\n  paths = [\"src/**\"]\n  needs = [database]\n}\n");
+    let service = error(
+        r#"#[paths("src/**")]
+#[needs(database)]
+check db {
+    run!("make ok")?;
+}
+"#,
+    );
+    assert!(service.contains("no service named `database`"), "{service}");
+    let check = error(
+        r#"#[paths("src/**")]
+#[covers(bd)]
+check all {
+    run!("make ok")?;
+}
+
+#[paths("src/**")]
+check db {
+    run!("make ok")?;
+}
+"#,
+    );
     assert!(
-        service.contains("no service `database`") && service.contains("service database"),
-        "{service}"
+        check.contains("no check named `bd`") && check.contains("did you mean `db`?"),
+        "{check}"
     );
-    let call = error("check db = mak(\"ok\") {\n  paths = [\"src/**\"]\n}\n");
-    assert!(call.contains("did you mean `make`?"), "{call}");
-    let arm = error(
-        "check db = match changed {\n  only(x) => make(\"ok\")\n} {\n  paths = [\"src/**\"]\n}\n",
-    );
-    assert!(arm.contains("needs a last `_ =>"), "{arm}");
 
     // A service checks need is a resource the runner provides.
     let project = Project::new(
-        "service browser {\n  limit = 2\n}\n\ncheck e2e = make(\"ok\") {\n  paths = [\"web/**\"]\n  needs = [browser]\n}\n",
+        r#"#[limit(2)]
+service browser;
+
+#[paths("web/**")]
+#[needs(browser)]
+check e2e {
+    run!("make ok")?;
+}
+
+"#,
     );
     let (targets, _) = project.json(&["targets"]);
     let e2e = targets["targets"]
@@ -2552,24 +2713,27 @@ fn names_refer_to_declarations() {
 #[test]
 fn a_check_that_replaces_parts_runs_instead_of_several() {
     let project = Project::new(
-        r#"
-project {
-  main = "main"
+        r#"#![main("main")]
+
+#[paths("api/**")]
+group api {
+    #[paths("api/users/**")]
+    check users {
+        run!("make ok")?;
+    }
+
+    #[paths("api/orders/**")]
+    check orders {
+        run!("make ok")?;
+    }
+
+    /// Every API test at once: cheaper than several parts.
+    #[replaces(users, orders)]
+    check all {
+        run!("make ok")?;
+    }
 }
 
-group api {
-  paths = ["api/**"]
-  check users = make("ok") {
-    paths = ["api/users/**"]
-  }
-  check orders = make("ok") {
-    paths = ["api/orders/**"]
-  }
-  # Every API test at once: cheaper than several parts.
-  check all = make("ok") {
-    replaces = [users, orders]
-  }
-}
 "#,
     );
     let plan_for = |paths: &str| {
@@ -2587,18 +2751,28 @@ group api {
 #[test]
 fn a_service_starts_once_before_the_checks_that_need_it() {
     let project = Project::new(
-        r#"
-# A stand-in database: a file appears when it is up.
-service database = run("sh", "-c", "echo started >> .scratch/db; touch .scratch/ready") {
-  ready = wait.file(".scratch/ready", timeout: 5s)
+        r#"/// A stand-in database: a file appears when it is up.
+service database {
+    start {
+        run!("sh -c 'echo started >> .scratch/db; touch .scratch/ready'")?;
+    }
+    ready {
+        std::wait::file(".scratch/ready", 5s)?;
+    }
 }
 
+#[paths("db/**")]
+#[needs(database)]
 group db {
-  paths = ["db/**"]
-  needs = [database]
-  check one = make("ok")
-  check two = make("ok")
+    check one {
+        run!("make ok")?;
+    }
+
+    check two {
+        run!("make ok")?;
+    }
 }
+
 "#,
     );
     project.write(".scratch/.keep", "");
@@ -2614,57 +2788,71 @@ group db {
 #[test]
 fn conditions_and_paths_take_lists_of_globs() {
     let project = Project::new(
-        r#"
-let tools = ["scripts/tool.py", "scripts/test_tool.py"]
-let clyer = ["clyer/**"]
+        r#"const TOOLS = ["scripts/tool.py", "scripts/test_tool.py"];
 
-# The tool's own tests.
-check tool = make("ok") {
-  paths = tools
+const CLYER = ["clyer/**"];
+
+/// The tool's own tests.
+#[paths(TOOLS)]
+check tool {
+    run!("make ok")?;
 }
 
-# Everything else under scripts/; the tool is not part of it.
+/// Everything else under scripts/; the tool is not part of it.
+#[paths(["scripts/**"] - TOOLS)]
 group infra {
-  paths = ["scripts/**"] - tools
-  check contract = match changed {
-    without(clyer) => make("ok")
-    _ => make("plain")
-  }
+    /// Without Clyer changes: the cheaper contract.
+    #[when(without(CLYER))]
+    check contract_main {
+        run!("make ok")?;
+    }
+
+    /// With Clyer changes: the whole contract.
+    #[when(!without(CLYER))]
+    check contract {
+        run!("make plain")?;
+    }
 }
 
-check clyer-only = make("ok") {
-  when = only(clyer + ["scripts/**"]) and touched(clyer)
+#[when(only(CLYER + ["scripts/**"]) && touched(CLYER))]
+check clyer_only {
+    run!("make ok")?;
 }
+
 "#,
     );
     let plan_for = |paths: &str| {
         project.write("paths.txt", paths);
-        let plan = project.json(&["plan", "--paths-file", "paths.txt"]).0["plan"].clone();
-        (plan["targets"].clone(), plan["arms"].clone())
+        project.json(&["plan", "--paths-file", "paths.txt"]).0["plan"]["targets"].clone()
     };
-    assert_eq!(plan_for("scripts/tool.py\n").0, serde_json::json!(["tool"]));
-    let (targets, arms) = plan_for("scripts/run.sh\n");
-    assert_eq!(targets, serde_json::json!(["infra.contract"]));
-    assert_eq!(arms["infra.contract"], 0);
-    let (targets, arms) = plan_for("scripts/run.sh\nclyer/bot.rs\n");
-    assert_eq!(targets, serde_json::json!(["infra.contract", "clyer-only"]));
-    assert_eq!(arms, serde_json::json!({}));
+    assert_eq!(plan_for("scripts/tool.py\n"), serde_json::json!(["tool"]));
+    assert_eq!(
+        plan_for("scripts/run.sh\n"),
+        serde_json::json!(["infra.contract_main"])
+    );
+    assert_eq!(
+        plan_for("scripts/run.sh\nclyer/bot.rs\n"),
+        serde_json::json!(["infra.contract", "clyer_only"])
+    );
 }
 
 #[test]
 fn a_path_a_check_names_is_that_checks_alone() {
     let project = Project::new(
-        r#"
+        r#"#[paths("scripts/**")]
 group infra {
-  paths = ["scripts/**"]
-  check contract = make("ok")
+    check contract {
+        run!("make ok")?;
+    }
 }
 
-# The tool's own tests: editing the tool does not run the infra contract.
-check tool = make("ok") {
-  paths = ["scripts/tool.py"]
-  reads = ["scripts/lib.py"]
+/// The tool's own tests: editing the tool does not run the infra contract.
+#[paths("scripts/tool.py")]
+#[reads("scripts/lib.py")]
+check tool {
+    run!("make ok")?;
 }
+
 "#,
     );
     let plan_for = |paths: &str| {
@@ -2685,28 +2873,30 @@ check tool = make("ok") {
 #[test]
 fn a_check_runs_for_a_group_it_names_and_its_own_paths() {
     let project = Project::new(
-        r#"
-# Platform crates every product builds on.
-group platform {
-  paths = ["platform/**"]
-}
+        r#"/// Platform crates every product builds on.
+#[paths("platform/**")]
+group platform {}
 
+#[paths("vpn/**")]
 group vpn {
-  paths = ["vpn/**"]
-  check backend = make("ok") {
-    paths = [platform, "vpn/backend/**"]
-  }
+    #[paths(platform, "vpn/backend/**")]
+    check backend {
+        run!("make ok")?;
+    }
 }
 
-check docs = make("ok") {
-  paths = ["platform/README.md"]
+#[paths("platform/README.md")]
+check docs {
+    run!("make ok")?;
 }
 
-# Runs for the platform's paths only.
-check platform-only = make("ok") {
-  paths = [platform]
-  when = not touched(["vpn/**"])
+/// Runs for the platform's paths only.
+#[paths(platform)]
+#[when(!touched(["vpn/**"]))]
+check platform_only {
+    run!("make ok")?;
 }
+
 "#,
     );
     let plan_for = |paths: &str| {
@@ -2715,7 +2905,7 @@ check platform-only = make("ok") {
     };
     assert_eq!(
         plan_for("platform/lib.rs\n"),
-        serde_json::json!(["vpn.backend", "platform-only"])
+        serde_json::json!(["vpn.backend", "platform_only"])
     );
     assert_eq!(
         plan_for("vpn/backend/main.rs\n"),
@@ -2733,14 +2923,23 @@ check platform-only = make("ok") {
         serde_json::json!(["docs"])
     );
     let unknown = Project::new(
-        "check x = make(\"ok\") {\n  paths = [platfrm]\n}\n\ngroup platform {\n  paths = [\"src/**\"]\n}\n",
+        r#"#[paths(platfrm)]
+check x {
+    run!("make ok")?;
+}
+
+#[paths("src/**")]
+group platform {}
+
+"#,
     );
     let error = unknown.json(&["status"]).0["error"]
         .as_str()
         .unwrap()
         .to_owned();
     assert!(
-        error.contains("no group `platfrm`") && error.contains("did you mean `platform`?"),
+        error.contains("no group or constant `platfrm`")
+            && error.contains("did you mean `platform`?"),
         "{error}"
     );
 }
@@ -2748,26 +2947,28 @@ check platform-only = make("ok") {
 #[test]
 fn only_checks_with_known_inputs_are_reused() {
     let project = Project::new(
-        r#"
-project {
-  cache = false
-}
+        r#"#![cache(false)]
 
+#[paths("lib/**")]
+#[cache(true)]
 group lib {
-  paths = ["lib/**"]
-  cache = true
-  check unit = make("ok")
+    check unit {
+        run!("make ok")?;
+    }
 }
 
-# Selected by a condition: nothing tells what it reads.
-check after = make("ok") {
-  when = selected(lib.unit)
+/// Selected by a condition: nothing tells what it reads.
+#[when(selected(lib::unit))]
+check after {
+    run!("make ok")?;
 }
 
-check named = make("ok") {
-  paths = [lib, "extra/**"]
-  cache = true
+#[paths(lib, "extra/**")]
+#[cache(true)]
+check named {
+    run!("make ok")?;
 }
+
 "#,
     );
     let (targets, _) = project.json(&["targets"]);
@@ -2797,20 +2998,21 @@ check named = make("ok") {
 #[test]
 fn a_signal_command_can_give_a_path_to_one_check() {
     let project = Project::new(
-        r#"
-project {
-  signals = run("sh", "classify.sh")
-}
+        r#"#![signals(cmd!("sh classify.sh"))]
 
+#[paths("web/**")]
 group web {
-  paths = ["web/**"]
-  check build = make("ok")
+    check build {
+        run!("make ok")?;
+    }
 }
 
-# Only the audited part of the workspace file changed.
-check audit = make("ok") {
-  when = signal("audit-only")
+/// Only the audited part of the workspace file changed.
+#[when(signal("audit-only"))]
+check audit {
+    run!("make ok")?;
 }
+
 "#,
     );
     project.write(
@@ -2838,15 +3040,31 @@ check audit = make("ok") {
 #[test]
 fn an_edited_check_still_needs_its_condition() {
     let project = Project::new(
-        "project {\n  main = \"main\"\n  signals = run(\"true\")\n}\n\ncheck gated = make(\"ok\") {\n  when = signal(\"release\")\n}\n",
+        r#"#![main("main")]
+#![signals(cmd!("true"))]
+
+#[when(signal("release"))]
+check gated {
+    run!("make ok")?;
+}
+
+"#,
     );
     project.git(&["checkout", "-q", "-b", "feature"]);
     let text = fs::read_to_string(project.root().join("citrus.ci")).unwrap();
     project.write(
         "citrus.ci",
         &text.replace(
-            "check gated = make(\"ok\")",
-            "check gated = make(\"plain\")",
+            r#"check gated {
+    run!("make ok")?;
+}
+
+"#,
+            r#"check gated {
+    run!("make plain")?;
+}
+
+"#,
         ),
     );
     project.commit("edit gated");
@@ -2866,7 +3084,17 @@ fn an_edited_check_still_needs_its_condition() {
 #[test]
 fn check_warns_about_missing_inputs_of_reused_checks_only() {
     let project = Project::new(
-        "# Removed code: only its removal appears in a diff.\ngroup retired {\n  paths = [\"gone/**\"]\n}\n\ncheck reused = make(\"ok\") {\n  paths = [\"src/*.txt\"]\n  reads = [\"missing/**\"]\n}\n",
+        r#"/// Removed code: only its removal appears in a diff.
+#[paths("gone/**")]
+group retired {}
+
+#[paths("src/*.txt")]
+#[reads("missing/**")]
+check reused {
+    run!("make ok")?;
+}
+
+"#,
     );
     let (checked, code) = project.json(&["check"]);
     assert_eq!(code, 0, "{checked}");

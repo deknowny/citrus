@@ -8,6 +8,7 @@ pub mod compile;
 pub mod eval;
 pub mod layout;
 pub mod lexer;
+pub mod migrate;
 pub mod parser;
 pub mod web;
 

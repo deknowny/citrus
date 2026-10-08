@@ -67,10 +67,26 @@ impl<'a> Compiler<'a> {
         Ok(value_json(&value))
     }
 
+    /// A group or a check: what `touched`, `only` and `without` can name.
+    fn is_selectable(&self, segments: &[String]) -> bool {
+        let name = segments.join("::");
+        self.program.items.iter().any(|item| match &item.kind {
+            ItemKind::Group { items } => {
+                item.name == name
+                    || items
+                        .iter()
+                        .any(|inner| format!("{}::{}", item.name, inner.name) == name)
+            }
+            ItemKind::Check { .. } => item.name == name,
+            _ => false,
+        })
+    }
+
+    /// A declared item that is not a value (not a const or a fn).
     fn is_item(&self, segments: &[String]) -> bool {
         let name = segments.join("::");
         self.program.items.iter().any(|item| {
-            item.name == name
+            (item.name == name && !matches!(item.kind, ItemKind::Const { .. } | ItemKind::Fn(_)))
                 || matches!(&item.kind, ItemKind::Group { items } if items.iter().any(|inner| format!("{}::{}", item.name, inner.name) == name))
         })
     }
@@ -297,11 +313,11 @@ fn condition_in(
     let help = "conditions: touched(…), only(…), without(…), signal(\"…\"), selected(…), profile(…), with &&, || and !";
     Ok(match expr {
         Expr::Bool(flag, _) => Cond::Always(*flag),
-        Expr::Unary("!", inner, _) => Cond::Not(Box::new(condition(inner, compiler)?)),
+        Expr::Unary("!", inner, _) => Cond::Not(Box::new(condition_in(inner, compiler, bound)?)),
         Expr::Binary(op @ ("&&" | "||"), left, right, _) => {
             let (left, right) = (
-                Box::new(condition(left, compiler)?),
-                Box::new(condition(right, compiler)?),
+                Box::new(condition_in(left, compiler, bound)?),
+                Box::new(condition_in(right, compiler, bound)?),
             );
             if *op == "&&" {
                 Cond::And(left, right)
@@ -328,7 +344,7 @@ fn condition_in(
             };
             let paths = |arg: &Expr, compiler: &mut Compiler| -> Compiled<Paths> {
                 match arg {
-                    Expr::Path(segments, _) if compiler.is_item(segments) => {
+                    Expr::Path(segments, _) if compiler.is_selectable(segments) => {
                         Ok(Paths::Name(external(segments)))
                     }
                     other => {
@@ -506,7 +522,7 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         profiles,
         covered_by: Vec::new(),
         when,
-        replaces: Compiler::names(&item.attrs, "replaces"),
+        replaces: qualify(Compiler::names(&item.attrs, "replaces"), &from.group),
         span: item.span,
     })
 }
@@ -549,6 +565,17 @@ fn lowered(body: &Block, env: &[(String, String)], span: Span) -> Option<Step> {
         label: work.label(),
         work,
     })
+}
+
+/// Names inside a group may leave the group out: `#[replaces(users)]`.
+fn qualify(names: Vec<String>, group: &Option<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .map(|name| match group {
+            Some(group) if !name.contains('.') => format!("{group}.{name}"),
+            _ => name,
+        })
+        .collect()
 }
 
 fn release_args() -> Vec<(String, String)> {
@@ -665,12 +692,19 @@ fn artifact(compiler: &mut Compiler, item: &Item) -> Compiled<crate::deploy::Art
                     json!({"file": fields.get("0").cloned().unwrap_or(Json::Null), "target": fields.get("target").cloned().unwrap_or(Json::Null)}),
                 );
             }
+            // How it is built and published: provider settings, part of its key.
+            "build" | "publish" => {
+                let fields = compiler.attr_object(attr)?;
+                object.insert(attr.name.clone(), Json::Object(fields));
+            }
             other => {
                 return Err(Error::at(
                     attr.span,
                     format!("`#[{other}]` does not apply to an artifact"),
                 )
-                .help("artifacts take #[inputs(…)] and #[dockerfile(…)]"));
+                .help(
+                    "artifacts take #[inputs(…)], #[dockerfile(…)], #[build(…)] and #[publish(…)]",
+                ));
             }
         }
     }
@@ -1000,7 +1034,13 @@ pub fn compile(
                 .collect::<Vec<_>>(),
             _ => vec![(item.name.clone(), item)],
         })
-        .map(|(name, item)| (name, Compiler::names(&item.attrs, "covers")))
+        .map(|(name, item)| {
+            let group = name.split_once('.').map(|(group, _)| group.to_owned());
+            (
+                name,
+                qualify(Compiler::names(&item.attrs, "covers"), &group),
+            )
+        })
         .collect();
     for (by, names) in covers {
         for name in names {

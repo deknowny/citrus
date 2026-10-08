@@ -431,8 +431,12 @@ pub fn check(program: &Program) -> Result<Globals, Error> {
 }
 
 fn check_item(item: &Item, globals: &Globals) -> Result<(), Error> {
+    check_item_in(item, globals, None)
+}
+
+fn check_item_in(item: &Item, globals: &Globals, group: Option<&str>) -> Result<(), Error> {
     for attr in &item.attrs {
-        check_attr(attr, globals)?;
+        check_attr_in(attr, globals, group)?;
     }
     match &item.kind {
         ItemKind::Fn(function) => {
@@ -456,7 +460,7 @@ fn check_item(item: &Item, globals: &Globals) -> Result<(), Error> {
         }
         ItemKind::Group { items } => {
             for inner in items {
-                check_item(inner, globals)?;
+                check_item_in(inner, globals, Some(&item.name))?;
             }
         }
         ItemKind::Release { steps, rollback } => {
@@ -519,6 +523,8 @@ const CONFIG: &[&str] = &[
     "limit",
     "inputs",
     "dockerfile",
+    "build",
+    "publish",
     "kubernetes",
     "record",
     "deploy",
@@ -558,6 +564,11 @@ fn not_found(globals: &Globals, name: &str, kinds: &[&str], span: Span) -> Error
 }
 
 pub fn check_attr(attr: &Attr, globals: &Globals) -> Result<(), Error> {
+    check_attr_in(attr, globals, None)
+}
+
+/// `group`: the group the attribute's item is in (its checks' names are relative).
+pub fn check_attr_in(attr: &Attr, globals: &Globals, group: Option<&str>) -> Result<(), Error> {
     let name = attr.name.as_str();
     if let Some((_, kinds)) = NAMING.iter().find(|(known, _)| *known == name) {
         for (_, arg) in &attr.args {
@@ -568,11 +579,14 @@ pub fn check_attr(attr: &Attr, globals: &Globals) -> Result<(), Error> {
                 ));
             };
             let item = segments.join("::");
-            if !globals
-                .items
-                .get(&item)
-                .is_some_and(|kind| kinds.contains(kind))
-            {
+            let known = |name: &str| {
+                globals
+                    .items
+                    .get(name)
+                    .is_some_and(|kind| kinds.contains(kind))
+            };
+            let relative = group.is_some_and(|group| known(&format!("{group}::{item}")));
+            if !known(&item) && !relative {
                 return Err(not_found(globals, &item, kinds, *span));
             }
         }
@@ -582,10 +596,24 @@ pub fn check_attr(attr: &Attr, globals: &Globals) -> Result<(), Error> {
         "paths" | "reads" => {
             for (_, arg) in &attr.args {
                 // A group's name: its paths select the check too.
-                if let Expr::Path(segments, _) = arg
-                    && globals.items.get(&segments.join("::")) == Some(&"group")
-                {
-                    continue;
+                if let Expr::Path(segments, span) = arg {
+                    let name = segments.join("::");
+                    if globals.items.get(&name) == Some(&"group") {
+                        continue;
+                    }
+                    if !globals.consts.contains_key(&name) {
+                        let known = globals
+                            .items
+                            .iter()
+                            .filter(|(_, kind)| **kind == "group")
+                            .map(|(name, _)| name.as_str())
+                            .chain(globals.consts.keys().map(String::as_str));
+                        let mut error = Error::at(*span, format!("no group or constant `{name}`"));
+                        if let Some(close) = suggest(&name, known) {
+                            error = error.help(format!("did you mean `{close}`?"));
+                        }
+                        return Err(error);
+                    }
                 }
                 let mut checker = Checker::new(globals, Phase::Load, Ty::Unknown);
                 let ty = checker.expr(arg)?;
@@ -1265,12 +1293,14 @@ impl<'a> Checker<'a> {
     }
 
     fn command_word(&mut self, word: &CmdWord) -> Result<(), Error> {
-        let text_like = |ty: &Ty| {
+        let plain = |ty: &Ty| {
             matches!(
                 ty,
                 Ty::Str | Ty::Path | Ty::Glob | Ty::Int | Ty::Version | Ty::Unknown
             )
         };
+        // An Option is its value; a missing one fails the command (a release's `previous`).
+        let text_like = |ty: &Ty| plain(ty) || matches!(ty, Ty::Option(inner) if plain(inner));
         match word {
             CmdWord::Word(pieces) => {
                 for piece in pieces {
