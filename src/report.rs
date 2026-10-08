@@ -97,8 +97,102 @@ fn is_make_failure(line: &str) -> bool {
 /// "error:" earlier are often expected output of passing tests.
 const BEFORE_MAKE_FAILURE: usize = 15;
 
+/// What test runners and compilers said failed, read from their own
+/// formats: failed Rust tests with the place they panicked, rustc and clippy
+/// errors with their place, failed Python and Node tests. At most a few
+/// lines; none when nothing is recognised.
+pub fn diagnose(lines: &[String]) -> Vec<String> {
+    const MAX: usize = 6;
+    let mut found: Vec<String> = Vec::new();
+    let push = |line: String, found: &mut Vec<String>| {
+        if found.len() < MAX && !found.contains(&line) {
+            found.push(line);
+        }
+    };
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        // cargo test: `test path::name ... FAILED`, then the panic.
+        if let Some(name) = trimmed
+            .strip_prefix("test ")
+            .and_then(|rest| rest.strip_suffix(" ... FAILED"))
+        {
+            let panic = lines.iter().find_map(|line| {
+                let rest = line.split_once(&format!("'{name}'"))?.1;
+                let place = rest.split_once("panicked at ")?.1.trim_end_matches(':');
+                Some(place.to_owned())
+            });
+            push(
+                match panic {
+                    Some(place) => format!("test {name} failed at {place}"),
+                    None => format!("test {name} failed"),
+                },
+                &mut found,
+            );
+        }
+        // rustc, clippy: `error[E0308]: …` or `error: …`, then `--> file:line:col`.
+        if (trimmed.starts_with("error[") || trimmed.starts_with("error: "))
+            && !trimmed.starts_with("error: could not compile")
+            && !trimmed.starts_with("error: test failed")
+            && !trimmed.starts_with("error: aborting")
+            && let Some(place) = lines
+                .iter()
+                .skip(index + 1)
+                .take(3)
+                .find_map(|next| next.trim().strip_prefix("--> "))
+        {
+            push(format!("{trimmed} ({place})"), &mut found);
+        }
+        // unittest: `FAIL: test_x (module.Case.test_x)` / `ERROR: …`.
+        if (trimmed.starts_with("FAIL: ") || trimmed.starts_with("ERROR: "))
+            && trimmed.contains('(')
+        {
+            // Under the header's `-----`, the traceback runs to the next one.
+            let reason = lines
+                .iter()
+                .skip(index + 1)
+                .skip_while(|next| next.starts_with("-----"))
+                .take(40)
+                .take_while(|next| !next.starts_with("-----") && !next.starts_with("====="))
+                .filter(|next| {
+                    let next = next.trim();
+                    !next.is_empty() && !next.starts_with("File ") && !next.starts_with("Traceback")
+                })
+                .last()
+                .map(|next| next.trim().to_owned());
+            push(
+                match reason {
+                    Some(reason) => format!("{trimmed}: {}", clip(&reason)),
+                    None => trimmed.to_owned(),
+                },
+                &mut found,
+            );
+        }
+        // pytest: `FAILED path::test - Error`.
+        if trimmed.starts_with("FAILED ") && trimmed.contains("::") {
+            push(clip(trimmed), &mut found);
+        }
+        // node --test (TAP): `not ok 3 - name`.
+        if let Some(rest) = trimmed.strip_prefix("not ok ")
+            && let Some((_, name)) = rest.split_once(" - ")
+        {
+            push(format!("node test failed: {name}"), &mut found);
+        }
+    }
+    found
+}
+
 /// A short excerpt describing the failure, or the tail when nothing matches.
+/// What the tools themselves reported comes first.
 pub fn first_error(lines: &[String]) -> Option<String> {
+    let excerpt = excerpt(lines)?;
+    let diagnosed = diagnose(lines);
+    if diagnosed.is_empty() {
+        return Some(excerpt);
+    }
+    Some(format!("{}\n{excerpt}", diagnosed.join("\n")))
+}
+
+fn excerpt(lines: &[String]) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
@@ -216,5 +310,42 @@ mod tests {
     fn formats_utc() {
         assert_eq!(compact_utc(0), "19700101-000000");
         assert_eq!(compact_utc(1_791_380_000), "20261007-133320");
+    }
+}
+
+#[cfg(test)]
+mod diagnose_tests {
+    use super::diagnose;
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn tools_say_what_failed() {
+        let cargo = lines(
+            "running 2 tests\ntest api::ok ... ok\ntest api::sums ... FAILED\n\nfailures:\n\n---- api::sums stdout ----\n\nthread 'api::sums' (77) panicked at src/lib.rs:9:5:\nassertion `left == right` failed\n",
+        );
+        assert_eq!(
+            diagnose(&cargo),
+            vec!["test api::sums failed at src/lib.rs:9:5"]
+        );
+        let rustc = lines(
+            "   Compiling api v0.1.0\nerror[E0308]: mismatched types\n  --> src/lib.rs:3:17\n   |\nerror: could not compile `api`\n",
+        );
+        assert_eq!(
+            diagnose(&rustc),
+            vec!["error[E0308]: mismatched types (src/lib.rs:3:17)"]
+        );
+        let unittest = lines(
+            "F.\n======================================================================\nFAIL: test_limits (test_tool.ToolTest.test_limits)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"x.py\", line 3, in test_limits\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n----------------------------------------------------------------------\nRan 2 tests\n",
+        );
+        assert_eq!(
+            diagnose(&unittest),
+            vec!["FAIL: test_limits (test_tool.ToolTest.test_limits): AssertionError: 1 != 2"]
+        );
+        let node = lines("TAP version 13\nok 1 - parses\nnot ok 2 - renders the plan\n");
+        assert_eq!(diagnose(&node), vec!["node test failed: renders the plan"]);
+        assert!(diagnose(&lines("all good\n")).is_empty());
     }
 }

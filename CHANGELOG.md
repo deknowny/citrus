@@ -18,6 +18,9 @@ Breaking: a new configuration language (docs/design/language.md). Every
   packages it builds, and a misspelled subcommand or package is an error.
 - Outside the language names use `-` for `_` (`test_db` → `test-db`),
   like Cargo crate names; the command line takes either.
+- A failed check's first error starts with what its tools reported: failed
+  Rust tests and where they panicked, rustc/clippy errors with their place,
+  failed unittest/pytest/node tests.
 - A cached check run locally is watched: what its Python and Node programs
   read outside its inputs keeps the pass from being reused, and is named.
 - Commands in a target's recipe that Citrus understands (Cargo, declared
