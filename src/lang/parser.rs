@@ -1,37 +1,69 @@
-//! Recursive-descent parser for `.ci` files.
+//! Recursive-descent parser of language v2.
 
-use super::ast::{Body, Expr, Item, StrPart};
+use super::ast::*;
 use super::lexer::{Part, Tok, Token, lex};
-use super::{Error, Span};
+use crate::lang::{Error, Span};
 
-const KEYWORDS: [&str; 13] = [
-    "let", "fn", "for", "in", "if", "else", "use", "true", "false", "none", "and", "or", "match",
-];
-
-#[derive(Debug)]
-pub struct File {
-    pub items: Vec<Item>,
-}
-
-pub fn parse_file(file: usize, source: &str) -> Result<File, Error> {
-    let mut parser = Parser {
-        tokens: lex(file, source, 0)?,
-        index: 0,
-        file,
-        source: source.to_owned(),
-    };
-    parser.header()?;
-    let items = parser.items(true)?;
-    parser.expect_eof()?;
-    Ok(File { items })
-}
-
-struct Parser {
+pub struct Parser {
     tokens: Vec<Token>,
     index: usize,
     file: usize,
-    /// The file's text, for comments right above declarations.
-    source: String,
+    /// In `if`/`match`/`for` heads `Name {` opens the block, not a struct.
+    no_struct: bool,
+    /// Where the name of the item being parsed is.
+    name_span: Span,
+}
+
+type Parsed<T> = Result<T, Error>;
+
+/// A command line's environment and words.
+type CommandLine = (Vec<(String, CmdWord)>, Vec<CmdWord>);
+
+const KEYWORDS: &[&str] = &[
+    "const",
+    "fn",
+    "struct",
+    "group",
+    "check",
+    "task",
+    "release",
+    "environment",
+    "step",
+    "rollback",
+    "let",
+    "mut",
+    "if",
+    "else",
+    "for",
+    "in",
+    "match",
+    "return",
+    "assert",
+    "true",
+    "false",
+];
+
+pub fn parse_file(file: usize, source: &str, program: &mut Program) -> Parsed<()> {
+    let tokens = lex(file, source, 0)?;
+    let mut parser = Parser {
+        tokens,
+        index: 0,
+        file,
+        no_struct: false,
+        name_span: Span::default(),
+    };
+    while parser.at_sym("#![") {
+        program.inner.push(parser.attr("#![")?);
+    }
+    while !parser.at_eof() {
+        // Project attributes may follow items, e.g. in a file of their own.
+        if parser.at_sym("#![") {
+            program.inner.push(parser.attr("#![")?);
+            continue;
+        }
+        program.items.push(parser.item()?);
+    }
+    Ok(())
 }
 
 impl Parser {
@@ -39,12 +71,24 @@ impl Parser {
         &self.tokens[self.index].tok
     }
 
-    fn peek_at(&self, offset: usize) -> &Tok {
-        &self.tokens[(self.index + offset).min(self.tokens.len() - 1)].tok
+    fn peek_at(&self, ahead: usize) -> &Tok {
+        &self.tokens[(self.index + ahead).min(self.tokens.len() - 1)].tok
     }
 
     fn span(&self) -> Span {
         self.tokens[self.index].span
+    }
+
+    fn previous_end(&self) -> Span {
+        self.tokens[self.index.saturating_sub(1)].span
+    }
+
+    fn join(&self, start: Span) -> Span {
+        Span {
+            file: start.file,
+            start: start.start,
+            end: self.previous_end().end.max(start.start),
+        }
     }
 
     fn bump(&mut self) -> Token {
@@ -55,16 +99,20 @@ impl Parser {
         token
     }
 
-    fn is_sym(&self, symbol: &str) -> bool {
-        matches!(self.peek(), Tok::Sym(found) if *found == symbol)
+    fn at_eof(&self) -> bool {
+        matches!(self.peek(), Tok::Eof)
     }
 
-    fn is_word(&self, word: &str) -> bool {
-        matches!(self.peek(), Tok::Ident(found) if found == word)
+    fn at_sym(&self, symbol: &str) -> bool {
+        matches!(self.peek(), Tok::Sym(s) if *s == symbol)
+    }
+
+    fn at_word(&self, word: &str) -> bool {
+        matches!(self.peek(), Tok::Ident(name) if name == word)
     }
 
     fn eat_sym(&mut self, symbol: &str) -> bool {
-        if self.is_sym(symbol) {
+        if self.at_sym(symbol) {
             self.bump();
             true
         } else {
@@ -72,644 +120,939 @@ impl Parser {
         }
     }
 
-    fn expect_sym(&mut self, symbol: &str) -> Result<Span, Error> {
-        if self.is_sym(symbol) {
-            return Ok(self.bump().span);
-        }
-        Err(Error::at(
-            self.span(),
-            format!("expected `{symbol}`, found {}", describe(self.peek())),
-        ))
-    }
-
-    fn expect_word(&mut self, word: &str) -> Result<Span, Error> {
-        if self.is_word(word) {
-            return Ok(self.bump().span);
-        }
-        Err(Error::at(
-            self.span(),
-            format!("expected `{word}`, found {}", describe(self.peek())),
-        ))
-    }
-
-    fn name(&mut self) -> Result<(String, Span), Error> {
-        match self.peek().clone() {
-            Tok::Ident(name) if !KEYWORDS.contains(&name.as_str()) => Ok((name, self.bump().span)),
-            other => Err(Error::at(
-                self.span(),
-                format!("expected a name, found {}", describe(&other)),
-            )),
+    fn eat_word(&mut self, word: &str) -> bool {
+        if self.at_word(word) {
+            self.bump();
+            true
+        } else {
+            false
         }
     }
 
-    fn expect_eof(&self) -> Result<(), Error> {
+    fn describe(&self) -> String {
         match self.peek() {
-            Tok::Eof => Ok(()),
-            other => Err(Error::at(
-                self.span(),
-                format!("unexpected {}", describe(other)),
-            )),
+            Tok::Ident(name) => format!("`{name}`"),
+            Tok::Str(_) => "a string".into(),
+            Tok::Int(_) => "a number".into(),
+            Tok::Duration(_) => "a duration".into(),
+            Tok::Sym(symbol) => format!("`{symbol}`"),
+            Tok::Doc(_) => "a `///` comment".into(),
+            Tok::Eof => "the end of the file".into(),
         }
     }
 
-    fn header(&mut self) -> Result<u32, Error> {
-        if !self.is_word("citrus") {
-            return Err(
-                Error::at(self.span(), "a .ci file starts with its language version")
-                    .help("add `citrus 1` as the first line"),
-            );
+    fn expect_sym(&mut self, symbol: &str) -> Parsed<Span> {
+        if self.at_sym(symbol) {
+            Ok(self.bump().span)
+        } else {
+            Err(Error::at(
+                self.span(),
+                format!("expected `{symbol}`, found {}", self.describe()),
+            ))
         }
-        self.bump();
+    }
+
+    fn ident(&mut self, what: &str) -> Parsed<(String, Span)> {
         match self.peek().clone() {
-            Tok::Int(1) => {
-                self.bump();
-                Ok(1)
+            Tok::Ident(name) if !KEYWORDS.contains(&name.as_str()) => {
+                let span = self.bump().span;
+                Ok((name, span))
             }
-            Tok::Int(other) => Err(Error::at(
+            _ => Err(Error::at(
                 self.span(),
-                format!("language version {other} is not supported by this Citrus"),
-            )
-            .help("this Citrus reads `citrus 1`; upgrade Citrus for newer files")),
-            other => Err(Error::at(
-                self.span(),
-                format!("expected the language version, found {}", describe(&other)),
+                format!("expected {what}, found {}", self.describe()),
             )),
         }
     }
 
-    /// Items until `}` (or end of file at the top level).
-    fn items(&mut self, top: bool) -> Result<Vec<Item>, Error> {
-        let mut items = Vec::new();
-        loop {
-            while self.eat_sym(",") || self.eat_sym(";") {}
-            if matches!(self.peek(), Tok::Eof) || self.is_sym("}") {
-                return Ok(items);
+    fn attr(&mut self, open: &str) -> Parsed<Attr> {
+        let start = self.expect_sym(open)?;
+        // Attribute names may be keywords: `#[environment(…)]`.
+        let name = match self.peek().clone() {
+            Tok::Ident(name) => {
+                self.bump();
+                name
             }
-            items.push(self.item(top)?);
-        }
-    }
-
-    fn item(&mut self, top: bool) -> Result<Item, Error> {
-        let start = self.span();
-        if self.is_word("use") {
-            if !top {
-                return Err(Error::at(start, "`use` belongs at the top of a file"));
-            }
-            self.bump();
-            let Tok::Str(parts) = self.peek().clone() else {
-                return Err(Error::at(
-                    self.span(),
-                    "expected a file path in quotes after `use`",
-                ));
-            };
-            let span = self.bump().span;
-            let path = literal(&parts)
-                .ok_or_else(|| Error::at(span, "a `use` path cannot contain `{…}`"))?;
-            return Ok(Item::Use {
-                path,
-                span: join(start, span),
-            });
-        }
-        if self.is_word("let") {
-            self.bump();
-            let (name, _) = self.name()?;
-            self.expect_sym("=")?;
-            let value = self.expr()?;
-            return Ok(Item::Let {
-                span: join(start, value.span()),
-                name,
-                value,
-            });
-        }
-        if self.is_word("fn") {
-            self.bump();
-            let (name, _) = self.name()?;
-            self.expect_sym("(")?;
-            let mut params = Vec::new();
-            while !self.is_sym(")") {
-                let (param, _) = self.name()?;
-                let default = if self.eat_sym("=") {
-                    Some(self.expr()?)
-                } else {
-                    None
+            _ => self.ident("an attribute name")?.0,
+        };
+        let mut args = Vec::new();
+        if self.eat_sym("(") {
+            while !self.at_sym(")") {
+                let key = match (self.peek().clone(), self.peek_at(1)) {
+                    (Tok::Ident(key), Tok::Sym("=")) => {
+                        self.bump();
+                        self.bump();
+                        Some(key)
+                    }
+                    _ => None,
                 };
-                params.push((param, default));
+                args.push((key, self.expr()?));
                 if !self.eat_sym(",") {
                     break;
                 }
             }
             self.expect_sym(")")?;
-            let body = self.body()?;
-            return Ok(Item::Fn {
-                name,
-                params,
-                span: join(start, body.value.span()),
-                body,
-            });
         }
-        if self.is_word("for") {
-            self.bump();
-            let (var, _) = self.name()?;
-            self.expect_word("in")?;
-            let iter = self.expr()?;
-            self.expect_sym("{")?;
-            let items = self.items(false)?;
-            let end = self.expect_sym("}")?;
-            return Ok(Item::For {
-                var,
-                iter,
-                items,
-                span: join(start, end),
-            });
-        }
-        if self.is_word("if") {
-            self.bump();
-            let cond = self.expr()?;
-            self.expect_sym("{")?;
-            let then = self.items(false)?;
-            let mut end = self.expect_sym("}")?;
-            let mut otherwise = Vec::new();
-            if self.is_word("else") {
-                self.bump();
-                self.expect_sym("{")?;
-                otherwise = self.items(false)?;
-                end = self.expect_sym("}")?;
+        self.expect_sym("]")?;
+        Ok(Attr {
+            name,
+            args,
+            span: self.join(start),
+        })
+    }
+
+    fn item(&mut self) -> Parsed<Item> {
+        let mut doc: Vec<String> = Vec::new();
+        let mut attrs = Vec::new();
+        let start = self.span();
+        loop {
+            match self.peek().clone() {
+                Tok::Doc(text) => {
+                    self.bump();
+                    doc.push(text);
+                }
+                Tok::Sym("#[") => attrs.push(self.attr("#[")?),
+                _ => break,
             }
-            return Ok(Item::If {
-                cond,
-                then,
-                otherwise,
-                span: join(start, end),
-            });
         }
-        // `"make verify" = "…"`: a field whose name is data (commands).
-        if let Tok::Str(parts) = self.peek().clone()
-            && matches!(self.peek_at(1), Tok::Sym("="))
-        {
-            let span = self.bump().span;
-            let name = literal(&parts)
-                .ok_or_else(|| Error::at(span, "a field name cannot contain `{…}`"))?;
-            self.bump();
-            let value = self.expr()?;
-            return Ok(Item::Field {
-                span: join(span, value.span()),
-                name,
-                value,
-            });
-        }
-        let doc = self.doc_above(start.start);
-        let (name, name_span) = self.name()?;
-        if self.eat_sym("=") {
-            let value = self.expr()?;
-            // `release = kubernetes("x") { … }`: a value with settings.
-            if self.is_sym("{") {
-                self.bump();
-                let items = self.items(false)?;
-                let end = self.expect_sym("}")?;
-                return Ok(Item::Block {
-                    kind: name,
-                    label: None,
-                    value: Some(value),
-                    items,
-                    doc,
-                    span: join(name_span, end),
-                });
+        let doc = (!doc.is_empty()).then(|| doc.join("\n"));
+        let keyword = match self.peek().clone() {
+            Tok::Ident(word) => word,
+            _ => {
+                return Err(Error::at(
+                    self.span(),
+                    format!(
+                        "expected an item (check, group, fn, const, …), found {}",
+                        self.describe()
+                    ),
+                ));
             }
-            return Ok(Item::Field {
-                span: join(name_span, value.span()),
-                name,
-                value,
-            });
-        }
-        // `kind [label] [= value] [{ items }]`
-        let label = match self.peek().clone() {
-            Tok::Str(_) => Some(self.primary()?),
-            Tok::Ident(word) if !KEYWORDS.contains(&word.as_str()) => {
-                let span = self.bump().span;
-                Some(Expr::Str(vec![StrPart::Lit(word)], span))
-            }
-            _ => None,
         };
-        let value = if self.eat_sym("=") {
-            Some(self.expr()?)
+        let kind_start = self.span();
+        let item_start = if attrs.is_empty() && doc.is_none() {
+            kind_start
+        } else {
+            start
+        };
+        match keyword.as_str() {
+            "const" if matches!(self.peek_at(1), Tok::Ident(word) if word == "fn") => {
+                self.bump();
+                let function = self.function(true, kind_start)?;
+                Ok(self.finish(
+                    function.name.clone(),
+                    doc,
+                    attrs,
+                    ItemKind::Fn(function),
+                    item_start,
+                ))
+            }
+            "const" => {
+                self.bump();
+                let (name, name_span) = self.ident("a constant name")?;
+                self.name_span = name_span;
+                let ty = if self.eat_sym(":") {
+                    Some(self.type_expr()?)
+                } else {
+                    None
+                };
+                self.expect_sym("=")?;
+                let value = self.expr()?;
+                self.expect_sym(";")?;
+                Ok(self.finish(name, doc, attrs, ItemKind::Const { ty, value }, item_start))
+            }
+            "fn" => {
+                let function = self.function(false, kind_start)?;
+                Ok(self.finish(
+                    function.name.clone(),
+                    doc,
+                    attrs,
+                    ItemKind::Fn(function),
+                    item_start,
+                ))
+            }
+            "struct" => {
+                self.bump();
+                let (name, name_span) = self.ident("a struct name")?;
+                self.name_span = name_span;
+                self.expect_sym("{")?;
+                let mut fields = Vec::new();
+                while !self.at_sym("}") {
+                    let (field, _) = self.ident("a field name")?;
+                    self.expect_sym(":")?;
+                    fields.push((field, self.type_expr()?));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym("}")?;
+                Ok(self.finish(name, doc, attrs, ItemKind::Struct { fields }, item_start))
+            }
+            "group" => {
+                self.bump();
+                let (name, name_span) = self.ident("a group name")?;
+                self.name_span = name_span;
+                self.expect_sym("{")?;
+                let mut items = Vec::new();
+                while !self.at_sym("}") && !self.at_eof() {
+                    items.push(self.item()?);
+                }
+                self.expect_sym("}")?;
+                Ok(self.finish(name, doc, attrs, ItemKind::Group { items }, item_start))
+            }
+            "check" | "task" => {
+                self.bump();
+                let (name, name_span) = self.ident(&format!("a {keyword} name"))?;
+                self.name_span = name_span;
+                let body = self.block()?;
+                let kind = if keyword == "check" {
+                    ItemKind::Check { body }
+                } else {
+                    ItemKind::Task { body }
+                };
+                Ok(self.finish(name, doc, attrs, kind, item_start))
+            }
+            "environment" | "profile" | "artifact" => {
+                self.bump();
+                let (name, name_span) = self.ident(&format!("a {keyword} name"))?;
+                self.name_span = name_span;
+                self.expect_sym(";")?;
+                let kind = match keyword.as_str() {
+                    "environment" => ItemKind::Environment,
+                    "profile" => ItemKind::Profile,
+                    _ => ItemKind::Artifact,
+                };
+                Ok(self.finish(name, doc, attrs, kind, item_start))
+            }
+            "service" => {
+                self.bump();
+                let (name, name_span) = self.ident("a service name")?;
+                self.name_span = name_span;
+                let (mut start, mut ready) = (None, None);
+                if !self.eat_sym(";") {
+                    self.expect_sym("{")?;
+                    while !self.at_sym("}") && !self.at_eof() {
+                        if self.eat_word("start") {
+                            start = Some(self.block()?);
+                        } else if self.eat_word("ready") {
+                            ready = Some(self.block()?);
+                        } else {
+                            return Err(Error::at(self.span(), format!("expected `start {{ … }}` or `ready {{ … }}`, found {}", self.describe())));
+                        }
+                    }
+                    self.expect_sym("}")?;
+                }
+                Ok(self.finish(name, doc, attrs, ItemKind::Service { start, ready }, item_start))
+            }
+            "release" => {
+                self.bump();
+                let (name, name_span) = self.ident("a release name")?;
+                self.name_span = name_span;
+                self.expect_sym("{")?;
+                let mut steps = Vec::new();
+                let mut rollback = None;
+                while !self.at_sym("}") && !self.at_eof() {
+                    let step = self.step()?;
+                    if step.name == "rollback" {
+                        rollback = Some(step);
+                    } else {
+                        steps.push(step);
+                    }
+                }
+                self.expect_sym("}")?;
+                Ok(self.finish(
+                    name,
+                    doc,
+                    attrs,
+                    ItemKind::Release { steps, rollback },
+                    item_start,
+                ))
+            }
+            other => Err(Error::at(
+                kind_start,
+                format!("expected an item (check, group, fn, const, …), found `{other}`"),
+            )
+            .help(if other == "let" {
+                "a value shared by items is `const NAME = …;`"
+            } else {
+                "items: const, fn, struct, group, check, task, profile, service, artifact, environment, release"
+            })),
+        }
+    }
+
+    fn finish(
+        &self,
+        name: String,
+        doc: Option<String>,
+        attrs: Vec<Attr>,
+        kind: ItemKind,
+        start: Span,
+    ) -> Item {
+        Item {
+            name_span: self.name_span,
+            name,
+            doc,
+            attrs,
+            kind,
+            span: self.join(start),
+        }
+    }
+
+    fn step(&mut self) -> Parsed<StepDecl> {
+        let mut doc: Vec<String> = Vec::new();
+        let mut attrs = Vec::new();
+        let start = self.span();
+        loop {
+            match self.peek().clone() {
+                Tok::Doc(text) => {
+                    self.bump();
+                    doc.push(text);
+                }
+                Tok::Sym("#[") => attrs.push(self.attr("#[")?),
+                _ => break,
+            }
+        }
+        let name = if self.eat_word("rollback") {
+            "rollback".to_owned()
+        } else if self.eat_word("step") {
+            self.ident("a step name")?.0
+        } else {
+            return Err(Error::at(
+                self.span(),
+                format!("expected `step` or `rollback`, found {}", self.describe()),
+            ));
+        };
+        let mut param = None;
+        if self.eat_sym("(") {
+            if !self.at_sym(")") {
+                param = Some(self.param()?);
+            }
+            self.expect_sym(")")?;
+        }
+        let body = self.block()?;
+        Ok(StepDecl {
+            name,
+            attrs,
+            doc: (!doc.is_empty()).then(|| doc.join("\n")),
+            param,
+            body,
+            span: self.join(start),
+        })
+    }
+
+    fn param(&mut self) -> Parsed<Param> {
+        let (name, span) = self.ident("a parameter name")?;
+        self.expect_sym(":")?;
+        let ty = self.type_expr()?;
+        Ok(Param { name, ty, span })
+    }
+
+    fn function(&mut self, is_const: bool, start: Span) -> Parsed<FnDecl> {
+        self.bump(); // fn
+        let (name, name_span) = self.ident("a function name")?;
+        self.name_span = name_span;
+        self.expect_sym("(")?;
+        let mut params = Vec::new();
+        while !self.at_sym(")") {
+            params.push(self.param()?);
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        let ret = if self.eat_sym("->") {
+            Some(self.type_expr()?)
         } else {
             None
         };
-        let mut end = value
-            .as_ref()
-            .map(Expr::span)
-            .or(label.as_ref().map(Expr::span))
-            .unwrap_or(name_span);
-        let mut items = Vec::new();
-        if self.eat_sym("{") {
-            items = self.items(false)?;
-            end = self.expect_sym("}")?;
-        } else if label.is_none() && value.is_none() {
-            return Err(Error::at(
-                self.span(),
-                format!(
-                    "expected `=`, a name or a block after `{name}`, found {}",
-                    describe(self.peek())
-                ),
-            )
-            .help(format!(
-                "a field is `{name} = value`; a declaration is `{name} label {{ … }}` or `{name} label = value`"
-            )));
-        }
-        Ok(Item::Block {
-            kind: name,
-            label,
-            value,
-            items,
-            doc,
-            span: join(name_span, end),
+        let body = self.block()?;
+        Ok(FnDecl {
+            name,
+            is_const,
+            params,
+            ret,
+            body,
+            span: self.join(start),
         })
     }
 
-    /// The `#` comment lines directly above `offset` (no blank line between).
-    fn doc_above(&self, offset: usize) -> Option<String> {
-        if self.source.is_empty() {
-            return None;
+    fn type_expr(&mut self) -> Parsed<TypeExpr> {
+        let start = self.span();
+        if self.eat_sym("(") {
+            self.expect_sym(")")?;
+            return Ok(TypeExpr {
+                name: "()".into(),
+                args: Vec::new(),
+                span: self.join(start),
+            });
         }
-        let before = &self.source[..offset.min(self.source.len())];
-        let mut lines: Vec<&str> = before.split('\n').collect();
-        // The declaration's own line up to the declaration: only indentation.
-        if !lines.pop().unwrap_or_default().trim().is_empty() {
-            return None;
+        let (name, _) = self.ident("a type")?;
+        let mut args = Vec::new();
+        if self.eat_sym("<") {
+            loop {
+                args.push(self.type_expr()?);
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            self.expect_sym(">")?;
         }
-        let mut doc: Vec<&str> = Vec::new();
-        while let Some(line) = lines.pop() {
-            match line.trim().strip_prefix('#') {
-                Some(text) => doc.push(text.strip_prefix(' ').unwrap_or(text)),
-                None => break,
+        Ok(TypeExpr {
+            name,
+            args,
+            span: self.join(start),
+        })
+    }
+
+    fn block(&mut self) -> Parsed<Block> {
+        let start = self.expect_sym("{")?;
+        let saved = self.no_struct;
+        self.no_struct = false;
+        let mut stmts = Vec::new();
+        let mut tail = None;
+        while !self.at_sym("}") && !self.at_eof() {
+            if let Some(stmt) = self.stmt()? {
+                stmts.push(stmt);
+                continue;
+            }
+            let expr = self.expr()?;
+            let block_like = matches!(expr, Expr::If { .. } | Expr::Match { .. } | Expr::Block(_));
+            if self.eat_sym(";") {
+                stmts.push(Stmt::Expr(expr));
+            } else if self.at_sym("}") {
+                tail = Some(Box::new(expr));
+            } else if block_like {
+                stmts.push(Stmt::Expr(expr));
+            } else {
+                return Err(Error::at(
+                    self.span(),
+                    format!("expected `;` or `}}`, found {}", self.describe()),
+                ));
             }
         }
-        if doc.is_empty() {
-            return None;
-        }
-        doc.reverse();
-        Some(doc.join("\n"))
-    }
-
-    fn body(&mut self) -> Result<Body, Error> {
-        self.expect_sym("{")?;
-        let mut lets = Vec::new();
-        while self.is_word("let") {
-            let start = self.bump().span;
-            let (name, _) = self.name()?;
-            self.expect_sym("=")?;
-            let value = self.expr()?;
-            lets.push((name, value.clone(), join(start, value.span())));
-            while self.eat_sym(";") || self.eat_sym(",") {}
-        }
-        let value = self.expr()?;
         self.expect_sym("}")?;
-        Ok(Body {
-            lets,
-            value: Box::new(value),
+        self.no_struct = saved;
+        Ok(Block {
+            stmts,
+            tail,
+            span: self.join(start),
         })
     }
 
-    pub fn expr(&mut self) -> Result<Expr, Error> {
+    /// A statement that is not an expression, or None.
+    fn stmt(&mut self) -> Parsed<Option<Stmt>> {
+        let start = self.span();
+        if self.eat_word("let") {
+            let mutable = self.eat_word("mut");
+            let (name, _) = self.ident("a variable name")?;
+            let ty = if self.eat_sym(":") {
+                Some(self.type_expr()?)
+            } else {
+                None
+            };
+            self.expect_sym("=")?;
+            let value = self.expr()?;
+            self.expect_sym(";")?;
+            return Ok(Some(Stmt::Let {
+                name,
+                mutable,
+                ty,
+                value,
+                span: self.join(start),
+            }));
+        }
+        if self.eat_word("assert") {
+            let cond = self.expr()?;
+            let message = if self.eat_sym(",") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            self.expect_sym(";")?;
+            return Ok(Some(Stmt::Assert {
+                cond,
+                message,
+                span: self.join(start),
+            }));
+        }
+        if self.eat_word("return") {
+            let value = if self.at_sym(";") {
+                None
+            } else {
+                Some(self.expr()?)
+            };
+            self.expect_sym(";")?;
+            return Ok(Some(Stmt::Return {
+                value,
+                span: self.join(start),
+            }));
+        }
+        if self.eat_word("for") {
+            let (var, _) = self.ident("a loop variable")?;
+            if !self.eat_word("in") {
+                return Err(Error::at(self.span(), "expected `in`"));
+            }
+            let iter = self.head_expr()?;
+            let body = self.block()?;
+            return Ok(Some(Stmt::For {
+                var,
+                iter,
+                body,
+                span: self.join(start),
+            }));
+        }
+        if let (Tok::Ident(name), Tok::Sym("=")) = (self.peek().clone(), self.peek_at(1))
+            && !KEYWORDS.contains(&name.as_str())
+        {
+            self.bump();
+            self.bump();
+            let value = self.expr()?;
+            self.expect_sym(";")?;
+            return Ok(Some(Stmt::Assign {
+                name,
+                value,
+                span: self.join(start),
+            }));
+        }
+        Ok(None)
+    }
+
+    /// An expression before a block (`if c {`): no struct literals.
+    fn head_expr(&mut self) -> Parsed<Expr> {
+        let saved = self.no_struct;
+        self.no_struct = true;
+        let expr = self.expr();
+        self.no_struct = saved;
+        expr
+    }
+
+    pub fn expr(&mut self) -> Parsed<Expr> {
         self.binary(0)
     }
 
-    fn binary(&mut self, level: usize) -> Result<Expr, Error> {
-        const LEVELS: [&[&str]; 6] = [
-            &["or"],
-            &["and"],
-            &["==", "!=", "<", "<=", ">", ">=", "in"],
-            &["??"],
-            &["+", "-"],
-            &["*", "/", "%"],
-        ];
-        if level == LEVELS.len() {
-            return self.unary();
-        }
-        let mut left = self.binary(level + 1)?;
+    fn binary(&mut self, min: u8) -> Parsed<Expr> {
+        let mut left = self.unary()?;
         loop {
-            let operator = match self.peek() {
-                Tok::Sym(symbol) if LEVELS[level].contains(symbol) => *symbol,
-                Tok::Ident(word) if LEVELS[level].contains(&word.as_str()) => LEVELS[level]
-                    .iter()
-                    .copied()
-                    .find(|op| *op == word)
-                    .unwrap_or("?"),
-                _ => return Ok(left),
+            let (op, precedence) = match self.peek() {
+                Tok::Sym("||") => ("||", 1),
+                Tok::Sym("&&") => ("&&", 2),
+                Tok::Sym("==") => ("==", 3),
+                Tok::Sym("!=") => ("!=", 3),
+                Tok::Sym("<") => ("<", 3),
+                Tok::Sym("<=") => ("<=", 3),
+                Tok::Sym(">") => (">", 3),
+                Tok::Sym(">=") => (">=", 3),
+                Tok::Sym("+") => ("+", 4),
+                Tok::Sym("-") => ("-", 4),
+                Tok::Sym("*") => ("*", 5),
+                Tok::Sym("/") => ("/", 5),
+                Tok::Sym("%") => ("%", 5),
+                _ => break,
             };
+            if precedence < min {
+                break;
+            }
             self.bump();
-            let right = self.binary(level + 1)?;
-            let span = join(left.span(), right.span());
-            left = Expr::Binary(operator, Box::new(left), Box::new(right), span);
+            let right = self.binary(precedence + 1)?;
+            let span = Span {
+                file: left.span().file,
+                start: left.span().start,
+                end: right.span().end,
+            };
+            left = Expr::Binary(op, Box::new(left), Box::new(right), span);
         }
+        Ok(left)
     }
 
-    fn unary(&mut self) -> Result<Expr, Error> {
+    fn unary(&mut self) -> Parsed<Expr> {
         let start = self.span();
-        if self.is_word("not") || self.is_sym("!") {
-            self.bump();
-            let value = self.unary()?;
-            return Ok(Expr::Unary(
-                "not",
-                Box::new(value.clone()),
-                join(start, value.span()),
-            ));
-        }
-        if self.eat_sym("-") {
-            let value = self.unary()?;
-            return Ok(Expr::Unary(
-                "-",
-                Box::new(value.clone()),
-                join(start, value.span()),
-            ));
+        for op in ["!", "-"] {
+            if self.eat_sym(op) {
+                let inner = self.unary()?;
+                return Ok(Expr::Unary(op, Box::new(inner), self.join(start)));
+            }
         }
         self.postfix()
     }
 
-    fn postfix(&mut self) -> Result<Expr, Error> {
-        let mut value = self.primary()?;
+    fn postfix(&mut self) -> Parsed<Expr> {
+        let start = self.span();
+        let mut expr = self.primary()?;
         loop {
-            if self.eat_sym(".") {
-                let (field, span) = self.name()?;
-                value = Expr::Field(Box::new(value.clone()), field, join(value.span(), span));
-            } else if self.is_sym("(") {
-                self.bump();
-                let mut args = Vec::new();
-                while !self.is_sym(")") {
-                    let named = match (self.peek().clone(), self.peek_at(1).clone()) {
-                        (Tok::Ident(name), Tok::Sym(":")) => {
-                            self.bump();
-                            self.bump();
-                            Some(name)
-                        }
-                        _ => None,
-                    };
-                    args.push((named, self.expr()?));
-                    if !self.eat_sym(",") {
-                        break;
+            if self.eat_sym("?") {
+                expr = Expr::Try(Box::new(expr), self.join(start));
+            } else if self.eat_sym(".") {
+                let (name, _) = match self.peek().clone() {
+                    Tok::Int(number) => {
+                        let span = self.bump().span;
+                        (number.to_string(), span)
                     }
-                }
-                let end = self.expect_sym(")")?;
-                value = Expr::Call {
-                    span: join(value.span(), end),
-                    callee: Box::new(value),
-                    args,
+                    _ => self.ident("a field or method name")?,
                 };
-            } else if self.is_sym("[") {
+                if self.eat_sym("(") {
+                    let args = self.args()?;
+                    expr = Expr::Method {
+                        receiver: Box::new(expr),
+                        name,
+                        args,
+                        span: self.join(start),
+                    };
+                } else {
+                    expr = Expr::Field(Box::new(expr), name, self.join(start));
+                }
+            } else if self.at_sym("(") {
                 self.bump();
+                let args = self.args()?;
+                expr = Expr::Call {
+                    callee: Box::new(expr),
+                    args,
+                    span: self.join(start),
+                };
+            } else if self.eat_sym("[") {
                 let index = self.expr()?;
-                let end = self.expect_sym("]")?;
-                value = Expr::Index(
-                    Box::new(value.clone()),
-                    Box::new(index),
-                    join(value.span(), end),
-                );
+                self.expect_sym("]")?;
+                expr = Expr::Index(Box::new(expr), Box::new(index), self.join(start));
             } else {
-                return Ok(value);
+                break;
             }
         }
+        Ok(expr)
     }
 
-    fn primary(&mut self) -> Result<Expr, Error> {
-        let token = self.bump();
-        let span = token.span;
-        Ok(match token.tok {
-            Tok::Int(value) => Expr::Int(value, span),
-            Tok::Duration(value) => Expr::Duration(value, span),
+    fn args(&mut self) -> Parsed<Vec<Expr>> {
+        let saved = self.no_struct;
+        self.no_struct = false;
+        let mut args = Vec::new();
+        while !self.at_sym(")") {
+            if matches!(self.peek_at(1), Tok::Sym(":")) && matches!(self.peek(), Tok::Ident(_)) {
+                return Err(
+                    Error::at(self.span(), "functions take positional arguments")
+                        .help("pass a struct, or use the builder methods of a std type"),
+                );
+            }
+            args.push(self.expr()?);
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        self.no_struct = saved;
+        Ok(args)
+    }
+
+    fn primary(&mut self) -> Parsed<Expr> {
+        let start = self.span();
+        match self.peek().clone() {
+            Tok::Int(number) => {
+                self.bump();
+                Ok(Expr::Int(number, start))
+            }
+            Tok::Duration(seconds) => {
+                self.bump();
+                Ok(Expr::Duration(seconds, start))
+            }
             Tok::Str(parts) => {
+                self.bump();
                 let mut out = Vec::new();
                 for part in parts {
                     match part {
                         Part::Lit(text) => out.push(StrPart::Lit(text)),
-                        Part::Hole(source, offset) => {
-                            let hint = |error: Error| {
-                                if error.help.is_some() {
-                                    error
-                                } else {
-                                    error.help("`{` in a string starts a value like `{name}`; write `{{` and `}}` for literal braces")
-                                }
-                            };
+                        Part::Hole(text, offset) => {
+                            let tokens = lex(self.file, &text, offset)?;
                             let mut inner = Parser {
-                                tokens: lex(self.file, &source, offset).map_err(hint)?,
+                                tokens,
                                 index: 0,
                                 file: self.file,
-                                source: String::new(),
+                                no_struct: false,
+                                name_span: Span::default(),
                             };
-                            let expr = inner.expr().map_err(hint)?;
-                            inner.expect_eof().map_err(hint)?;
+                            let expr = inner.expr()?;
+                            if !inner.at_eof() {
+                                return Err(Error::at(
+                                    inner.span(),
+                                    "unexpected text inside `{…}`",
+                                )
+                                .help("`{name}`, `{value.field}` or `{call()}` put a value in; write `{{` for a brace"));
+                            }
                             out.push(StrPart::Expr(expr));
                         }
                     }
                 }
-                Expr::Str(out, span)
+                Ok(Expr::Str(out, start))
             }
-            Tok::Ident(word) => match word.as_str() {
-                "true" => Expr::Bool(true, span),
-                "false" => Expr::Bool(false, span),
-                "none" => Expr::None(span),
-                "if" => {
-                    let cond = self.expr()?;
-                    let then = self.body()?;
-                    self.expect_word("else").map_err(|error| {
-                        error.help("an `if` that produces a value needs an `else`")
-                    })?;
-                    let otherwise = if self.is_word("if") {
-                        let nested = self.primary()?;
-                        Body {
-                            lets: Vec::new(),
-                            value: Box::new(nested),
-                        }
-                    } else {
-                        self.body()?
-                    };
-                    let end = otherwise.value.span();
-                    Expr::If {
-                        cond: Box::new(cond),
-                        then,
-                        otherwise,
-                        span: join(span, end),
-                    }
-                }
-                "match" => {
-                    let (subject, subject_span) = self.name()?;
-                    if subject != "changed" {
-                        return Err(Error::at(subject_span, "`match` takes `changed`")
-                            .help("match changed { only(group) => …, _ => … }"));
-                    }
-                    self.expect_sym("{")?;
-                    let mut arms = Vec::new();
-                    while !self.is_sym("}") {
-                        let pattern = if self.is_word("_") {
-                            self.bump();
-                            None
-                        } else {
-                            Some(self.expr()?)
-                        };
-                        self.expect_sym("=>")?;
-                        let value = self.expr()?;
-                        arms.push((pattern, value));
-                        while self.eat_sym(",") {}
-                    }
-                    let end = self.expect_sym("}")?;
-                    Expr::Match {
-                        arms,
-                        span: join(span, end),
-                    }
-                }
-                word if KEYWORDS.contains(&word) => {
-                    return Err(Error::at(span, format!("`{word}` cannot start a value")));
-                }
-                _ => Expr::Name(word, span),
-            },
             Tok::Sym("(") => {
-                let value = self.expr()?;
+                self.bump();
+                if self.eat_sym(")") {
+                    return Ok(Expr::Unit(self.join(start)));
+                }
+                let saved = self.no_struct;
+                self.no_struct = false;
+                let inner = self.expr()?;
+                self.no_struct = saved;
                 self.expect_sym(")")?;
-                value
+                Ok(inner)
             }
             Tok::Sym("[") => {
+                self.bump();
+                let saved = self.no_struct;
+                self.no_struct = false;
                 let mut items = Vec::new();
-                while !self.is_sym("]") {
-                    let value = self.expr()?;
-                    if items.is_empty() && self.is_word("for") {
-                        self.bump();
-                        let (var, _) = self.name()?;
-                        self.expect_word("in")?;
-                        let iter = self.expr()?;
-                        let cond = if self.is_word("if") {
-                            self.bump();
-                            Some(Box::new(self.expr()?))
+                while !self.at_sym("]") {
+                    items.push(self.expr()?);
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym("]")?;
+                self.no_struct = saved;
+                Ok(Expr::List(items, self.join(start)))
+            }
+            Tok::Sym("{") => Ok(Expr::Block(self.block()?)),
+            Tok::Sym("|") => Err(Error::at(start, "Citrus has no closures")
+                .help("loop with `for`, or call a named `fn`")),
+            Tok::Ident(word) if word == "true" || word == "false" => {
+                self.bump();
+                Ok(Expr::Bool(word == "true", start))
+            }
+            Tok::Ident(word) if word == "if" => {
+                self.bump();
+                let cond = self.head_expr()?;
+                let then = self.block()?;
+                let otherwise = if self.eat_word("else") {
+                    if self.at_word("if") {
+                        Some(Box::new(self.primary()?))
+                    } else {
+                        Some(Box::new(Expr::Block(self.block()?)))
+                    }
+                } else {
+                    None
+                };
+                Ok(Expr::If {
+                    cond: Box::new(cond),
+                    then,
+                    otherwise,
+                    span: self.join(start),
+                })
+            }
+            Tok::Ident(word) if word == "match" => {
+                self.bump();
+                let value = self.head_expr()?;
+                self.expect_sym("{")?;
+                let mut arms = Vec::new();
+                while !self.at_sym("}") {
+                    let pattern = self.pattern()?;
+                    self.expect_sym("=>")?;
+                    let body = self.expr()?;
+                    let block = matches!(body, Expr::Block(_));
+                    arms.push((pattern, body));
+                    if !self.eat_sym(",") && !block {
+                        break;
+                    }
+                }
+                self.expect_sym("}")?;
+                Ok(Expr::Match {
+                    value: Box::new(value),
+                    arms,
+                    span: self.join(start),
+                })
+            }
+            Tok::Ident(word)
+                if (word == "run" || word == "cmd") && matches!(self.peek_at(1), Tok::Sym("!")) =>
+            {
+                self.bump();
+                self.bump();
+                self.expect_sym("(")?;
+                let Tok::Str(parts) = self.peek().clone() else {
+                    return Err(Error::at(
+                        self.span(),
+                        format!("`{word}!` takes a command line in quotes"),
+                    )
+                    .help(format!("{word}!(\"cargo test --locked\")")));
+                };
+                let text_span = self.bump().span;
+                self.expect_sym(")")?;
+                let (env, words) = self.command_words(&parts, text_span)?;
+                if words.is_empty() {
+                    return Err(Error::at(text_span, "an empty command"));
+                }
+                Ok(Expr::Command {
+                    run: word == "run",
+                    env,
+                    words,
+                    span: self.join(start),
+                })
+            }
+            Tok::Ident(word) if KEYWORDS.contains(&word.as_str()) => Err(Error::at(
+                start,
+                format!("`{word}` cannot start an expression here"),
+            )),
+            Tok::Ident(_) => {
+                let mut segments = vec![self.ident("a name")?.0];
+                while self.at_sym("::") {
+                    self.bump();
+                    segments.push(self.ident("a name after `::`")?.0);
+                }
+                let simple = segments.len() == 1;
+                let capital = segments[0].starts_with(|c: char| c.is_ascii_uppercase());
+                if simple && capital && !self.no_struct && self.at_sym("{") {
+                    self.bump();
+                    let mut fields = Vec::new();
+                    while !self.at_sym("}") {
+                        let (field, field_span) = self.ident("a field name")?;
+                        let value = if self.eat_sym(":") {
+                            self.expr()?
                         } else {
-                            None
+                            Expr::Path(vec![field.clone()], field_span)
                         };
-                        let end = self.expect_sym("]")?;
-                        return Ok(Expr::Comprehension {
-                            value: Box::new(value),
-                            var,
-                            iter: Box::new(iter),
-                            cond,
-                            span: join(span, end),
-                        });
-                    }
-                    items.push(value);
-                    if !self.eat_sym(",") {
-                        break;
-                    }
-                }
-                let end = self.expect_sym("]")?;
-                Expr::List(items, join(span, end))
-            }
-            Tok::Sym("{") => {
-                let mut entries = Vec::new();
-                while !self.is_sym("}") {
-                    let key = match self.bump().tok {
-                        Tok::Ident(name) => name,
-                        Tok::Str(parts) => literal(&parts).ok_or_else(|| {
-                            Error::at(
-                                self.tokens[self.index - 1].span,
-                                "a map key cannot contain `{…}`",
-                            )
-                        })?,
-                        other => {
-                            return Err(Error::at(
-                                self.tokens[self.index - 1].span,
-                                format!("expected a map key, found {}", describe(&other)),
-                            ));
+                        fields.push((field, value));
+                        if !self.eat_sym(",") {
+                            break;
                         }
-                    };
-                    self.expect_sym(":")
-                        .map_err(|error| error.help("map entries are `key: value`"))?;
-                    entries.push((key, self.expr()?));
-                    if !self.eat_sym(",") {
-                        break;
+                    }
+                    self.expect_sym("}")?;
+                    return Ok(Expr::StructLit {
+                        name: segments.remove(0),
+                        fields,
+                        span: self.join(start),
+                    });
+                }
+                Ok(Expr::Path(segments, self.join(start)))
+            }
+            _ => Err(Error::at(
+                start,
+                format!("expected an expression, found {}", self.describe()),
+            )),
+        }
+    }
+
+    /// Split a command line into words: whitespace separates, `'…'` keeps
+    /// spaces, `{x}` is part of the word it is in, `{xs...}` a whole word
+    /// spread from a list. No shell: `|`, `>`, `*` are plain characters.
+    fn command_words(&self, parts: &[Part], span: Span) -> Parsed<CommandLine> {
+        let mut words: Vec<CmdWord> = Vec::new();
+        let mut current: Vec<CmdPiece> = Vec::new();
+        let mut text = String::new();
+        let mut quoted = false;
+        let mut splat_pending = false;
+        let flush = |current: &mut Vec<CmdPiece>, text: &mut String, words: &mut Vec<CmdWord>| {
+            if !text.is_empty() {
+                current.push(CmdPiece::Lit(std::mem::take(text)));
+            }
+            if !current.is_empty() {
+                words.push(CmdWord::Word(std::mem::take(current)));
+            }
+        };
+        for part in parts {
+            match part {
+                Part::Lit(literal) => {
+                    for ch in literal.chars() {
+                        if splat_pending && !ch.is_whitespace() {
+                            return Err(Error::at(span, "`{list...}` must be a word of its own")
+                                .help("put a space after it"));
+                        }
+                        splat_pending = false;
+                        match ch {
+                            '\'' => quoted = !quoted,
+                            c if c.is_whitespace() && !quoted => {
+                                flush(&mut current, &mut text, &mut words)
+                            }
+                            c => text.push(c),
+                        }
                     }
                 }
-                let end = self.expect_sym("}")?;
-                Expr::Map(entries, join(span, end))
+                Part::Hole(source, offset) => {
+                    if let Some(list) = source.trim().strip_suffix("...") {
+                        if !text.is_empty() || !current.is_empty() || quoted {
+                            return Err(Error::at(span, "`{list...}` must be a word of its own"));
+                        }
+                        let expr = self.hole_expr(list, *offset)?;
+                        words.push(CmdWord::Splat(expr));
+                        splat_pending = true;
+                        continue;
+                    }
+                    if !text.is_empty() {
+                        current.push(CmdPiece::Lit(std::mem::take(&mut text)));
+                    }
+                    current.push(CmdPiece::Expr(self.hole_expr(source, *offset)?));
+                }
             }
-            other => {
-                return Err(Error::at(
-                    span,
-                    format!("expected a value, found {}", describe(&other)),
-                ));
+        }
+        if quoted {
+            return Err(Error::at(span, "unclosed `'` in the command"));
+        }
+        flush(&mut current, &mut text, &mut words);
+        // Leading `KEY=value` words set the environment, as in a shell.
+        let mut env = Vec::new();
+        while let Some(CmdWord::Word(pieces)) = words.first() {
+            let Some(CmdPiece::Lit(first)) = pieces.first() else {
+                break;
+            };
+            let Some((key, rest)) = first.split_once('=') else {
+                break;
+            };
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                break;
             }
-        })
-    }
-}
-
-fn literal(parts: &[Part]) -> Option<String> {
-    parts
-        .iter()
-        .map(|part| {
-            if let Part::Lit(text) = part {
-                Some(text.as_str())
-            } else {
-                None
+            let mut value = pieces[1..].to_vec();
+            if !rest.is_empty() {
+                value.insert(0, CmdPiece::Lit(rest.to_owned()));
             }
-        })
-        .collect()
-}
-
-fn join(start: Span, end: Span) -> Span {
-    Span {
-        file: start.file,
-        start: start.start,
-        end: end.end.max(start.start),
-    }
-}
-
-fn describe(tok: &Tok) -> String {
-    match tok {
-        Tok::Ident(name) => format!("`{name}`"),
-        Tok::Str(_) => "a string".into(),
-        Tok::Int(value) => format!("`{value}`"),
-        Tok::Duration(_) => "a duration".into(),
-        Tok::Sym(symbol) => format!("`{symbol}`"),
-        Tok::Eof => "the end of the file".into(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_declarations_loops_and_expressions() {
-        let file = parse_file(
-            0,
-            "citrus 1\nuse \"ci/more.ci\"\nlet names = [n for n in [\"a\", \"b\"] if n != \"c\"]\n\
-             fn image(name, tag = \"x\") { let base = \"r\"\n \"{base}/{name}:{tag}\" }\n\
-             for name in names {\n  check \"test-{name}\" { owns = [\"src/{name}/**\"], run = make(\"t\", JOBS: 2), cache = true }\n}\n\
-             project { base = \"origin/main\" }\n",
-        )
-        .unwrap();
-        assert_eq!(file.items.len(), 5);
-        assert!(
-            matches!(&file.items[3], Item::For { items, .. } if matches!(&items[0], Item::Block { kind, .. } if kind == "check"))
-        );
+            env.push((key.to_owned(), CmdWord::Word(value)));
+            words.remove(0);
+        }
+        Ok((env, words))
     }
 
-    #[test]
-    fn version_header_is_required_and_checked() {
-        assert!(
-            parse_file(0, "check \"a\" {}")
-                .unwrap_err()
-                .help
-                .unwrap()
-                .contains("citrus 1")
-        );
-        assert!(
-            parse_file(0, "citrus 2\n")
-                .unwrap_err()
-                .message
-                .contains("not supported")
-        );
+    fn hole_expr(&self, source: &str, offset: usize) -> Parsed<Expr> {
+        let tokens = lex(self.file, source, offset)?;
+        let mut inner = Parser {
+            tokens,
+            index: 0,
+            file: self.file,
+            no_struct: false,
+            name_span: Span::default(),
+        };
+        let expr = inner.expr()?;
+        if !inner.at_eof() {
+            return Err(Error::at(inner.span(), "unexpected text inside `{…}`")
+                .help("`{name}` puts a value in; write `{{` for a brace"));
+        }
+        Ok(expr)
     }
 
-    #[test]
-    fn errors_name_what_was_expected() {
-        let error = parse_file(0, "citrus 1\ncheck a { paths [\"x\"] }").unwrap_err();
-        assert!(error.message.contains("expected `=`"), "{}", error.message);
-        let error = parse_file(0, "citrus 1\nlet x = if true { 1 }").unwrap_err();
-        assert!(error.help.unwrap().contains("else"));
+    fn pattern(&mut self) -> Parsed<Pattern> {
+        let start = self.span();
+        match self.peek().clone() {
+            Tok::Sym("_") => {
+                self.bump();
+                Ok(Pattern::Wild(start))
+            }
+            Tok::Str(_) | Tok::Int(_) | Tok::Sym("-") => Ok(Pattern::Lit(self.unary()?)),
+            Tok::Ident(word) if word == "true" || word == "false" => {
+                Ok(Pattern::Lit(self.primary()?))
+            }
+            Tok::Ident(word) if ["Some", "Ok", "Err", "None"].contains(&word.as_str()) => {
+                self.bump();
+                let inner = if self.eat_sym("(") {
+                    let inner = self.pattern()?;
+                    self.expect_sym(")")?;
+                    Some(Box::new(inner))
+                } else {
+                    None
+                };
+                Ok(Pattern::Variant(word, inner, self.join(start)))
+            }
+            Tok::Ident(_) => {
+                let (name, span) = self.ident("a pattern")?;
+                Ok(Pattern::Bind(name, span))
+            }
+            _ => Err(Error::at(
+                start,
+                format!("expected a pattern, found {}", self.describe()),
+            )),
+        }
     }
 }

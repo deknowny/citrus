@@ -1842,20 +1842,30 @@ fn ci_project(source: &str) -> Project {
     project
 }
 
-const CI: &str = r#"citrus 1
+const CI: &str = r#"#![citrus(2)]
+#![main("main")]
 
-project {
-  main = "main"
+/// `src/{name}.txt` says ok.
+fn says_ok(name: str) -> Result<()> {
+    let text = std::fs::read("src/{name}.txt")?;
+    assert text.contains("ok"), "Error: src/{name}.txt is not ok";
 }
 
-for name in ["a", "b"] {
-  check "check-{name}" = run("sh", "-c", "grep -q ok src/{name}.txt || {{ echo 'Error: src/{name}.txt is not ok'; exit 1; }}") {
-    paths = ["src/{name}.txt"]
-  }
+#[paths("src/a.txt")]
+check check_a {
+    says_ok("a")?;
 }
 
-# Copy a file once it exists.
-task prepare = [wait.file("ready.txt", timeout: 5s), copy("ready.txt", "out/copied.txt")]
+#[paths("src/b.txt")]
+check check_b {
+    says_ok("b")?;
+}
+
+/// Copy a file once it exists.
+task prepare {
+    std::wait::file("ready.txt", 5s)?;
+    std::fs::copy("ready.txt", "out/copied.txt")?;
+}
 "#;
 
 #[test]
@@ -1863,23 +1873,26 @@ fn checks_declared_in_citrus_ci_run_their_steps_and_are_reused() {
     let project = ci_project(CI);
     project.write("src/a.txt", "ok\n");
     project.write("src/b.txt", "bad\n");
-    let (run, code) = project.json(&["run", "check-a", "check-b"]);
+    let (run, code) = project.json(&["run", "check_a", "check_b"]);
     assert_eq!(code, 1, "{run}");
-    assert_eq!(target(&run, "check-a")["result"], "passed");
+    assert_eq!(target(&run, "check_a")["result"], "passed");
     assert!(
-        target(&run, "check-b")["first_error"]
+        target(&run, "check_b")["first_error"]
             .as_str()
             .unwrap()
             .contains("src/b.txt is not ok"),
         "{run}"
     );
-    let (again, _) = project.json(&["run", "check-a"]);
-    assert_eq!(target(&again, "check-a")["result"], "reused");
+    let (again, _) = project.json(&["run", "check_a"]);
+    assert_eq!(target(&again, "check_a")["result"], "reused");
 
-    // Changing what a check runs invalidates its earlier pass.
-    project.write("citrus.ci", &CI.replace("grep -q ok", "grep -q 'ok'"));
-    let (changed, _) = project.json(&["run", "check-a"]);
-    assert_eq!(target(&changed, "check-a")["result"], "passed", "{changed}");
+    // Changing what a check runs, here a function it calls, invalidates its earlier pass.
+    project.write(
+        "citrus.ci",
+        &CI.replace("text.contains(\"ok\")", "text.trim().contains(\"ok\")"),
+    );
+    let (changed, _) = project.json(&["run", "check_a"]);
+    assert_eq!(target(&changed, "check_a")["result"], "passed", "{changed}");
 
     let (checked, code) = project.json(&["check"]);
     assert_eq!(code, 0, "{checked}");
@@ -1889,8 +1902,9 @@ fn checks_declared_in_citrus_ci_run_their_steps_and_are_reused() {
 
 #[test]
 fn a_shell_brace_in_a_string_explains_interpolation() {
-    let project =
-        ci_project("citrus 1\ncheck x = sh(\"a || { b; }\") {\n  paths = [\"src/**\"]\n}\n");
+    let project = ci_project(
+        "#![citrus(2)]\n#[paths(\"src/**\")]\ncheck x {\n    run!(\"sh -c 'a || { b; }'\")?;\n}\n",
+    );
     let message = project.json(&["status"]).0["error"]
         .as_str()
         .unwrap()
@@ -1901,13 +1915,13 @@ fn a_shell_brace_in_a_string_explains_interpolation() {
 #[test]
 fn an_error_in_citrus_ci_points_at_the_line() {
     let project = ci_project(
-        "citrus 1\ncheck x {\n  paths = [\"src/**\"]\n}\ncheck y = mak(\"x\") {\n  paths = [\"src/**\"]\n}\n",
+        "#![citrus(2)]\n#[paths(\"src/**\")]\ncheck x {\n    run!(\"make x\")?;\n}\n#[pths(\"src/**\")]\ncheck y {\n    run!(\"make y\")?;\n}\n",
     );
     let (error, code) = project.json(&["status"]);
     assert_eq!(code, 2);
     let message = error["error"].as_str().unwrap();
     assert!(
-        message.contains("citrus.ci:5:11") && message.contains("did you mean `make`?"),
+        message.contains("citrus.ci:6:1") && message.contains("did you mean `#[paths]`?"),
         "{message}"
     );
 }
@@ -1925,7 +1939,7 @@ fn tasks_run_built_in_steps_without_a_shell() {
     fs::remove_file(project.root().join("ready.txt")).unwrap();
     let (failed, code) = project.json(&["do", "prepare"]);
     assert_eq!(code, 1);
-    assert_eq!(failed["source"], "citrus.ci:14");
+    assert_eq!(failed["source"], "citrus.ci:20");
     assert!(
         project.json(&["do", "prepar"]).0["error"]
             .as_str()

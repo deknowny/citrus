@@ -90,7 +90,7 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
                     .iter()
                     .chain(target.arms.iter().flat_map(|(_, steps)| steps))
                     .filter_map(|step| match &step.work {
-                        crate::lang::compile::Work::Process { argv, .. }
+                        crate::model::Work::Process { argv, .. }
                             if argv.first().map(String::as_str) == Some("make") =>
                         {
                             argv.iter()

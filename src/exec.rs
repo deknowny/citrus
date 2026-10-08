@@ -39,7 +39,7 @@ pub struct Context {
     pub store: Store,
     pub manifest: Manifest,
     /// The compiled `citrus.ci`, when the repository has one.
-    pub project: Option<crate::lang::compile::Project>,
+    pub project: Option<crate::model::Project>,
 }
 
 impl Context {
@@ -47,7 +47,7 @@ impl Context {
     /// project's first profile.
     pub fn open(profile: Option<String>) -> Result<Context> {
         let mut repo = Repo::discover()?;
-        let (manifest, project) = match crate::lang::compile::load(&repo.root)
+        let (manifest, project) = match crate::model::load(&repo.root)
             .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
         {
             // `citrus.ci` is the whole configuration; without it, generic defaults.
@@ -123,8 +123,8 @@ impl Context {
                                 .or_insert_with(|| value.clone());
                         }
                         for step in &mut target.steps {
-                            if let crate::lang::compile::Work::Process { env, .. }
-                            | crate::lang::compile::Work::Script { env, .. } = &mut step.work
+                            if let crate::model::Work::Process { env, .. }
+                            | crate::model::Work::Script { env, .. } = &mut step.work
                             {
                                 for (name, value) in &profile_env {
                                     if !env.iter().any(|(known, _)| known == name) {
@@ -521,8 +521,7 @@ impl Context {
                     started_services.push(service.name.clone());
                     for step in service.start.iter().chain(&service.ready) {
                         println!("── {}  (service {})", step.label, service.name);
-                        code =
-                            i64::from(crate::lang::compile::execute(step, &self.repo.root, false)?);
+                        code = i64::from(crate::model::execute(step, &self.repo.root, false)?);
                         if code != 0 {
                             println!("service {} did not start", service.name);
                             break;
@@ -540,7 +539,7 @@ impl Context {
                         step.label,
                         entry.source.as_deref().unwrap_or("citrus.ci")
                     );
-                    code = i64::from(crate::lang::compile::execute(step, &self.repo.root, false)?);
+                    code = i64::from(crate::model::execute(step, &self.repo.root, false)?);
                     if code != 0 {
                         break;
                     }

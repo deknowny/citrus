@@ -14,8 +14,8 @@ mod doctor;
 mod exec;
 mod integrate;
 mod lang;
-mod lang2;
 mod manifest;
+mod model;
 mod plan;
 mod release;
 mod repo;
@@ -213,12 +213,6 @@ enum Command {
     },
     /// Check citrus.ci before anything runs: syntax, names, fields, globs, portability.
     Check,
-    /// Write .ci files in the canonical layout (no aligned columns).
-    Fmt {
-        /// Only report files that are not formatted; exit 1 if any.
-        #[arg(long)]
-        check: bool,
-    },
     /// Run a task declared in citrus.ci (no name: list the tasks).
     Do { task: Option<String> },
     /// Check that this repository is set up so Citrus can be trusted.
@@ -236,13 +230,6 @@ enum Command {
     ApplyWorker { release: String },
     #[command(hide = true)]
     RefreshResources,
-    /// Rewrite v1 `.ci` files in language v2 (one-off, removed with v1).
-    #[command(hide = true)]
-    MigrateV2 {
-        files: Vec<String>,
-        #[arg(long)]
-        write: bool,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -355,9 +342,6 @@ fn main() {
 }
 
 fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Result<i32> {
-    if let Some(Command::MigrateV2 { files, write }) = &command {
-        return migrate_v2(files, *write);
-    }
     let mut context = Context::open(profile)?;
     let Some(command) = command else {
         return overview(&mut context, json);
@@ -419,7 +403,6 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
         }
         Command::Stats { days } => stats(&context, days, json),
         Command::Check => check_command(&context, json),
-        Command::Fmt { check } => fmt_command(&context, check, json),
         Command::Do { task } => do_command(&context, task, json),
         Command::Integrate { base, push, no_run } => {
             integrate_command(&mut context, base, push, !no_run, json)
@@ -650,7 +633,6 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             context.work(&run)?;
             Ok(0)
         }
-        Command::MigrateV2 { .. } => unreachable!("handled before the context opens"),
         Command::RefreshResources => {
             resources::refresh(&context)?;
             Ok(0)
@@ -1673,38 +1655,6 @@ fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool)
 }
 
 /// A task's description in a line: what it does, what blocks it.
-fn migrate_v2(files: &[String], write: bool) -> Result<i32> {
-    let texts: Vec<String> = files
-        .iter()
-        .map(std::fs::read_to_string)
-        .collect::<std::io::Result<_>>()?;
-    let mut sources = lang::Sources::default();
-    for (path, text) in files.iter().zip(&texts) {
-        sources.add(path.into(), text.clone());
-    }
-    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let names = lang::migrate::collect(&refs)
-        .map_err(|error| anyhow::anyhow!("{}", sources.render(&error)))?;
-    let mut failed = 0;
-    for (index, (path, text)) in files.iter().zip(&texts).enumerate() {
-        let converted = match lang::migrate::migrate(text, &names) {
-            Ok(converted) => converted,
-            Err(mut error) => {
-                error.span.file = index;
-                eprint!("{}", sources.render(&error));
-                failed += 1;
-                continue;
-            }
-        };
-        if write {
-            std::fs::write(path, converted)?;
-        } else {
-            println!("// ── {path}\n{converted}");
-        }
-    }
-    Ok(i32::from(failed > 0))
-}
-
 fn version_command(context: &Context, action: VersionAction, json: bool) -> Result<i32> {
     let committed = || -> Result<(String, String)> {
         let repo = &context.repo;
@@ -2244,44 +2194,6 @@ fn emit_release(context: &Context, item: &crate::state::Release, json: bool) -> 
     Ok(code)
 }
 
-fn fmt_command(context: &Context, check: bool, json: bool) -> Result<i32> {
-    let files = context
-        .project
-        .as_ref()
-        .map(|project| project.files.clone())
-        .unwrap_or_default();
-    let mut changed = Vec::new();
-    for file in &files {
-        let path = context.repo.root.join(file);
-        let text = std::fs::read_to_string(&path)?;
-        // Language v2 has no formatter yet: never rewrite it with v1's layout.
-        if lang2::is_v2(&text) {
-            continue;
-        }
-        let formatted = lang::layout::format(&text);
-        if formatted != text {
-            if !check {
-                std::fs::write(&path, &formatted)?;
-            }
-            changed.push(file.clone());
-        }
-    }
-    if json {
-        println!(
-            "{}",
-            json!({"schema": SCHEMA, "files": files, "changed": changed, "written": !check})
-        );
-    } else if changed.is_empty() {
-        println!("✓ {} .ci files are formatted", files.len());
-    } else {
-        let verb = if check { "not formatted" } else { "formatted" };
-        for file in &changed {
-            println!("  {verb}: {file}");
-        }
-    }
-    Ok(i32::from(check && !changed.is_empty()))
-}
-
 fn check_command(context: &Context, json: bool) -> Result<i32> {
     let Some(project) = &context.project else {
         if json {
@@ -2292,11 +2204,11 @@ fn check_command(context: &Context, json: bool) -> Result<i32> {
         return Ok(0);
     };
     // Context::open already failed on errors; here only warnings remain.
-    let (_, sources) = lang::compile::load(&context.repo.root)
+    let (_, sources) = model::load(&context.repo.root)
         .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
         .context("the configuration disappeared")?;
     let mut project = project.clone();
-    let dead = lang::compile::dead_globs(&project, &context.repo.root);
+    let dead = model::dead_globs(&project, &context.repo.root);
     project.warnings.extend(dead);
     let project = &project;
     if json {
@@ -2385,7 +2297,7 @@ fn do_command(context: &Context, task: Option<String>, json: bool) -> Result<i32
                 None => format!("no task {name}; tasks: {}", known.join(", ")),
             }
         })?;
-    let (_, sources) = lang::compile::load(&context.repo.root)
+    let (_, sources) = model::load(&context.repo.root)
         .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
         .context("citrus.ci disappeared")?;
     let started = std::time::Instant::now();
@@ -2397,7 +2309,7 @@ fn do_command(context: &Context, task: Option<String>, json: bool) -> Result<i32
             task.steps.len(),
             step.label
         );
-        let code = lang::compile::execute(step, &context.repo.root, json)?;
+        let code = model::execute(step, &context.repo.root, json)?;
         if code != 0 {
             if json {
                 println!(

@@ -7,8 +7,8 @@ use std::process::{Command, Stdio};
 use std::rc::Rc;
 
 use super::ast::*;
-use crate::lang::compile::{Step as WorkStep, Work};
 use crate::lang::{Sources, Span};
+use crate::model::{Step as WorkStep, Work};
 
 /// An error a body ends with: its message, where, and what it happened in.
 #[derive(Debug, Clone, PartialEq)]
@@ -815,7 +815,7 @@ impl<'a> Interp<'a> {
             label: label.clone(),
             work,
         };
-        match crate::lang::compile::execute(&step, self.root, false) {
+        match crate::model::execute(&step, self.root, false) {
             Ok(0) => Value::Ok(Box::new(Value::Unit)),
             Ok(code) => Value::Err(Rc::new(Failure {
                 message: format!("{label} failed ({code})"),

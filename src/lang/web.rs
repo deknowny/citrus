@@ -216,11 +216,6 @@ pub fn closure(files: &dyn Files, names: &[String], kind: Kind) -> Result<Vec<St
         .collect())
 }
 
-/// The workspace directory, for running pnpm (`pnpm --dir <it>`).
-pub fn root(files: &dyn Files) -> Result<String, String> {
-    Ok(workspace(files)?.root)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

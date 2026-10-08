@@ -29,14 +29,14 @@ pub struct Target {
     /// Extra environment of its steps.
     pub env: BTreeMap<String, String>,
     /// Steps declared in `citrus.ci`; empty means `run.local` (`make <target>`).
-    pub steps: Vec<crate::lang::compile::Step>,
+    pub steps: Vec<crate::model::Step>,
     /// The group it is declared in, and whether it narrows the group's paths.
     pub group: Option<String>,
     pub narrows: bool,
     /// Groups whose paths select it too.
     pub via: Vec<String>,
     /// `match changed` arms; a plan picks one (or none: `steps`).
-    pub arms: Vec<(crate::lang::compile::Cond, Vec<crate::lang::compile::Step>)>,
+    pub arms: Vec<(crate::model::Cond, Vec<crate::model::Step>)>,
     /// `file:line` of the declaration in `citrus.ci`.
     pub source: Option<String>,
     /// Profiles it belongs to; empty: all.
@@ -44,7 +44,7 @@ pub struct Target {
     /// Checks that already run this one.
     pub covered_by: Vec<String>,
     /// Plan-time condition.
-    pub when: Option<crate::lang::compile::Cond>,
+    pub when: Option<crate::model::Cond>,
     /// Order of declaration in `citrus.ci`: plans list checks in this order.
     pub position: usize,
     owned: GlobList,
@@ -79,7 +79,7 @@ impl GlobList {
 
 impl Target {
     /// A check declared in `citrus.ci`.
-    pub fn declared(check: &crate::lang::compile::Check, source: String) -> Result<Target> {
+    pub fn declared(check: &crate::model::Check, source: String) -> Result<Target> {
         let owned = GlobList::new(&check.owns)?;
         let extra = GlobList::new(&check.reads)?;
         Ok(Target {
@@ -159,7 +159,7 @@ pub struct Manifest {
     /// Prints `SIGNAL <name>` lines for changed paths.
     pub signals: Vec<String>,
     /// Named conditions reported with a plan.
-    pub labels: Vec<(String, crate::lang::compile::Cond)>,
+    pub labels: Vec<(String, crate::model::Cond)>,
 }
 
 /// A group: a named path set and the checks inside it.
@@ -190,7 +190,7 @@ impl Manifest {
 
     /// The checks of a compiled `citrus.ci`.
     pub fn from_project(
-        project: &crate::lang::compile::Project,
+        project: &crate::model::Project,
         sources: &crate::lang::Sources,
     ) -> Result<Manifest> {
         let mut targets = BTreeMap::new();

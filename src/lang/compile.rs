@@ -1,769 +1,243 @@
-//! From evaluated declarations to what Citrus runs: project settings, checks
-//! with their steps, tasks. Validation that needs the meaning of a block
-//! (known kinds and fields, portable actions, globs that match) lives here.
+//! A checked v2 program → the project model Citrus plans and runs: checks,
+//! groups, tasks, profiles, services, the runner, releases, artifacts and
+//! environments. Attribute arguments are evaluated here, once, as constants.
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
-use super::eval::{Action, Decl, Graph, Value};
-use super::{Error, Sources, Span};
+use serde_json::{Value as Json, json};
+use sha2::{Digest, Sha256};
 
-/// One unit of work Citrus executes, with where it was declared.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Step {
-    pub span: Span,
-    /// Human label, e.g. `make test-api` or `wait.tcp localhost:5432`.
-    pub label: String,
-    pub work: Work,
+use super::ast::{Attr, Block, Expr, Item, ItemKind, Program, StepDecl};
+use super::interp::{Interp, Value};
+use super::tools;
+use crate::lang::{Error, Sources, Span};
+use crate::model::{Check, Cond, Group, Paths, Pool, Project, Service, Step, Task, Work};
+
+type Compiled<T> = Result<T, Error>;
+
+fn failure(failure: super::interp::Failure) -> Error {
+    Error::at(failure.span, failure.message)
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum Work {
-    Process {
-        argv: Vec<String>,
-        env: Vec<(String, String)>,
-        portable: bool,
-    },
-    WaitTcp {
-        address: String,
-        timeout: u64,
-    },
-    WaitHttp {
-        url: String,
-        timeout: u64,
-    },
-    WaitFile {
-        path: String,
-        timeout: u64,
-    },
-    Copy {
-        from: String,
-        to: String,
-    },
-    /// Relative links in Markdown files matching `pattern` point at existing files.
-    LinksCheck {
-        pattern: String,
-    },
-    /// A body written in language v2 (`check:name`, `step:release:name`, …);
-    /// `digest` changes with its source, `args` are the release's values.
-    Script {
-        item: String,
-        digest: String,
-        args: Vec<(String, String)>,
-        /// Environment of every program the body runs (check and profile `env`).
-        #[serde(default)]
-        env: Vec<(String, String)>,
-    },
+/// An item's external name: `group::check` → `group.check`.
+fn external(segments: &[String]) -> String {
+    segments.join(".")
 }
 
-impl Work {
-    /// Short human form, e.g. `make test-api` or `wait.tcp localhost:5432`.
-    pub fn label(&self) -> String {
-        match self {
-            Work::Process { argv, .. } => argv
+/// The source text of a span.
+fn slice(sources: &Sources, span: Span) -> &str {
+    sources
+        .files
+        .get(span.file)
+        .and_then(|(_, text)| text.get(span.start..span.end))
+        .unwrap_or_default()
+}
+
+struct Compiler<'a> {
+    program: &'a Program,
+    sources: &'a Sources,
+    interp: Interp<'a>,
+    files: tools::RepoFiles<'a>,
+    /// What every body depends on besides itself: functions, constants, structs.
+    shared: String,
+}
+
+impl<'a> Compiler<'a> {
+    fn value(&mut self, expr: &Expr) -> Compiled<Value> {
+        self.interp.value(expr).map_err(failure)
+    }
+
+    /// A configuration value as JSON: a command becomes its argv, an item's
+    /// name its name, a duration its seconds.
+    fn json(&mut self, expr: &Expr) -> Compiled<Json> {
+        if let Expr::Path(segments, _) = expr
+            && (self.is_item(segments) || !self.interp.consts.contains_key(&segments.join("::")))
+        {
+            return Ok(Json::String(external(segments)));
+        }
+        if let Expr::List(items, _) = expr {
+            return items
                 .iter()
-                .filter(|part| *part != "--no-print-directory")
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" "),
-            Work::WaitTcp { address, .. } => format!("wait.tcp {address}"),
-            Work::WaitHttp { url, .. } => format!("wait.http {url}"),
-            Work::WaitFile { path, .. } => format!("wait.file {path}"),
-            Work::Copy { from, to } => format!("copy {from} → {to}"),
-            Work::LinksCheck { pattern } => format!("links.check {pattern}"),
-            Work::Script { item, .. } => item.clone(),
+                .map(|item| self.json(item))
+                .collect::<Compiled<Vec<_>>>()
+                .map(Json::Array);
+        }
+        let value = self.value(expr)?;
+        Ok(value_json(&value))
+    }
+
+    /// A group or a check: what `touched`, `only` and `without` can name.
+    fn is_selectable(&self, segments: &[String]) -> bool {
+        let name = segments.join("::");
+        self.program.items.iter().any(|item| match &item.kind {
+            ItemKind::Group { items } => {
+                item.name == name
+                    || items
+                        .iter()
+                        .any(|inner| format!("{}::{}", item.name, inner.name) == name)
+            }
+            ItemKind::Check { .. } => item.name == name,
+            _ => false,
+        })
+    }
+
+    /// A declared item that is not a value (not a const or a fn).
+    fn is_item(&self, segments: &[String]) -> bool {
+        let name = segments.join("::");
+        self.program.items.iter().any(|item| {
+            (item.name == name && !matches!(item.kind, ItemKind::Const { .. } | ItemKind::Fn(_)))
+                || matches!(&item.kind, ItemKind::Group { items } if items.iter().any(|inner| format!("{}::{}", item.name, inner.name) == name))
+        })
+    }
+
+    /// `#[name(a, key = b)]` → {"0": a, "key": b} with positional args by index.
+    fn attr_object(&mut self, attr: &Attr) -> Compiled<serde_json::Map<String, Json>> {
+        let mut object = serde_json::Map::new();
+        let mut position = 0;
+        for (key, arg) in &attr.args {
+            let value = self.json(arg)?;
+            match key {
+                Some(key) => {
+                    object.insert(key.clone(), value);
+                }
+                None => {
+                    object.insert(position.to_string(), value);
+                    position += 1;
+                }
+            }
+        }
+        Ok(object)
+    }
+
+    fn globs(&mut self, attrs: &[Attr], name: &str) -> Compiled<(Vec<String>, Vec<String>)> {
+        let mut globs = Vec::new();
+        let mut groups = Vec::new();
+        for attr in attrs.iter().filter(|attr| attr.name == name) {
+            for (_, arg) in &attr.args {
+                if let Expr::Path(segments, _) = arg
+                    && self.program.items.iter().any(|item| {
+                        item.name == segments.join("::")
+                            && matches!(item.kind, ItemKind::Group { .. })
+                    })
+                {
+                    groups.push(external(segments));
+                    continue;
+                }
+                self.value(arg)?.globs(&mut globs);
+            }
+        }
+        Ok((unique(globs), groups))
+    }
+
+    fn names(attrs: &[Attr], name: &str) -> Vec<String> {
+        attrs
+            .iter()
+            .filter(|attr| attr.name == name)
+            .flat_map(|attr| attr.args.iter())
+            .filter_map(|(_, arg)| match arg {
+                Expr::Path(segments, _) => Some(external(segments)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn flag(&mut self, attrs: &[Attr], name: &str) -> Compiled<Option<bool>> {
+        let Some(attr) = attrs.iter().find(|attr| attr.name == name) else {
+            return Ok(None);
+        };
+        match attr.args.first() {
+            None => Ok(Some(true)),
+            Some((_, arg)) => match self.value(arg)? {
+                Value::Bool(flag) => Ok(Some(flag)),
+                _ => Err(Error::at(
+                    attr.span,
+                    format!("`#[{name}]` or `#[{name}(false)]`"),
+                )),
+            },
         }
     }
 
-    /// The same work with every text passed through `apply` (runtime values).
-    pub fn map_text(&self, apply: impl Fn(&str) -> String) -> Work {
-        match self {
-            Work::Process {
-                argv,
-                env,
-                portable,
-            } => Work::Process {
-                argv: argv.iter().map(|part| apply(part)).collect(),
-                env: env
-                    .iter()
-                    .map(|(key, value)| (key.clone(), apply(value)))
-                    .collect(),
-                portable: *portable,
-            },
-            Work::WaitTcp { address, timeout } => Work::WaitTcp {
-                address: apply(address),
-                timeout: *timeout,
-            },
-            Work::WaitHttp { url, timeout } => Work::WaitHttp {
-                url: apply(url),
-                timeout: *timeout,
-            },
-            Work::WaitFile { path, timeout } => Work::WaitFile {
-                path: apply(path),
-                timeout: *timeout,
-            },
-            Work::Copy { from, to } => Work::Copy {
-                from: apply(from),
-                to: apply(to),
-            },
-            Work::LinksCheck { pattern } => Work::LinksCheck {
-                pattern: apply(pattern),
-            },
-            Work::Script {
+    /// `#[env(KEY = "value", …)]`, in order.
+    fn env(&mut self, attrs: &[Attr]) -> Compiled<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for attr in attrs.iter().filter(|attr| attr.name == "env") {
+            for (key, arg) in &attr.args {
+                let Some(key) = key else {
+                    return Err(Error::at(arg.span(), "`#[env(KEY = \"value\")]`"));
+                };
+                out.push((key.clone(), self.value(arg)?.as_text()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// A `cmd!(…)` argument as argv, its environment as `KEY=value` words first.
+    fn argv(&mut self, expr: &Expr) -> Compiled<Vec<String>> {
+        match self.value(expr)? {
+            Value::Command(spec) => {
+                let mut argv: Vec<String> = Vec::new();
+                if !spec.env.is_empty() {
+                    argv.push("env".into());
+                    argv.extend(spec.env.iter().map(|(key, value)| format!("{key}={value}")));
+                }
+                argv.push(spec.program.clone());
+                argv.extend(spec.args.iter().cloned());
+                Ok(argv)
+            }
+            _ => Err(Error::at(expr.span(), "expected a command: cmd!(\"…\")")),
+        }
+    }
+
+    fn script(
+        &self,
+        item: String,
+        body: Span,
+        args: Vec<(String, String)>,
+        env: Vec<(String, String)>,
+    ) -> Step {
+        let digest = hex::encode(Sha256::digest(format!(
+            "{}\n{}",
+            slice(self.sources, body),
+            self.shared
+        )));
+        Step {
+            span: body,
+            label: item.clone(),
+            work: Work::Script {
                 item,
-                digest,
+                digest: digest[..16].to_owned(),
                 args,
                 env,
-            } => Work::Script {
-                item: item.clone(),
-                digest: digest.clone(),
-                args: args
-                    .iter()
-                    .map(|(key, value)| (key.clone(), apply(value)))
-                    .collect(),
-                env: env
-                    .iter()
-                    .map(|(key, value)| (key.clone(), apply(value)))
-                    .collect(),
             },
         }
     }
+}
 
-    /// `[kind, arguments…]`, the documented form hashed into fingerprints.
-    pub fn canonical(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        match self {
-            Work::Process { argv, .. } => {
-                out.push("run".to_owned());
-                out.extend(argv.iter().cloned());
-            }
-            Work::WaitTcp { address, timeout } => {
-                out.extend(["wait.tcp".into(), address.clone(), timeout.to_string()])
-            }
-            Work::WaitHttp { url, timeout } => {
-                out.extend(["wait.http".into(), url.clone(), timeout.to_string()])
-            }
-            Work::WaitFile { path, timeout } => {
-                out.extend(["wait.file".into(), path.clone(), timeout.to_string()])
-            }
-            Work::Copy { from, to } => out.extend(["copy".into(), from.clone(), to.clone()]),
-            Work::LinksCheck { pattern } => out.extend(["links.check".into(), pattern.clone()]),
-            Work::Script { item, digest, .. } => {
-                out.extend(["script".into(), item.clone(), digest.clone()])
-            }
+fn value_json(value: &Value) -> Json {
+    match value {
+        Value::Unit | Value::None => Json::Null,
+        Value::Bool(flag) => Json::Bool(*flag),
+        Value::Int(number) => json!(number),
+        Value::Duration(seconds) => json!(seconds),
+        Value::List(items) => Json::Array(items.iter().map(value_json).collect()),
+        Value::Some(inner) => value_json(inner),
+        Value::Command(spec) => {
+            let mut argv = vec![spec.program.clone()];
+            argv.extend(spec.args.iter().cloned());
+            json!(argv)
         }
-        out
-    }
-}
-
-/// What `touched`, `only` and `without` look at: a group or check by name,
-/// or a list of path globs.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Paths {
-    Name(String),
-    Globs(Vec<String>),
-}
-
-/// A plan-time condition (`when`), evaluated once the changed paths are known.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Cond {
-    Always(bool),
-    /// A changed path is in this group, check or glob list.
-    Touched(Paths),
-    /// This check is in the plan.
-    Selected(String),
-    /// The project's signal command printed this signal.
-    Signal(String),
-    /// The plan is for this profile.
-    Profile(String),
-    /// Every changed path is in it.
-    Only(Paths),
-    /// No changed path is in it.
-    Without(Paths),
-    And(Box<Cond>, Box<Cond>),
-    Or(Box<Cond>, Box<Cond>),
-    Not(Box<Cond>),
-}
-
-impl Cond {
-    pub fn eval(&self, facts: &dyn Fn(&Cond) -> bool) -> bool {
-        match self {
-            Cond::Always(value) => *value,
-            Cond::And(left, right) => left.eval(facts) && right.eval(facts),
-            Cond::Or(left, right) => left.eval(facts) || right.eval(facts),
-            Cond::Not(inner) => !inner.eval(facts),
-            leaf => facts(leaf),
-        }
-    }
-}
-
-fn cond(value: &Value, span: Span) -> Result<Cond, Error> {
-    let name = |action: &Action| match action.args.first() {
-        Some(Value::Ref(name)) => Ok(name.clone()),
-        _ => text(action, 0),
-    };
-    let paths = |action: &Action| match action.args.first() {
-        Some(Value::List(items)) => items
-            .iter()
-            .map(|item| {
-                item.as_str().map(str::to_owned).ok_or_else(|| {
-                    Error::at(
-                        action.span,
-                        format!("`{}` takes a name or a list of paths", action.kind),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Paths::Globs),
-        _ => name(action).map(Paths::Name),
-    };
-    Ok(match value {
-        Value::Bool(value) => Cond::Always(*value),
-        Value::Action(action) => match action.kind.as_str() {
-            "touched" => Cond::Touched(paths(action)?),
-            "selected" => Cond::Selected(name(action)?),
-            "signal" => Cond::Signal(name(action)?),
-            "profile" => Cond::Profile(name(action)?),
-            "only" => Cond::Only(paths(action)?),
-            "without" => Cond::Without(paths(action)?),
-            "and" | "or" => {
-                let left = Box::new(cond(&action.args[0], span)?);
-                let right = Box::new(cond(&action.args[1], span)?);
-                if action.kind == "and" {
-                    Cond::And(left, right)
-                } else {
-                    Cond::Or(left, right)
-                }
-            }
-            "not" => Cond::Not(Box::new(cond(&action.args[0], span)?)),
-            other => {
-                return Err(Error::at(
-                    action.span,
-                    format!(
-                        "`when` takes touched(...), selected(...), signal(...), and, or, not — not `{other}`"
-                    ),
-                ));
-            }
-        },
-        other => {
-            return Err(Error::at(
-                span,
-                format!("`when` must be a condition, not a {}", other.type_name()),
-            ));
-        }
-    })
-}
-
-/// A set of paths and the checks that protect it.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Group {
-    pub name: String,
-    pub owns: Vec<String>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Check {
-    /// Its qualified name: `clyer.bot`.
-    pub name: String,
-    pub description: Option<String>,
-    pub owns: Vec<String>,
-    pub reads: Vec<String>,
-    pub cache: bool,
-    /// `cache` as the check or its group says; otherwise the project's default.
-    #[serde(skip)]
-    pub cache_set: Option<bool>,
-    pub resources: Vec<String>,
-    /// Project-specific data for the project's own tools (`meta = { … }`).
-    pub meta: BTreeMap<String, serde_json::Value>,
-    pub env: Vec<(String, String)>,
-    pub steps: Vec<Step>,
-    /// The group it is declared in; `narrows`: it has its own `paths`.
-    pub group: Option<String>,
-    pub narrows: bool,
-    /// Groups whose paths select it too (`paths = [platform, …]`).
-    pub via: Vec<String>,
-    /// `match changed` arms: the first whose condition holds replaces `steps`.
-    pub arms: Vec<(Cond, Vec<Step>)>,
-    /// Profiles the check belongs to; empty: every profile.
-    pub profiles: Vec<String>,
-    /// Checks that already run this one: with one of them in a plan, this one is dropped.
-    pub covered_by: Vec<String>,
-    /// Selected only when this holds (and, with `owns`, a path it owns changed).
-    pub when: Option<Cond>,
-    /// Checks it runs instead of when the change goes beyond one of them.
-    pub replaces: Vec<String>,
-    pub span: Span,
-}
-
-/// A service checks need: started by Citrus when it has an action,
-/// otherwise a resource the runner provides.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Service {
-    pub name: String,
-    pub description: Option<String>,
-    pub start: Vec<Step>,
-    pub ready: Vec<Step>,
-    pub limit: Option<i64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Task {
-    pub name: String,
-    pub about: String,
-    pub steps: Vec<Step>,
-    pub span: Span,
-}
-
-/// A runner: runs the planned checks elsewhere and reports them in the
-/// runner protocol (docs/protocol.md).
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct Pool {
-    pub argv: Vec<String>,
-    /// Prints `CITRUS_RESOURCE key=value…` lines describing the runner's machines.
-    pub status: Vec<String>,
-}
-
-#[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct Project {
-    pub base: Option<String>,
-    /// Profiles checks may belong to; the first one is the default.
-    pub profiles: Vec<String>,
-    pub logs: Option<String>,
-    pub toolchain: Vec<String>,
-    pub checks: Vec<Check>,
-    pub tasks: Vec<Task>,
-    pub receipts: Option<String>,
-    /// Environment of each profile's checks.
-    pub profile_env: Vec<(String, Vec<(String, String)>)>,
-    pub services: Vec<Service>,
-    pub pool: Option<Pool>,
-    pub after_merge: Vec<String>,
-    pub commands: Vec<(String, String, String)>,
-    pub groups: Vec<Group>,
-    /// Named conditions reported with the plan (`label "scope:main" { when = … }`).
-    pub labels: Vec<(String, Cond)>,
-    /// Prints `SIGNAL <name>` lines for the changed paths (in CITRUS_PATHS).
-    pub signals: Vec<String>,
-    /// Prints the first free version at or after CITRUS_VERSION for the names in CITRUS_SCOPE.
-    #[serde(skip)]
-    pub free_version: Vec<String>,
-    #[serde(skip)]
-    pub releases: BTreeMap<String, crate::release::Unit>,
-    #[serde(skip)]
-    pub artifacts: BTreeMap<String, crate::deploy::Artifact>,
-    #[serde(skip)]
-    pub environments: BTreeMap<String, crate::deploy::Environment>,
-    /// Repository-relative `.ci` files this project was read from.
-    pub files: Vec<String>,
-    /// Declarations Citrus reads but does not execute from `.ci` yet.
-    pub pending: Vec<(String, String, Span)>,
-    pub warnings: Vec<Error>,
-}
-
-const KINDS: &[&str] = &[
-    "project",
-    "profile",
-    "group",
-    "check",
-    "service",
-    "runner",
-    "task",
-    "commands",
-    "label",
-    "release",
-    "artifact",
-    "environment",
-];
-
-/// A group's paths and environment, given to the checks inside it.
-struct Scope<'a> {
-    name: &'a str,
-    paths: &'a [String],
-    env: &'a [(String, String)],
-    needs: &'a [String],
-    cache: Option<bool>,
-}
-
-pub fn compile(graph: &Graph) -> Result<Project, Error> {
-    let mut project = Project::default();
-    let mut runners: Vec<(String, Pool, Span)> = Vec::new();
-    let mut chosen_runner: Option<(String, Span)> = None;
-    // `project { cache = false }`: checks reuse a pass only when they say so.
-    let mut default_cache = true;
-    // (check index, field, names, span): references resolved after all checks are known.
-    let mut covers: Vec<(String, Vec<String>, Span)> = Vec::new();
-    let mut needs: Vec<(usize, Vec<String>, Span)> = Vec::new();
-    for decl in &graph.decls {
-        match decl.kind.as_str() {
-            "project" => {
-                known_fields(
-                    decl,
-                    &[
-                        "main",
-                        "runner",
-                        "logs",
-                        "toolchain",
-                        "receipts",
-                        "after_merge",
-                        "signals",
-                        "free_version",
-                        "cache",
-                    ],
-                )?;
-                if let Some(Value::Bool(flag)) = decl.field("cache") {
-                    default_cache = *flag;
-                }
-                known_children(decl, &[])?;
-                project.base = optional_string(decl, "main")?;
-                if let Some(value) = decl.field("runner") {
-                    chosen_runner = Some((
-                        reference(value, decl.field_span("runner"))?,
-                        decl.field_span("runner"),
-                    ));
-                }
-                if let Some(Value::Action(action)) = decl.field("signals") {
-                    project.signals = argv(action)?;
-                }
-                if let Some(Value::Action(action)) = decl.field("free_version") {
-                    project.free_version = argv(action)?;
-                }
-                project.logs = optional_string(decl, "logs")?;
-                project.toolchain = strings(decl, "toolchain")?;
-                project.receipts = optional_string(decl, "receipts")?;
-                if let Some(Value::Action(action)) = decl.field("after_merge") {
-                    project.after_merge = argv(action)?;
-                }
-            }
-            "profile" => {
-                known_children(decl, &["env"])?;
-                known_fields(decl, &[])?;
-                let name = label(decl)?;
-                if project.profiles.contains(&name) {
-                    return Err(Error::at(
-                        decl.span,
-                        format!("profile {name} is declared twice"),
-                    ));
-                }
-                project.profile_env.push((name.clone(), env_of(decl)?));
-                project.profiles.push(name);
-            }
-            "runner" => {
-                known_fields(decl, &["status"])?;
-                known_children(decl, &[])?;
-                let name = label(decl)?;
-                let Some(Value::Action(action)) = &decl.value else {
-                    return Err(
-                        Error::at(decl.span, format!("runner {name} needs a command"))
-                            .help(format!("runner {name} = make(\"remote-check\")")),
-                    );
-                };
-                let status = match decl.field("status") {
-                    Some(Value::Action(action)) => argv(action)?,
-                    _ => Vec::new(),
-                };
-                runners.push((
-                    name,
-                    Pool {
-                        argv: argv(action)?,
-                        status,
-                    },
-                    decl.span,
-                ));
-            }
-            "service" => {
-                known_fields(decl, &["ready", "limit"])?;
-                known_children(decl, &[])?;
-                let name = label(decl)?;
-                let start = match &decl.value {
-                    Some(Value::Action(action)) => vec![step(action, &[])?],
-                    _ => Vec::new(),
-                };
-                let ready = match decl.field("ready") {
-                    Some(Value::Action(action)) => vec![step(action, &[])?],
-                    _ => Vec::new(),
-                };
-                project.services.push(Service {
-                    name,
-                    description: decl.doc.clone(),
-                    start,
-                    ready,
-                    limit: match decl.field("limit") {
-                        Some(Value::Int(limit)) => Some(*limit),
-                        _ => None,
-                    },
-                });
-            }
-            "commands" => {
-                for (command, value, span) in &decl.fields {
-                    let Value::Str(about) = value else {
-                        return Err(Error::at(*span, "a command's description is a string"));
-                    };
-                    // `commands release { … }`: listed under that heading.
-                    project.commands.push((
-                        command.clone(),
-                        about.clone(),
-                        decl.name.clone().unwrap_or_default(),
-                    ));
-                }
-            }
-            "label" => {
-                known_fields(decl, &["when"])?;
-                known_children(decl, &[])?;
-                let name = label(decl)?;
-                let Some(value) = decl.field("when") else {
-                    return Err(Error::at(
-                        decl.span,
-                        format!("label {name} needs `when = …`"),
-                    ));
-                };
-                project
-                    .labels
-                    .push((name, cond(value, decl.field_span("when"))?));
-            }
-            "group" => {
-                known_fields(decl, &["paths", "needs", "cache"])?;
-                known_children(decl, &["check", "env"])?;
-                let name = label(decl)?;
-                if project.groups.iter().any(|group| group.name == name) {
-                    return Err(
-                        Error::at(decl.span, format!("group {name} is declared twice")).help(
-                            "one group, one place: move these paths and checks into the first one",
-                        ),
-                    );
-                }
-                let paths = unique(strings(decl, "paths")?);
-                let env = env_of(decl)?;
-                project.groups.push(Group {
-                    owns: paths.clone(),
-                    name: name.clone(),
-                    span: decl.span,
-                });
-                let group_needs = references(decl, "needs")?;
-                let scope = Scope {
-                    name: &name,
-                    paths: &paths,
-                    env: &env,
-                    needs: &group_needs,
-                    cache: match decl.field("cache") {
-                        Some(Value::Bool(flag)) => Some(*flag),
-                        _ => None,
-                    },
-                };
-                for child in decl.children.iter().filter(|child| child.kind == "check") {
-                    compile_check(child, Some(&scope), &mut project, &mut covers, &mut needs)?;
-                }
-            }
-            "check" => compile_check(decl, None, &mut project, &mut covers, &mut needs)?,
-            "task" => {
-                known_fields(decl, &[])?;
-                known_children(decl, &["env"])?;
-                let name = label(decl)?;
-                let env = env_of(decl)?;
-                let steps = match &decl.value {
-                    Some(value) => actions(value, decl.span, &env, &mut project.warnings)?,
-                    None => Vec::new(),
-                };
-                if steps.is_empty() {
-                    return Err(
-                        Error::at(decl.span, format!("task {name} has nothing to run"))
-                            .help(format!("task {name} = [make(\"…\"), wait.tcp(\"…\")]")),
-                    );
-                }
-                project.tasks.push(Task {
-                    about: decl.doc.clone().unwrap_or_default(),
-                    steps,
-                    name,
-                    span: decl.span,
-                });
-            }
-            "release" => {
-                let name = label(decl)?;
-                let unit: crate::release::Unit = typed(decl, release_json(decl)?)?;
-                unit.validate(&name)
-                    .map_err(|error| Error::at(decl.span, error.to_string()))?;
-                project.releases.insert(name, unit);
-            }
-            "artifact" => {
-                let name = label(decl)?;
-                project
-                    .artifacts
-                    .insert(name, typed(decl, artifact_json(decl)?)?);
-            }
-            "environment" => {
-                let name = label(decl)?;
-                project
-                    .environments
-                    .insert(name, typed(decl, environment_json(decl)?)?);
-            }
-            other => {
-                let error = Error::at(decl.span, format!("unknown declaration `{other}`"));
-                return Err(match super::suggest(other, KINDS.iter().copied()) {
-                    Some(close) => error.help(format!("did you mean `{close}`?")),
-                    None => error.help(format!("declarations are: {}", KINDS.join(", "))),
-                });
-            }
-        }
-    }
-    // The runner: the one `project { runner = … }` names, or the only one.
-    project.pool = match (chosen_runner, runners.len()) {
-        (Some((name, span)), _) => {
-            let Some((_, pool, _)) = runners.iter().find(|(known, ..)| *known == name) else {
-                return Err(unknown(
-                    span,
-                    "runner",
-                    &name,
-                    runners.iter().map(|(known, ..)| known.as_str()),
-                ));
-            };
-            Some(pool.clone())
-        }
-        (None, 1) => Some(runners[0].1.clone()),
-        (None, 0) => None,
-        (None, _) => {
-            return Err(Error::at(
-                runners[1].2,
-                "several runners: name one in `project { runner = … }`",
-            ));
-        }
-    };
-    // References: profiles, services, covered checks.
-    let profiles = project.profiles.clone();
-    let services: Vec<String> = project
-        .services
-        .iter()
-        .map(|service| service.name.clone())
-        .collect();
-    for check in &project.checks {
-        for profile in &check.profiles {
-            if !profiles.contains(profile) {
-                return Err(unknown(
-                    check.span,
-                    "profile",
-                    profile,
-                    profiles.iter().map(String::as_str),
-                )
-                .or_help(format!("declare it: profile {profile}")));
-            }
-        }
-    }
-    for (index, names, span) in needs {
-        for name in &names {
-            if !services.contains(name) {
-                return Err(
-                    unknown(span, "service", name, services.iter().map(String::as_str))
-                        .or_help(format!("declare it: service {name}")),
-                );
-            }
-        }
-        project.checks[index].resources.extend(names);
-    }
-    for (by, names, span) in covers {
-        for name in names {
-            let covered: Vec<usize> = project
-                .checks
+        Value::Struct(_, fields) => Json::Object(
+            fields
                 .iter()
-                .enumerate()
-                .filter(|(_, check)| check.name == name)
-                .map(|(index, _)| index)
-                .collect();
-            if covered.is_empty() {
-                return Err(unknown(
-                    span,
-                    "check",
-                    &name,
-                    project.checks.iter().map(|check| check.name.as_str()),
-                ));
-            }
-            for index in covered {
-                project.checks[index].covered_by.push(by.clone());
-            }
-        }
+                .map(|(k, v)| (k.clone(), value_json(v)))
+                .collect(),
+        ),
+        other => Json::String(other.as_text()),
     }
-    // A group a check names in its paths is part of its inputs; a check with
-    // no known inputs is never reused by them.
-    let group_paths: BTreeMap<String, Vec<String>> = project
-        .groups
-        .iter()
-        .map(|group| (group.name.clone(), group.owns.clone()))
-        .collect();
-    for check in &mut project.checks {
-        // The groups' globs first: a check's own reads may re-include what a
-        // group excludes, never the other way round.
-        let mut reads: Vec<String> = Vec::new();
-        for name in &check.via {
-            reads.extend(group_paths.get(name).into_iter().flatten().cloned());
-        }
-        if !reads.is_empty() {
-            reads.append(&mut check.reads);
-            check.reads = reads;
-        }
-        check.cache = check.cache_set.unwrap_or(default_cache)
-            && !(check.owns.is_empty() && check.reads.is_empty());
-    }
-    for check in &project.checks {
-        for name in &check.via {
-            if !project.groups.iter().any(|group| group.name == *name) {
-                return Err(unknown(
-                    check.span,
-                    "group",
-                    name,
-                    project.groups.iter().map(|group| group.name.as_str()),
-                ));
-            }
-        }
-        for name in &check.replaces {
-            if !project.checks.iter().any(|other| other.name == *name) {
-                return Err(unknown(
-                    check.span,
-                    "check",
-                    name,
-                    project.checks.iter().map(|other| other.name.as_str()),
-                ));
-            }
-        }
-    }
-    Ok(project)
 }
 
-/// Inputs of reused checks that match no file. Such a typo silently makes a
-/// reused pass wrong; a selection typo shows itself as an unclaimed path.
-/// Slow on large repositories, so only `citrus check` asks.
-pub fn dead_globs(project: &Project, root: &Path) -> Vec<Error> {
-    let files = crate::repo::Repo::discover_at(root)
-        .and_then(|repo| repo.paths())
-        .unwrap_or_default();
-    let mut dead = Vec::new();
-    if files.is_empty() {
-        return dead;
-    }
-    for check in project.checks.iter().filter(|check| check.cache) {
-        let mut reported: Vec<&String> = Vec::new();
-        for pattern in check.owns.iter().chain(&check.reads) {
-            if pattern.starts_with('!')
-                || reported.contains(&pattern)
-                || crate::manifest::pattern_matches_any(pattern, &files).unwrap_or(true)
-            {
-                continue;
-            }
-            reported.push(pattern);
-            dead.push(Error::at(
-                check.span,
-                format!(
-                    "check {} reuses passes, but its input `{pattern}` matches no file",
-                    check.name
-                ),
-            ));
-        }
-    }
-    dead
-}
-
-/// First occurrence of each entry, in order (input lists are often joined).
-/// Lists with exclusions keep their order exactly: a later entry may re-include.
+/// First occurrence of each glob; lists with exclusions keep their order.
 fn unique(items: Vec<String>) -> Vec<String> {
     if items.iter().any(|item| item.starts_with('!')) {
         return items;
@@ -775,1030 +249,828 @@ fn unique(items: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// `kind name` is not declared: the message names the closest one.
-fn unknown<'a>(span: Span, kind: &str, name: &str, known: impl Iterator<Item = &'a str>) -> Error {
-    let error = Error::at(span, format!("no {kind} `{name}`"));
-    match super::suggest(name, known) {
-        Some(close) => error.help(format!("did you mean `{close}`?")),
-        None => error,
-    }
+/// A plan condition: `touched(x)`, `only(x)`, `without(x)` (a group, a check
+/// or a list of globs), `signal("…")`, `selected(check)`, `profile(p)`, with
+/// `&&`, `||`, `!`, `true`, `false`.
+fn condition(expr: &Expr, compiler: &mut Compiler) -> Compiled<Cond> {
+    condition_in(expr, compiler, &BTreeMap::new())
 }
 
-/// A bare name (or a quoted one) naming a declaration.
-fn reference(value: &Value, span: Span) -> Result<String, Error> {
-    match value {
-        Value::Ref(name) | Value::Str(name) => Ok(name.clone()),
-        other => Err(Error::at(
-            span,
-            format!("expected a name, not a {}", other.type_name()),
-        )),
-    }
-}
-
-fn references(decl: &Decl, field: &str) -> Result<Vec<String>, Error> {
-    match decl.field(field) {
-        None => Ok(Vec::new()),
-        Some(Value::List(items)) => items
+/// `bound`: the arguments of a `const fn` whose body is being expanded.
+fn condition_in(
+    expr: &Expr,
+    compiler: &mut Compiler,
+    bound: &BTreeMap<String, Expr>,
+) -> Compiled<Cond> {
+    let program = compiler.program;
+    // A name: a bound argument, or a constant holding a condition.
+    if let Expr::Path(segments, _) = expr
+        && segments.len() == 1
+    {
+        if let Some(value) = bound.get(&segments[0]) {
+            return condition_in(&value.clone(), compiler, &BTreeMap::new());
+        }
+        if let Some(ItemKind::Const { value, .. }) = program
+            .items
             .iter()
-            .map(|item| reference(item, decl.field_span(field)))
-            .collect(),
-        Some(value) => Ok(vec![reference(value, decl.field_span(field))?]),
-    }
-}
-
-/// `env { NAME = "value" }` inside a declaration.
-fn env_of(decl: &Decl) -> Result<Vec<(String, String)>, Error> {
-    let mut env = Vec::new();
-    for child in decl.children.iter().filter(|child| child.kind == "env") {
-        for (name, value, span) in &child.fields {
-            match value {
-                Value::Str(text) => env.push((name.clone(), text.clone())),
-                other => {
-                    return Err(Error::at(
-                        *span,
-                        format!("`{name}` must be a string, not a {}", other.type_name()),
-                    ));
-                }
-            }
+            .find(|item| item.name == segments[0])
+            .map(|item| &item.kind)
+        {
+            return condition_in(value, compiler, &BTreeMap::new());
         }
     }
-    Ok(env)
-}
-
-fn known_children(decl: &Decl, known: &[&str]) -> Result<(), Error> {
-    for child in &decl.children {
-        if !known.contains(&child.kind.as_str()) {
-            return Err(Error::at(
-                child.span,
-                format!("`{}` cannot contain `{}`", decl.kind, child.kind),
-            ));
+    // A call of a `const fn` returning a condition: its body with the arguments.
+    if let Expr::Call { callee, args, .. } = expr
+        && let Expr::Path(segments, _) = &**callee
+        && segments.len() == 1
+        && let Some(ItemKind::Fn(function)) = program
+            .items
+            .iter()
+            .find(|item| item.name == segments[0])
+            .map(|item| &item.kind)
+        && let Some(tail) = &function.body.tail
+    {
+        let mut inner = BTreeMap::new();
+        for (param, arg) in function.params.iter().zip(args) {
+            let arg = match arg {
+                Expr::Path(names, _) if names.len() == 1 && bound.contains_key(&names[0]) => {
+                    bound[&names[0]].clone()
+                }
+                other => other.clone(),
+            };
+            inner.insert(param.name.clone(), arg);
         }
+        return condition_in(tail, compiler, &inner);
     }
-    Ok(())
-}
-
-/// Steps of an action or a list of actions.
-fn actions(
-    value: &Value,
-    span: Span,
-    env: &[(String, String)],
-    warnings: &mut Vec<Error>,
-) -> Result<Vec<Step>, Error> {
-    let items = match value {
-        Value::List(items) => items.clone(),
-        other => vec![other.clone()],
-    };
-    items
-        .iter()
-        .map(|item| match item {
-            Value::Action(action) => {
-                let step = step(action, env)?;
-                if let Work::Process {
-                    portable: false, ..
-                } = step.work
-                {
-                    warnings.push(
-                        Error::at(
-                            action.span,
-                            format!(
-                                "`{}` runs a shell command: it will not work on Windows",
-                                action.kind
-                            ),
-                        )
-                        .help("prefer run(...) or a built-in action"),
-                    );
-                }
-                if let Some(builtin) = builtin_for(action) {
-                    warnings.push(
-                        Error::at(
-                            action.span,
-                            format!("`run(\"cargo\", …)` has a built-in: use {builtin}"),
-                        )
-                        .help("built-in steps know their flags and read the same everywhere"),
-                    );
-                }
-                Ok(step)
+    let resolve = |arg: &Expr| -> Expr {
+        match arg {
+            Expr::Path(names, _) if names.len() == 1 && bound.contains_key(&names[0]) => {
+                bound[&names[0]].clone()
             }
-            other => Err(Error::at(
-                span,
-                format!(
-                    "expected actions such as make(\"…\"), not a {}",
-                    other.type_name()
-                ),
-            )),
-        })
-        .collect()
-}
-
-/// `check name = action { … }`, alone or inside a group.
-fn compile_check(
-    decl: &Decl,
-    group: Option<&Scope>,
-    project: &mut Project,
-    covers: &mut Vec<(String, Vec<String>, Span)>,
-    needs: &mut Vec<(usize, Vec<String>, Span)>,
-) -> Result<(), Error> {
-    known_fields(
-        decl,
-        &[
-            "paths", "reads", "profile", "needs", "covers", "replaces", "cache", "when", "meta",
-        ],
-    )?;
-    known_children(decl, &["env"])?;
-    let short = label(decl)?;
-    let title = match group {
-        Some(group) => format!("{}.{short}", group.name),
-        None => short.clone(),
+            other => other.clone(),
+        }
     };
-    let mut env: Vec<(String, String)> = group.map(|group| group.env.to_vec()).unwrap_or_default();
-    for (name, value) in env_of(decl)? {
-        env.retain(|(known, _)| *known != name);
-        env.push((name, value));
-    }
-    // `paths = [platform, "x/**"]`: a group's paths (shared) and globs (its own).
-    let mut via = Vec::new();
-    let mut globs = Vec::new();
-    match decl.field("paths") {
-        None | Some(Value::None) => {}
-        Some(Value::List(items)) => {
-            for item in items {
-                match item {
-                    Value::Str(glob) => globs.push(glob.clone()),
-                    Value::Ref(name) => via.push(name.clone()),
+    let help = "conditions: touched(…), only(…), without(…), signal(\"…\"), selected(…), profile(…), with &&, || and !";
+    Ok(match expr {
+        Expr::Bool(flag, _) => Cond::Always(*flag),
+        Expr::Unary("!", inner, _) => Cond::Not(Box::new(condition_in(inner, compiler, bound)?)),
+        Expr::Binary(op @ ("&&" | "||"), left, right, _) => {
+            let (left, right) = (
+                Box::new(condition_in(left, compiler, bound)?),
+                Box::new(condition_in(right, compiler, bound)?),
+            );
+            if *op == "&&" {
+                Cond::And(left, right)
+            } else {
+                Cond::Or(left, right)
+            }
+        }
+        Expr::Call { callee, args, span } => {
+            let Expr::Path(segments, _) = &**callee else {
+                return Err(Error::at(*span, "not a condition").help(help));
+            };
+            let [arg] = args.as_slice() else {
+                return Err(Error::at(
+                    *span,
+                    format!("`{}` takes one argument", segments.join("::")),
+                ));
+            };
+            let arg = &resolve(arg);
+            let name = |arg: &Expr, compiler: &mut Compiler| -> Compiled<String> {
+                match arg {
+                    Expr::Path(segments, _) => Ok(external(segments)),
+                    other => Ok(compiler.value(other)?.as_text()),
+                }
+            };
+            let paths = |arg: &Expr, compiler: &mut Compiler| -> Compiled<Paths> {
+                match arg {
+                    Expr::Path(segments, _) if compiler.is_selectable(segments) => {
+                        Ok(Paths::Name(external(segments)))
+                    }
                     other => {
-                        return Err(Error::at(
-                            decl.field_span("paths"),
-                            format!(
-                                "`paths` takes globs and group names, not a {}",
-                                other.type_name()
-                            ),
-                        ));
+                        let mut globs = Vec::new();
+                        compiler.value(other)?.globs(&mut globs);
+                        Ok(Paths::Globs(globs))
                     }
                 }
-            }
-        }
-        Some(Value::Str(glob)) => globs.push(glob.clone()),
-        Some(Value::Ref(name)) => via.push(name.clone()),
-        Some(other) => {
-            return Err(Error::at(
-                decl.field_span("paths"),
-                format!(
-                    "`paths` takes globs and group names, not a {}",
-                    other.type_name()
-                ),
-            ));
-        }
-    }
-    let own_paths = unique(globs);
-    let narrows = !own_paths.is_empty() || !via.is_empty();
-    let owns = if narrows {
-        own_paths
-    } else {
-        group.map(|group| group.paths.to_vec()).unwrap_or_default()
-    };
-    let when = match decl.field("when") {
-        None => None,
-        Some(value) => Some(cond(value, decl.field_span("when"))?),
-    };
-    if owns.is_empty() && via.is_empty() && when.is_none() {
-        return Err(Error::at(decl.span, format!("check {title} has no paths"))
-            .help("put it in a group, or give it `paths = [\"…\"]`"));
-    }
-    let Some(value) = &decl.value else {
-        return Err(
-            Error::at(decl.span, format!("check {title} has nothing to run"))
-                .help(format!("check {short} = make(\"…\")")),
-        );
-    };
-    // `match changed { … }`: the arms before `_` are tried in order when the
-    // plan is made; `_` is the command otherwise.
-    let (run, arms) = match value {
-        Value::Action(action) if action.kind == "match" => {
-            let pairs: Vec<&[Value]> = action.args.chunks(2).collect();
-            let Some((last, rest)) = pairs.split_last() else {
-                return Err(Error::at(action.span, "`match changed` needs arms"));
             };
-            if last[0] != Value::Bool(true) {
-                return Err(Error::at(
-                    action.span,
-                    format!("check {title}: `match changed` needs a last `_ => …` arm"),
-                )
-                .help("the `_` arm runs when no other arm holds"));
+            match segments.join("::").as_str() {
+                "touched" => Cond::Touched(paths(arg, compiler)?),
+                "only" => Cond::Only(paths(arg, compiler)?),
+                "without" => Cond::Without(paths(arg, compiler)?),
+                "signal" => Cond::Signal(name(arg, compiler)?),
+                "selected" => Cond::Selected(name(arg, compiler)?),
+                "profile" => Cond::Profile(name(arg, compiler)?),
+                other => {
+                    return Err(
+                        Error::at(*span, format!("`{other}` is not a condition")).help(help)
+                    );
+                }
             }
-            let mut arms = Vec::new();
-            for pair in rest {
-                arms.push((
-                    cond(&pair[0], action.span)?,
-                    actions(&pair[1], decl.span, &env, &mut project.warnings)?,
-                ));
-            }
-            (last[1].clone(), arms)
         }
-        other => (other.clone(), Vec::new()),
-    };
-    let profiles = references(decl, "profile")?;
-    // Names inside a group may leave the group out: `covers = [bot]`.
-    let qualify = |names: Vec<String>| -> Vec<String> {
-        names
-            .into_iter()
-            .map(|name| match group {
-                Some(group) if !name.contains('.') => format!("{}.{name}", group.name),
-                _ => name,
-            })
-            .collect()
-    };
-    let covered = qualify(references(decl, "covers")?);
-    let replaces = qualify(references(decl, "replaces")?);
-    let mut required: Vec<String> = group.map(|group| group.needs.to_vec()).unwrap_or_default();
-    for name in references(decl, "needs")? {
-        if !required.contains(&name) {
-            required.push(name);
-        }
-    }
-    let meta = match decl.field("meta") {
-        None => BTreeMap::new(),
-        Some(value @ Value::Map(_)) => match to_json(value, decl.field_span("meta"))? {
-            serde_json::Value::Object(map) => map.into_iter().collect(),
-            _ => BTreeMap::new(),
-        },
-        Some(other) => {
-            return Err(Error::at(
-                decl.field_span("meta"),
-                format!("`meta` must be a map, not a {}", other.type_name()),
-            ));
-        }
-    };
-    let steps = actions(&run, decl.span, &env, &mut project.warnings)?;
-    let name = title.clone();
-    if !crate::manifest::valid_name(&name) {
-        return Err(Error::at(
-            decl.span,
-            format!("check name {name} must be lowercase letters, digits, `.`, `_` or `-`"),
-        ));
-    }
-    if project.checks.iter().any(|check| check.name == name) {
-        return Err(Error::at(
-            decl.span,
-            format!("check {name} is declared twice"),
-        ));
-    }
-    if !required.is_empty() {
-        needs.push((project.checks.len(), required, decl.field_span("needs")));
-    }
-    project.checks.push(Check {
-        name,
-        description: decl.doc.clone(),
-        owns,
-        reads: unique(strings(decl, "reads")?),
-        cache: true,
-        cache_set: match decl.field("cache") {
-            Some(Value::Bool(flag)) => Some(*flag),
-            _ => group.and_then(|group| group.cache),
-        },
-        resources: Vec::new(),
-        profiles,
-        covered_by: Vec::new(),
-        when,
-        replaces,
-        meta,
-        env,
-        steps,
-        arms,
-        group: group.map(|group| group.name.to_owned()),
-        narrows,
-        via,
-        span: decl.span,
-    });
-    if !covered.is_empty() {
-        covers.push((title, covered, decl.field_span("covers")));
-    }
-    Ok(())
-}
-
-fn known_fields(decl: &Decl, known: &[&str]) -> Result<(), Error> {
-    for (name, _, span) in &decl.fields {
-        if !known.contains(&name.as_str()) {
-            let error = Error::at(
-                *span,
-                format!("`{}` blocks have no field `{name}`", decl.kind),
-            );
-            return Err(match super::suggest(name, known.iter().copied()) {
-                Some(close) => error.help(format!("did you mean `{close}`?")),
-                None => error.help(format!("fields are: {}", known.join(", "))),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn label(decl: &Decl) -> Result<String, Error> {
-    decl.name.clone().ok_or_else(|| {
-        Error::at(decl.span, format!("a `{}` block needs a name", decl.kind))
-            .help(format!("{} name {{ … }}", decl.kind))
+        // A `const` holding a condition is not a thing yet: say what is.
+        other => return Err(Error::at(other.span(), "not a condition").help(help)),
     })
 }
 
-fn optional_string(decl: &Decl, field: &str) -> Result<Option<String>, Error> {
-    match decl.field(field) {
-        None | Some(Value::None) => Ok(None),
-        Some(Value::Str(value)) => Ok(Some(value.clone())),
-        Some(other) => Err(Error::at(
-            decl.field_span(field),
-            format!("`{field}` must be a string, not a {}", other.type_name()),
-        )),
+/// What a body's commands (and the functions it calls) read, as far as
+/// Citrus understands them; whether one of them is a plain process.
+fn understood(compiler: &Compiler, body: &Block) -> Compiled<(Vec<String>, Vec<String>, bool)> {
+    let mut found: Vec<&Expr> = Vec::new();
+    tools::block_commands(body, &mut found);
+    let mut seen_fns: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < found.len() {
+        if let Expr::Call { callee, .. } = found[index]
+            && let Expr::Path(segments, _) = &**callee
+            && segments.len() == 1
+            && !seen_fns.contains(&segments[0])
+            && let Some(ItemKind::Fn(function)) = compiler
+                .program
+                .items
+                .iter()
+                .find(|item| item.name == segments[0])
+                .map(|item| &item.kind)
+        {
+            seen_fns.push(segments[0].clone());
+            tools::block_commands(&function.body, &mut found);
+        }
+        index += 1;
     }
+    let mut inputs = Vec::new();
+    let mut summaries = Vec::new();
+    let mut opaque = false;
+    for expr in found {
+        let Expr::Command { words, span, .. } = expr else {
+            if let Expr::Call { callee, .. } = expr
+                && let Expr::Path(segments, _) = &**callee
+                && segments.first().is_some_and(|first| first == "std")
+            {
+                opaque = true;
+            }
+            continue;
+        };
+        match tools::understand(words, *span, &compiler.files)? {
+            Some(found) => {
+                for glob in found.inputs {
+                    if !inputs.contains(&glob) {
+                        inputs.push(glob);
+                    }
+                }
+                summaries.push(found.summary);
+            }
+            None => opaque = true,
+        }
+    }
+    Ok((inputs, summaries, opaque))
 }
 
-fn strings(decl: &Decl, field: &str) -> Result<Vec<String>, Error> {
-    match decl.field(field) {
-        None | Some(Value::None) => Ok(Vec::new()),
-        Some(Value::Str(value)) => Ok(vec![value.clone()]),
-        Some(Value::List(items)) => items
-            .iter()
-            .map(|item| {
-                item.as_str().map(str::to_owned).ok_or_else(|| {
-                    Error::at(
-                        decl.field_span(field),
-                        format!(
-                            "`{field}` must be a list of strings; found a {}",
-                            item.type_name()
-                        ),
-                    )
-                })
-            })
-            .collect(),
-        Some(other) => Err(Error::at(
-            decl.field_span(field),
-            format!(
-                "`{field}` must be a list of strings, not a {}",
-                other.type_name()
-            ),
-        )),
-    }
+/// Settings a group passes to its checks.
+#[derive(Default, Clone)]
+struct Inherited {
+    group: Option<String>,
+    paths: Vec<String>,
+    reads: Vec<String>,
+    needs: Vec<String>,
+    env: Vec<(String, String)>,
+    profiles: Vec<String>,
+    cache: Option<bool>,
+    when: Option<Cond>,
 }
 
-/// The built-in action a `run("cargo", "<sub>", …)` step should be.
-fn builtin_for(action: &Action) -> Option<String> {
-    if action.kind != "run" || action.args.first().and_then(Value::as_str) != Some("cargo") {
+fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> Compiled<Check> {
+    let ItemKind::Check { body } = &item.kind else {
+        return Err(Error::at(item.span, "not a check"));
+    };
+    if !crate::manifest::valid_name(name) {
+        return Err(Error::at(
+            item.name_span,
+            format!("check name {name} must be lowercase letters, digits, `_` or `-`"),
+        ));
+    }
+    let (declared, via) = compiler.globs(&item.attrs, "paths")?;
+    let (inferred, summaries, opaque) = understood(compiler, body)?;
+    // Understood inputs select the check on their own only when every command
+    // was understood; a plain process next to them needs `#[paths]`.
+    let mut owns = declared.clone();
+    if !opaque || !declared.is_empty() || !via.is_empty() {
+        for glob in inferred {
+            if !owns.contains(&glob) {
+                owns.push(glob);
+            }
+        }
+    }
+    let narrows = !owns.is_empty() || !via.is_empty();
+    if !narrows {
+        owns = from.paths.clone();
+    }
+    let (mut reads, _) = compiler.globs(&item.attrs, "reads")?;
+    reads.extend(from.reads.iter().cloned());
+    let mut env = from.env.clone();
+    env.extend(compiler.env(&item.attrs)?);
+    let mut resources = from.needs.clone();
+    for need in Compiler::names(&item.attrs, "needs") {
+        if !resources.contains(&need) {
+            resources.push(need);
+        }
+    }
+    let mut profiles = Compiler::names(&item.attrs, "profile");
+    if profiles.is_empty() {
+        profiles = from.profiles.clone();
+    }
+    let mut when = None;
+    for attr in item.attrs.iter().filter(|attr| attr.name == "when") {
+        for (_, arg) in &attr.args {
+            when = Some(condition(arg, compiler)?);
+        }
+    }
+    let when = match (from.when.clone(), when) {
+        (Some(a), Some(b)) => Some(Cond::And(Box::new(a), Box::new(b))),
+        (a, b) => b.or(a),
+    };
+    let mut meta = BTreeMap::new();
+    for attr in item.attrs.iter().filter(|attr| attr.name == "meta") {
+        for (key, value) in compiler.attr_object(attr)? {
+            meta.insert(key, value);
+        }
+    }
+    if !summaries.is_empty() {
+        meta.insert("understood".to_owned(), json!(summaries));
+    }
+    if owns.is_empty() && via.is_empty() && when.is_none() {
+        return Err(Error::at(item.name_span, format!("check {name} has no paths"))
+            .help("run a command Citrus understands (cargo …), put it in a group, or give it `#[paths(\"…\")]`"));
+    }
+    let step = lowered(body, &env, item.span).unwrap_or_else(|| {
+        compiler.script(format!("check:{name}"), item.span, Vec::new(), env.clone())
+    });
+    Ok(Check {
+        name: name.to_owned(),
+        description: item.doc.clone(),
+        owns,
+        reads,
+        cache: true,
+        cache_set: compiler.flag(&item.attrs, "cache")?.or(from.cache),
+        resources,
+        meta,
+        env,
+        steps: vec![step],
+        group: from.group.clone(),
+        narrows,
+        via,
+        arms: Vec::new(),
+        profiles,
+        covered_by: Vec::new(),
+        when,
+        replaces: qualify(Compiler::names(&item.attrs, "replaces"), &from.group),
+        span: item.span,
+    })
+}
+
+/// A body that only runs one fixed command line is that process: other
+/// tools see its argv (`CITRUS_CHECKS`), and no interpreter starts for it.
+fn lowered(body: &Block, env: &[(String, String)], span: Span) -> Option<Step> {
+    let expr = match (body.stmts.as_slice(), &body.tail) {
+        ([super::ast::Stmt::Expr(expr)], None) => expr,
+        ([], Some(tail)) => &**tail,
+        _ => return None,
+    };
+    let Expr::Try(inner, _) = expr else {
         return None;
-    }
-    let sub = action.args.get(1).and_then(Value::as_str)?;
-    ["fmt", "test", "build", "clippy", "run"]
-        .contains(&sub)
-        .then(|| format!("cargo.{sub}(…)"))
-}
-
-fn text(action: &Action, index: usize) -> Result<String, Error> {
-    match action.args.get(index) {
-        Some(Value::Str(value)) => Ok(value.clone()),
-        Some(Value::Int(value)) => Ok(value.to_string()),
-        Some(other) => Err(Error::at(
-            action.span,
-            format!(
-                "`{}` argument {} must be a string, not a {}",
-                action.kind,
-                index + 1,
-                other.type_name()
-            ),
-        )),
-        None => Err(Error::at(
-            action.span,
-            format!("`{}` needs argument {}", action.kind, index + 1),
-        )),
-    }
-}
-
-fn named<'a>(action: &'a Action, name: &str) -> Option<&'a Value> {
-    action
-        .named
+    };
+    let Expr::Command {
+        run: true,
+        env: own,
+        words,
+        ..
+    } = &**inner
+    else {
+        return None;
+    };
+    let argv: Vec<String> = words
         .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value)
-}
-
-fn timeout(action: &Action) -> u64 {
-    match named(action, "timeout") {
-        Some(Value::Duration(seconds)) => *seconds,
-        Some(Value::Int(seconds)) => *seconds as u64,
-        _ => 60,
+        .map(super::ast::CmdWord::literal)
+        .collect::<Option<_>>()?;
+    let mut all = env.to_vec();
+    for (key, word) in own {
+        all.push((key.clone(), word.literal()?));
     }
-}
-
-fn step(action: &Action, env: &[(String, String)]) -> Result<Step, Error> {
-    let process = |argv: Vec<String>, portable: bool| Work::Process {
+    let work = Work::Process {
         argv,
-        env: env.to_vec(),
-        portable,
+        env: all,
+        portable: true,
     };
-    let all_text = |action: &Action| -> Result<Vec<String>, Error> {
-        (0..action.args.len())
-            .map(|index| text(action, index))
-            .collect()
-    };
-    let work = match action.kind.as_str() {
-        "run" => {
-            let argv = all_text(action)?;
-            if argv.is_empty() {
-                return Err(Error::at(action.span, "`run` needs a program"));
-            }
-            process(argv, true)
-        }
-        "make" => {
-            let mut argv = vec![
-                "make".to_owned(),
-                "--no-print-directory".to_owned(),
-                text(action, 0)?,
-            ];
-            for (key, value) in &action.named {
-                argv.push(format!("{key}={}", value_text(value)));
-            }
-            process(argv, true)
-        }
-        "sh" => process(vec!["sh".into(), "-c".into(), text(action, 0)?], false),
-        "cargo.test" => {
-            let mut argv = vec!["cargo".into(), "test".into(), "--locked".into()];
-            if !action.args.is_empty() {
-                argv.extend(["-p".into(), text(action, 0)?]);
-            }
-            process(argv, true)
-        }
-        "cargo.build" => {
-            let mut argv = vec!["cargo".into(), "build".into(), "--locked".into()];
-            if matches!(named(action, "release"), Some(Value::Bool(true))) {
-                argv.push("--release".into());
-            }
-            if let Some(Value::Str(target)) = named(action, "target") {
-                argv.extend(["--target".into(), target.clone()]);
-            }
-            process(argv, true)
-        }
-        "cargo.fmt" => {
-            let mut argv = vec!["cargo".into(), "fmt".into()];
-            if matches!(named(action, "check"), Some(Value::Bool(true))) {
-                argv.push("--check".into());
-            }
-            process(argv, true)
-        }
-        "pnpm.test" | "pnpm.build" => {
-            let script = action.kind.trim_start_matches("pnpm.").to_owned();
-            let dir = match named(action, "dir") {
-                Some(Value::Str(dir)) => dir.clone(),
-                _ => ".".into(),
-            };
-            process(
-                vec![
-                    "pnpm".into(),
-                    "--dir".into(),
-                    dir,
-                    "--filter".into(),
-                    text(action, 0)?,
-                    "run".into(),
-                    script,
-                ],
-                true,
-            )
-        }
-        "cargo.run" => {
-            // `cargo run` of this package with the given arguments.
-            let mut argv = vec![
-                "cargo".to_owned(),
-                "run".to_owned(),
-                "--quiet".to_owned(),
-                "--locked".to_owned(),
-                "--".to_owned(),
-            ];
-            argv.extend(all_text(action)?);
-            process(argv, true)
-        }
-        "cargo.clippy" => {
-            let mut argv = vec![
-                "cargo".into(),
-                "clippy".into(),
-                "--all-targets".into(),
-                "--locked".into(),
-            ];
-            if let Some(Value::Str(level)) = named(action, "deny") {
-                argv.extend(["--".into(), "-D".into(), level.clone()]);
-            }
-            process(argv, true)
-        }
-        "compose.up" => process(
-            ["docker", "compose", "up", "-d"]
-                .into_iter()
-                .map(str::to_owned)
-                .chain(all_text(action)?)
-                .collect(),
-            true,
-        ),
-        "compose.down" => process(
-            ["docker", "compose", "down"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            true,
-        ),
-        "wait.tcp" => Work::WaitTcp {
-            address: text(action, 0)?,
-            timeout: timeout(action),
-        },
-        "wait.http" => Work::WaitHttp {
-            url: text(action, 0)?,
-            timeout: timeout(action),
-        },
-        "wait.file" => Work::WaitFile {
-            path: text(action, 0)?,
-            timeout: timeout(action),
-        },
-        "copy" => Work::Copy {
-            from: text(action, 0)?,
-            to: text(action, 1)?,
-        },
-        "links.check" => Work::LinksCheck {
-            pattern: if action.args.is_empty() {
-                "**/*.md".into()
-            } else {
-                text(action, 0)?
-            },
-        },
-        other => {
-            return Err(
-                Error::at(action.span, format!("`{other}` cannot be a step here yet"))
-                    .help("steps are run, make, sh, cargo.*, pnpm.*, compose.*, wait.*, copy, links.check"),
-            );
-        }
-    };
-    let label = work.label();
-    Ok(Step {
-        span: action.span,
-        label,
+    Some(Step {
+        span,
+        label: work.label(),
         work,
     })
 }
 
-/// The program and arguments of a process action.
-fn argv(action: &Action) -> Result<Vec<String>, Error> {
-    match step(action, &[])?.work {
-        Work::Process { argv, .. } => Ok(argv),
-        _ => Err(Error::at(
-            action.span,
-            format!("`{}` is not a command here", action.kind),
-        )),
-    }
+/// Names inside a group may leave the group out: `#[replaces(users)]`.
+fn qualify(names: Vec<String>, group: &Option<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .map(|name| match group {
+            Some(group) if !name.contains('.') => format!("{group}.{name}"),
+            _ => name,
+        })
+        .collect()
 }
 
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::Str(text) => text.clone(),
-        Value::Int(number) => number.to_string(),
-        Value::Bool(flag) => flag.to_string(),
-        other => format!("{other:?}"),
-    }
+fn release_args() -> Vec<(String, String)> {
+    ["version", "previous", "commit", "unit"]
+        .into_iter()
+        .map(|name| (name.to_owned(), format!("{{{name}}}")))
+        .collect()
 }
 
-/// Execute one step in `root`; the process inherits stdout/stderr.
-/// `stdout_to_stderr` keeps a JSON answer on stdout clean while steps print.
-pub fn execute(step: &Step, root: &Path, stdout_to_stderr: bool) -> anyhow::Result<i32> {
-    let deadline = |seconds: u64| Instant::now() + Duration::from_secs(seconds);
-    match &step.work {
-        Work::Process { argv, env, .. } => {
-            let (program, args) = argv
-                .split_first()
-                .ok_or_else(|| anyhow::anyhow!("empty command"))?;
-            let mut command = std::process::Command::new(program);
-            command
-                .args(args)
-                .envs(env.iter().cloned())
-                .current_dir(root)
-                .stdin(std::process::Stdio::null());
-            if stdout_to_stderr {
-                use std::os::fd::AsFd;
-                command.stdout(std::process::Stdio::from(
-                    std::io::stderr().as_fd().try_clone_to_owned()?,
-                ));
-            }
-            // A program that cannot start fails its check like a shell would
-            // (127), with the reason in the log, rather than ending the run.
-            match command.status() {
-                Ok(status) => Ok(status.code().unwrap_or(-1)),
-                Err(error) => {
-                    eprintln!("error: cannot run {program}: {error}");
-                    Ok(if error.kind() == std::io::ErrorKind::NotFound {
-                        127
-                    } else {
-                        126
-                    })
+fn release(
+    compiler: &mut Compiler,
+    item: &Item,
+    steps: &[StepDecl],
+    rollback: Option<&StepDecl>,
+) -> Compiled<crate::release::Unit> {
+    let environment = Compiler::names(&item.attrs, "environment")
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            Error::at(
+                item.name_span,
+                format!("release {} needs `#[environment(…)]`", item.name),
+            )
+        })?;
+    let version = match item.attr("version") {
+        None => None,
+        Some(attr) => {
+            let mut initial = String::new();
+            let mut scope = Vec::new();
+            for (key, arg) in &attr.args {
+                let value = compiler.value(arg)?;
+                match key.as_deref() {
+                    Some("initial") => initial = value.as_text(),
+                    _ => value.globs(&mut scope),
                 }
             }
-        }
-        Work::WaitTcp { address, timeout } => {
-            let until = deadline(*timeout);
-            loop {
-                if std::net::TcpStream::connect(address.as_str()).is_ok() {
-                    return Ok(0);
-                }
-                if Instant::now() > until {
-                    eprintln!("{address} did not accept connections within {timeout}s");
-                    return Ok(1);
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-        Work::WaitHttp { url, timeout } => {
-            let until = deadline(*timeout);
-            loop {
-                let ok = std::process::Command::new("curl")
-                    .args([
-                        "-fsS",
-                        "--max-time",
-                        "5",
-                        "-o",
-                        if cfg!(windows) { "NUL" } else { "/dev/null" },
-                        url,
-                    ])
-                    .status()
-                    .is_ok_and(|status| status.success());
-                if ok {
-                    return Ok(0);
-                }
-                if Instant::now() > until {
-                    eprintln!("{url} did not answer within {timeout}s");
-                    return Ok(1);
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        }
-        Work::WaitFile { path, timeout } => {
-            let until = deadline(*timeout);
-            while !root.join(path).exists() {
-                if Instant::now() > until {
-                    eprintln!("{path} did not appear within {timeout}s");
-                    return Ok(1);
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Ok(0)
-        }
-        Work::Script {
-            item, args, env, ..
-        } => Ok(crate::lang2::run_item(root, item, args, env)),
-        Work::LinksCheck { pattern } => {
-            let files = crate::repo::Repo::discover_at(root)?.files()?;
-            let mut broken = 0;
-            let mut checked = 0;
-            for file in &files {
-                if !crate::manifest::pattern_matches_any(pattern, std::slice::from_ref(file))? {
-                    continue;
-                }
-                checked += 1;
-                let text = std::fs::read_to_string(root.join(file)).unwrap_or_default();
-                let dir = Path::new(file).parent().unwrap_or(Path::new(""));
-                for link in markdown_links(&text) {
-                    let target = link.split('#').next().unwrap_or_default();
-                    if target.is_empty() || target.contains("://") || target.starts_with("mailto:")
-                    {
-                        continue;
-                    }
-                    if !root.join(dir).join(target).exists() {
-                        eprintln!("{file}: broken link {link}");
-                        broken += 1;
-                    }
-                }
-            }
-            if broken == 0 {
-                eprintln!("links ok: {checked} files");
-            }
-            Ok(i32::from(broken > 0))
-        }
-        Work::Copy { from, to } => {
-            let target = root.join(to);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(root.join(from), target)?;
-            Ok(0)
-        }
-    }
-}
-
-/// Targets of `[text](target)` links.
-fn markdown_links(text: &str) -> Vec<&str> {
-    let mut links = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("](") {
-        rest = &rest[start + 2..];
-        if let Some(end) = rest.find(')') {
-            let link = &rest[..end];
-            if !link.contains(char::is_whitespace) {
-                links.push(link);
-            }
-            rest = &rest[end..];
-        }
-    }
-    links
-}
-
-/// `citrus.ci` of a repository, compiled; None when there is no such file.
-pub fn load(root: &Path) -> Result<Option<(Project, Sources)>, String> {
-    let file = root.join("citrus.ci").exists();
-    let directory = root.join(".citrus").is_dir()
-        && std::fs::read_dir(root.join(".citrus"))
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .any(|entry| entry.path().extension().is_some_and(|ext| ext == "ci"))
-            })
-            .unwrap_or(false);
-    match (file, directory) {
-        (true, true) => Err(
-            "error: both citrus.ci and .citrus/ hold a configuration; keep one\nhelp: a small project uses citrus.ci, a larger one .citrus/*.ci\n".into(),
-        ),
-        (false, false) => Ok(None),
-        _ => load_at(root, None),
-    }
-}
-
-/// The project as committed at `revision` (or the working tree), compiled.
-pub fn load_at(root: &Path, revision: Option<&str>) -> Result<Option<(Project, Sources)>, String> {
-    let entry = match revision {
-        None if root.join("citrus.ci").exists() => "citrus.ci",
-        None => ".citrus",
-        Some(revision) => {
-            let listed = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(["cat-file", "-e", &format!("{revision}:citrus.ci")])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            if listed { "citrus.ci" } else { ".citrus" }
+            Some(crate::release::Version { initial, scope })
         }
     };
-    if crate::lang2::detect(root, entry, revision) {
-        return crate::lang2::load(root, entry, revision).map(Some);
-    }
-    match super::load_at(root, entry, revision) {
-        Ok((graph, sources)) => match compile(&graph) {
-            Ok(mut project) => {
-                project.files = sources
-                    .files
-                    .iter()
-                    .map(|(path, _)| path.display().to_string())
-                    .collect();
-                Ok(Some((project, sources)))
-            }
-            Err(error) => Err(sources.render(&error)),
-        },
-        Err((error, sources)) => Err(sources.render(&error)),
-    }
-}
-
-/// A `.ci` value as JSON: durations become seconds, commands their argv.
-fn to_json(value: &Value, span: Span) -> Result<serde_json::Value, Error> {
-    use serde_json::Value as Json;
-    Ok(match value {
-        Value::None => Json::Null,
-        Value::Bool(flag) => Json::Bool(*flag),
-        Value::Int(number) => Json::from(*number),
-        Value::Duration(seconds) => Json::from(*seconds),
-        Value::Str(text) | Value::Ref(text) => Json::String(text.clone()),
-        Value::List(items) => Json::Array(
-            items
-                .iter()
-                .map(|item| to_json(item, span))
-                .collect::<Result<_, _>>()?,
-        ),
-        Value::Map(entries) => Json::Object(
-            entries
-                .iter()
-                .map(|(key, value)| Ok((key.clone(), to_json(value, span)?)))
-                .collect::<Result<_, Error>>()?,
-        ),
-        Value::Action(action) => Json::from(argv(action)?),
-        other => {
+    let checks = match item.attr("checks").and_then(|attr| attr.args.first()) {
+        Some((_, Expr::Path(segments, _))) if segments == &["none".to_owned()] => "none".to_owned(),
+        Some((_, arg)) => {
             return Err(Error::at(
-                span,
-                format!("a {} cannot be used as data", other.type_name()),
+                arg.span(),
+                "`#[checks(none)]` turns the check gate off",
             ));
         }
-    })
+        None => "proven".to_owned(),
+    };
+    let step = |decl: &StepDecl, item_name: String| -> crate::release::Step {
+        let recover = Compiler::names(&decl.attrs, "recover")
+            .first()
+            .map(|name| {
+                vec![
+                    compiler
+                        .script(format!("fn:{name}"), decl.span, release_args(), Vec::new())
+                        .work,
+                ]
+            })
+            .unwrap_or_default();
+        crate::release::Step {
+            name: decl.name.clone(),
+            run: vec![
+                compiler
+                    .script(item_name, decl.span, release_args(), Vec::new())
+                    .work,
+            ],
+            production: decl.attrs.iter().any(|attr| attr.name == "production"),
+            recover,
+        }
+    };
+    let unit = crate::release::Unit {
+        description: item.doc.clone().unwrap_or_default(),
+        environment,
+        checks,
+        version,
+        steps: steps
+            .iter()
+            .map(|decl| step(decl, format!("step:{}:{}", item.name, decl.name)))
+            .collect(),
+        rollback: rollback.map(|decl| step(decl, format!("rollback:{}", item.name))),
+    };
+    unit.validate(&item.name)
+        .map_err(|error| Error::at(item.span, format!("{error:#}")))?;
+    Ok(unit)
 }
 
-/// Fields of a block as a JSON object.
-fn fields_json(
-    decl: &Decl,
-    skip: &[&str],
-) -> Result<serde_json::Map<String, serde_json::Value>, Error> {
+fn artifact(compiler: &mut Compiler, item: &Item) -> Compiled<crate::deploy::Artifact> {
     let mut object = serde_json::Map::new();
-    for (name, value, span) in &decl.fields {
-        if !skip.contains(&name.as_str()) {
-            object.insert(name.clone(), to_json(value, *span)?);
-        }
-    }
-    Ok(object)
-}
-
-/// `checks = none` / `approval = none` read as the word, not as absence.
-fn none_as_word(object: &mut serde_json::Map<String, serde_json::Value>, fields: &[&str]) {
-    for field in fields {
-        if object.get(*field).is_some_and(serde_json::Value::is_null) {
-            object.insert((*field).to_owned(), "none".into());
-        }
-    }
-}
-
-/// Actions as JSON `Work` values: commands and built-in steps.
-fn works_json(value: &Value, span: Span) -> Result<serde_json::Value, Error> {
-    let items = match value {
-        Value::List(items) => items.clone(),
-        other => vec![other.clone()],
-    };
-    let works = items
-        .iter()
-        .map(|item| match item {
-            Value::Action(action) => Ok(step(action, &[])?.work),
-            other => Err(Error::at(
-                span,
-                format!(
-                    "expected actions such as make(\"…\"), not a {}",
-                    other.type_name()
-                ),
-            )),
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    serde_json::to_value(works).map_err(|error| Error::at(span, error.to_string()))
-}
-
-/// `step name = actions { production = true; recover = actions }`, also
-/// `rollback = actions { … }`.
-fn release_step_json(decl: &Decl) -> Result<serde_json::Value, Error> {
-    known_fields(decl, &["production", "recover"])?;
-    known_children(decl, &[])?;
-    let Some(run) = &decl.value else {
-        return Err(
-            Error::at(decl.span, format!("`{}` needs what it runs", decl.kind))
-                .help(format!("{} = make(\"…\")", decl.kind)),
-        );
-    };
-    let mut object = serde_json::Map::new();
-    if let Some(name) = &decl.name {
-        object.insert("name".into(), name.clone().into());
-    }
-    object.insert("run".into(), works_json(run, decl.span)?);
-    if let Some(recover) = decl.field("recover") {
-        object.insert(
-            "recover".into(),
-            works_json(recover, decl.field_span("recover"))?,
-        );
-    }
-    if let Some(production) = decl.field("production") {
-        object.insert(
-            "production".into(),
-            to_json(production, decl.field_span("production"))?,
-        );
-    }
-    Ok(object.into())
-}
-
-/// A field given as `name = value` or as `name = value { … }` (a child block).
-fn value_block(decl: &Decl, kind: &str) -> Option<Decl> {
-    decl.children
-        .iter()
-        .find(|child| child.kind == kind && child.name.is_none())
-        .cloned()
-        .or_else(|| {
-            decl.fields
-                .iter()
-                .find(|(name, ..)| name == kind)
-                .map(|(_, value, span)| Decl {
-                    kind: kind.to_owned(),
-                    name: None,
-                    value: Some(value.clone()),
-                    doc: None,
-                    fields: Vec::new(),
-                    children: Vec::new(),
-                    span: *span,
-                    instance: Vec::new(),
-                })
-        })
-}
-
-fn release_json(decl: &Decl) -> Result<serde_json::Value, Error> {
-    known_fields(decl, &["environment", "checks", "version", "rollback"])?;
-    known_children(decl, &["step", "version", "rollback"])?;
-    let mut object = fields_json(decl, &["version", "rollback"])?;
-    if let Some(doc) = &decl.doc {
-        object.insert("description".into(), doc.clone().into());
-    }
-    none_as_word(&mut object, &["checks"]);
-    if let Some(version) = value_block(decl, "version") {
-        known_fields(&version, &["initial", "scope"])?;
-        known_children(&version, &[])?;
-        if version.value.is_some() || version.field("initial").is_none() {
-            return Err(Error::at(
-                version.span,
-                "`version` says where versions start and what they are for",
-            )
-            .help("version { initial = \"1.0.0\"  scope = [\"api-image\"] }"));
-        }
-        object.insert("version".into(), fields_json(&version, &[])?.into());
-    }
-    if let Some(rollback) = value_block(decl, "rollback") {
-        object.insert("rollback".into(), release_step_json(&rollback)?);
-    }
-    let steps = decl
-        .children
-        .iter()
-        .filter(|child| child.kind == "step")
-        .map(|step| {
-            label(step)?;
-            release_step_json(step)
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    object.insert("steps".into(), steps.into());
-    Ok(object.into())
-}
-
-fn artifact_json(decl: &Decl) -> Result<serde_json::Value, Error> {
-    known_children(decl, &[])?;
-    let mut object = fields_json(decl, &["inputs"])?;
-    if let Some(doc) = &decl.doc {
-        object.insert("description".into(), doc.clone().into());
-    }
-    match decl.field("inputs") {
-        Some(Value::Action(action)) if action.kind == "inputs_of" => {
-            let Some(Value::Action(command)) = action.args.first() else {
-                return Err(Error::at(
-                    action.span,
-                    "`inputs_of` takes a command, e.g. inputs_of(run(\"…\"))",
-                ));
-            };
-            object.insert("inputs_command".into(), argv(command)?.into());
-        }
-        Some(value) => {
-            object.insert("inputs".into(), to_json(value, decl.field_span("inputs"))?);
-        }
-        None => {}
-    }
-    Ok(object.into())
-}
-
-/// `environment name = kubernetes(…) { record = …; deploy workload = artifact }`.
-fn environment_json(decl: &Decl) -> Result<serde_json::Value, Error> {
-    known_children(decl, &["deploy"])?;
-    let mut object = fields_json(decl, &[])?;
-    if let Some(doc) = &decl.doc {
-        object.insert("description".into(), doc.clone().into());
-    }
-    none_as_word(&mut object, &["checks", "approval"]);
-    let Some(Value::Action(on)) = &decl.value else {
-        return Err(Error::at(
-            decl.span,
-            format!(
-                "environment {} needs where it is",
-                decl.name.clone().unwrap_or_default()
-            ),
-        )
-        .help("environment production = kubernetes(context: \"…\", namespace: \"…\")"));
-    };
-    object.insert("provider".into(), on.kind.clone().into());
-    let connection: serde_json::Map<String, serde_json::Value> = on
-        .named
-        .iter()
-        .map(|(key, value)| (key.clone(), value_text(value).into()))
-        .collect();
-    object.insert("connection".into(), connection.into());
-    let mut workloads = serde_json::Map::new();
-    for deploy in &decl.children {
-        known_children(deploy, &[])?;
-        let mut workload = fields_json(deploy, &[])?;
-        match &deploy.value {
-            Some(value) => {
-                workload.insert("artifact".into(), reference(value, deploy.span)?.into());
+    object.insert(
+        "description".into(),
+        json!(item.doc.clone().unwrap_or_default()),
+    );
+    for attr in &item.attrs {
+        match attr.name.as_str() {
+            "inputs" => {
+                for (_, arg) in &attr.args {
+                    if matches!(arg, Expr::Command { .. }) {
+                        object.insert("inputs_command".into(), json!(compiler.argv(arg)?));
+                    } else {
+                        let mut globs = Vec::new();
+                        compiler.value(arg)?.globs(&mut globs);
+                        let entry = object.entry("inputs").or_insert_with(|| json!([]));
+                        if let Json::Array(items) = entry {
+                            items.extend(globs.into_iter().map(Json::String));
+                        }
+                    }
+                }
             }
-            None => {
-                return Err(
-                    Error::at(deploy.span, "`deploy` names the artifact it runs")
-                        .help("deploy backend = backend-image"),
+            "dockerfile" => {
+                let fields = compiler.attr_object(attr)?;
+                object.insert(
+                    "dockerfile".into(),
+                    json!({"file": fields.get("0").cloned().unwrap_or(Json::Null), "target": fields.get("target").cloned().unwrap_or(Json::Null)}),
                 );
             }
+            // How it is built and published: provider settings, part of its key.
+            "build" | "publish" => {
+                let fields = compiler.attr_object(attr)?;
+                object.insert(attr.name.clone(), Json::Object(fields));
+            }
+            other => {
+                return Err(Error::at(
+                    attr.span,
+                    format!("`#[{other}]` does not apply to an artifact"),
+                )
+                .help(
+                    "artifacts take #[inputs(…)], #[dockerfile(…)], #[build(…)] and #[publish(…)]",
+                ));
+            }
         }
-        workloads.insert(label(deploy)?, workload.into());
     }
-    object.insert("workloads".into(), workloads.into());
-    Ok(object.into())
+    serde_json::from_value(Json::Object(object))
+        .map_err(|error| Error::at(item.span, format!("artifact {}: {error}", item.name)))
 }
 
-/// Read a block's JSON form into Citrus's own type; errors point at the block.
-fn typed<T: serde::de::DeserializeOwned>(decl: &Decl, json: serde_json::Value) -> Result<T, Error> {
-    serde_json::from_value(json).map_err(|error| {
-        Error::at(
-            decl.span,
-            format!(
-                "{} \"{}\": {}",
-                decl.kind,
-                decl.name.clone().unwrap_or_default(),
-                error
-            ),
-        )
-    })
+fn environment(
+    compiler: &mut Compiler,
+    item: &Item,
+) -> Compiled<Option<crate::deploy::Environment>> {
+    let Some(provider) = item.attrs.iter().find(|attr| attr.name == "kubernetes") else {
+        // Without a provider an environment is only a release lock.
+        return Ok(None);
+    };
+    let mut object = serde_json::Map::new();
+    object.insert("provider".into(), json!("kubernetes"));
+    object.insert(
+        "description".into(),
+        json!(item.doc.clone().unwrap_or_default()),
+    );
+    let connection: serde_json::Map<String, Json> = compiler
+        .attr_object(provider)?
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                key,
+                json!(
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                ),
+            )
+        })
+        .collect();
+    object.insert("connection".into(), Json::Object(connection));
+    let mut workloads = serde_json::Map::new();
+    for attr in &item.attrs {
+        match attr.name.as_str() {
+            "kubernetes" => {}
+            "deploy" => {
+                let mut fields = compiler.attr_object(attr)?;
+                let name = fields
+                    .remove("0")
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                let artifact = fields.remove("1");
+                let (Some(name), Some(artifact)) = (name, artifact) else {
+                    return Err(Error::at(attr.span, "`#[deploy(\"workload\", artifact)]`"));
+                };
+                fields.insert("artifact".into(), artifact);
+                workloads.insert(name, Json::Object(fields));
+            }
+            "record" | "migrations" | "verify" => {
+                let mut fields = compiler.attr_object(attr)?;
+                if attr.name == "record"
+                    && let Some((_, arg)) = attr
+                        .args
+                        .iter()
+                        .find(|(key, _)| key.as_deref() == Some("resolve"))
+                {
+                    fields.insert("resolve".into(), json!(compiler.argv(arg)?));
+                }
+                if attr.name == "verify"
+                    && let Some((_, Expr::List(items, _))) = attr
+                        .args
+                        .iter()
+                        .find(|(key, _)| key.as_deref() == Some("commands"))
+                {
+                    let commands = items
+                        .iter()
+                        .map(|item| compiler.argv(item))
+                        .collect::<Compiled<Vec<_>>>()?;
+                    fields.insert("commands".into(), json!(commands));
+                }
+                object.insert(attr.name.clone(), Json::Object(fields));
+            }
+            "prepare" => {
+                let (_, arg) = attr
+                    .args
+                    .first()
+                    .ok_or_else(|| Error::at(attr.span, "`#[prepare(cmd!(\"…\"))]`"))?;
+                object.insert("prepare".into(), json!(compiler.argv(arg)?));
+            }
+            "approval" | "checks" | "release_name" => {
+                let fields = compiler.attr_object(attr)?;
+                object.insert(
+                    attr.name.clone(),
+                    fields.get("0").cloned().unwrap_or(Json::Null),
+                );
+            }
+            other => {
+                return Err(Error::at(
+                    attr.span,
+                    format!("`#[{other}]` does not apply to an environment"),
+                ));
+            }
+        }
+    }
+    object.insert("workloads".into(), Json::Object(workloads));
+    serde_json::from_value(Json::Object(object))
+        .map(Some)
+        .map_err(|error| Error::at(item.span, format!("environment {}: {error}", item.name)))
+}
+
+pub fn compile(
+    program: &Program,
+    sources: &Sources,
+    root: &Path,
+    revision: Option<&str>,
+) -> Compiled<Project> {
+    let mut interp = Interp::new(program, root);
+    interp.revision = revision.map(str::to_owned);
+    interp.load_consts(program).map_err(failure)?;
+    let shared = program
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.kind,
+                ItemKind::Fn(_) | ItemKind::Const { .. } | ItemKind::Struct { .. }
+            )
+        })
+        .map(|item| slice(sources, item.span))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut compiler = Compiler {
+        program,
+        sources,
+        interp,
+        files: tools::RepoFiles::new(root, revision),
+        shared,
+    };
+    let mut project = Project::default();
+    let mut default_cache = true;
+    for attr in &program.inner {
+        let first = |compiler: &mut Compiler| -> Compiled<Value> {
+            let (_, arg) = attr.args.first().ok_or_else(|| {
+                Error::at(attr.span, format!("`#![{}(…)]` needs a value", attr.name))
+            })?;
+            compiler.value(arg)
+        };
+        match attr.name.as_str() {
+            "citrus" => {}
+            "main" => project.base = Some(first(&mut compiler)?.as_text()),
+            "logs" => project.logs = Some(first(&mut compiler)?.as_text()),
+            "receipts" => project.receipts = Some(first(&mut compiler)?.as_text()),
+            "cache" => default_cache = matches!(first(&mut compiler)?, Value::Bool(true)),
+            "toolchain" => {
+                for (_, arg) in &attr.args {
+                    compiler.value(arg)?.globs(&mut project.toolchain);
+                }
+            }
+            "signals" | "free_version" | "after_merge" => {
+                let (_, arg) = attr.args.first().ok_or_else(|| {
+                    Error::at(attr.span, format!("`#![{}(cmd!(\"…\"))]`", attr.name))
+                })?;
+                let argv = compiler.argv(arg)?;
+                match attr.name.as_str() {
+                    "signals" => project.signals = argv,
+                    "free_version" => project.free_version = argv,
+                    _ => project.after_merge = argv,
+                }
+            }
+            "runner" => {
+                let mut pool = Pool::default();
+                for (key, arg) in &attr.args {
+                    match key.as_deref() {
+                        None => pool.argv = compiler.argv(arg)?,
+                        Some("status") => pool.status = compiler.argv(arg)?,
+                        Some(other) => {
+                            return Err(Error::at(
+                                arg.span(),
+                                format!("`#![runner]` has no `{other}`"),
+                            )
+                            .help("#![runner(cmd!(\"…\"), status = cmd!(\"…\"))]"));
+                        }
+                    }
+                }
+                project.pool = Some(pool);
+            }
+            "command" => {
+                let fields = compiler.attr_object(attr)?;
+                let text = |key: &str| {
+                    fields
+                        .get(key)
+                        .and_then(Json::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                project.commands.push((text("1"), text("2"), text("0")));
+            }
+            "label" => {
+                let [(_, name), (_, when)] = attr.args.as_slice() else {
+                    return Err(Error::at(attr.span, "`#![label(\"name\", condition)]`"));
+                };
+                let name = compiler.value(name)?.as_text();
+                let when = condition(when, &mut compiler)?;
+                project.labels.push((name, when));
+            }
+            other => {
+                return Err(Error::at(attr.span, format!("unknown project attribute `#![{other}]`")).help(
+                    "project attributes: citrus, main, toolchain, logs, receipts, cache, signals, free_version, after_merge, runner, command, label",
+                ));
+            }
+        }
+    }
+    for item in &program.items {
+        match &item.kind {
+            ItemKind::Profile => {
+                project.profiles.push(item.name.clone());
+                let env = compiler.env(&item.attrs)?;
+                project.profile_env.push((item.name.clone(), env));
+            }
+            ItemKind::Service { start, ready } => {
+                let limit = match item.attr("limit").and_then(|attr| attr.args.first()) {
+                    Some((_, arg)) => match compiler.value(arg)? {
+                        Value::Int(limit) => Some(limit),
+                        _ => return Err(Error::at(arg.span(), "`#[limit(n)]` takes a number")),
+                    },
+                    None => None,
+                };
+                let start = start
+                    .as_ref()
+                    .map(|body| {
+                        vec![compiler.script(
+                            format!("service-start:{}", item.name),
+                            body.span,
+                            Vec::new(),
+                            Vec::new(),
+                        )]
+                    })
+                    .unwrap_or_default();
+                let ready = ready
+                    .as_ref()
+                    .map(|body| {
+                        vec![compiler.script(
+                            format!("service-ready:{}", item.name),
+                            body.span,
+                            Vec::new(),
+                            Vec::new(),
+                        )]
+                    })
+                    .unwrap_or_default();
+                project.services.push(Service {
+                    name: item.name.clone(),
+                    description: item.doc.clone(),
+                    start,
+                    ready,
+                    limit,
+                });
+            }
+            ItemKind::Group { items } => {
+                let (paths, _) = compiler.globs(&item.attrs, "paths")?;
+                let (reads, _) = compiler.globs(&item.attrs, "reads")?;
+                let mut when = None;
+                for attr in item.attrs.iter().filter(|attr| attr.name == "when") {
+                    for (_, arg) in &attr.args {
+                        when = Some(condition(arg, &mut compiler)?);
+                    }
+                }
+                let inherited = Inherited {
+                    group: Some(item.name.clone()),
+                    paths: paths.clone(),
+                    reads,
+                    needs: Compiler::names(&item.attrs, "needs"),
+                    env: compiler.env(&item.attrs)?,
+                    profiles: Compiler::names(&item.attrs, "profile"),
+                    cache: compiler.flag(&item.attrs, "cache")?,
+                    when,
+                };
+                project.groups.push(Group {
+                    name: item.name.clone(),
+                    owns: paths,
+                    span: item.span,
+                });
+                for inner in items {
+                    let name = format!("{}.{}", item.name, inner.name);
+                    let compiled = check(&mut compiler, inner, &name, &inherited)?;
+                    project.checks.push(compiled);
+                }
+            }
+            ItemKind::Check { .. } => {
+                let compiled = check(&mut compiler, item, &item.name, &Inherited::default())?;
+                project.checks.push(compiled);
+            }
+            ItemKind::Task { body } => {
+                let step = lowered(body, &[], item.span).unwrap_or_else(|| {
+                    compiler.script(
+                        format!("task:{}", item.name),
+                        item.span,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                });
+                project.tasks.push(Task {
+                    name: item.name.clone(),
+                    about: item.doc.clone().unwrap_or_default(),
+                    steps: vec![step],
+                    span: item.span,
+                });
+            }
+            ItemKind::Release { steps, rollback } => {
+                let unit = release(&mut compiler, item, steps, rollback.as_ref())?;
+                project.releases.insert(item.name.clone(), unit);
+            }
+            ItemKind::Artifact => {
+                let built = artifact(&mut compiler, item)?;
+                project.artifacts.insert(item.name.clone(), built);
+            }
+            ItemKind::Environment => {
+                if let Some(env) = environment(&mut compiler, item)? {
+                    project.environments.insert(item.name.clone(), env);
+                }
+            }
+            ItemKind::Const { .. } | ItemKind::Fn(_) | ItemKind::Struct { .. } => {}
+        }
+    }
+    // Checks that cover others; groups named in paths are part of the inputs.
+    let covers: Vec<(String, Vec<String>)> = program
+        .items
+        .iter()
+        .flat_map(|item| match &item.kind {
+            ItemKind::Group { items } => items
+                .iter()
+                .map(|inner| (format!("{}.{}", item.name, inner.name), inner))
+                .collect::<Vec<_>>(),
+            _ => vec![(item.name.clone(), item)],
+        })
+        .map(|(name, item)| {
+            let group = name.split_once('.').map(|(group, _)| group.to_owned());
+            (
+                name,
+                qualify(Compiler::names(&item.attrs, "covers"), &group),
+            )
+        })
+        .collect();
+    for (by, names) in covers {
+        for name in names {
+            for check in project.checks.iter_mut().filter(|check| check.name == name) {
+                check.covered_by.push(by.clone());
+            }
+        }
+    }
+    let group_paths: BTreeMap<String, Vec<String>> = project
+        .groups
+        .iter()
+        .map(|group| (group.name.clone(), group.owns.clone()))
+        .collect();
+    for check in &mut project.checks {
+        let mut reads: Vec<String> = check
+            .via
+            .iter()
+            .flat_map(|name| group_paths.get(name).into_iter().flatten().cloned())
+            .collect();
+        if !reads.is_empty() {
+            reads.append(&mut check.reads);
+            check.reads = reads;
+        }
+        check.cache = check.cache_set.unwrap_or(default_cache)
+            && !(check.owns.is_empty() && check.reads.is_empty());
+    }
+    project.files = sources
+        .files
+        .iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect();
+    Ok(project)
 }

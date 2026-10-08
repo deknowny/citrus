@@ -12,8 +12,8 @@ use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
 use crate::exec::{Context, agent, read_log, segment};
-use crate::lang::compile::Work;
 use crate::manifest::now;
+use crate::model::Work;
 use crate::report::{self, compact_utc};
 use crate::state::{Release, ReleaseStep};
 
@@ -581,16 +581,12 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
             }
         } else {
             for work in &works {
-                let step = crate::lang::compile::Step {
+                let step = crate::model::Step {
                     span: Default::default(),
                     label: work.label(),
                     work: work.clone(),
                 };
-                code = i64::from(crate::lang::compile::execute(
-                    &step,
-                    &context.repo.root,
-                    false,
-                )?);
+                code = i64::from(crate::model::execute(&step, &context.repo.root, false)?);
                 if code != 0 {
                     break;
                 }

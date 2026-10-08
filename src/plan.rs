@@ -100,7 +100,7 @@ fn changed_paths(repo: &Repo, fork: &str) -> Result<Vec<String>> {
 fn edited_checks(repo: &Repo, manifest: &Manifest, before: &str) -> Vec<String> {
     let old = (!before.is_empty())
         .then(|| {
-            crate::lang::compile::load_at(&repo.root, Some(before))
+            crate::model::load_at(&repo.root, Some(before))
                 .ok()
                 .flatten()
         })
@@ -470,16 +470,16 @@ impl Facts<'_> {
     }
 
     /// Changed paths in a group or glob list.
-    fn within(&self, set: &crate::lang::compile::Paths) -> usize {
-        use crate::lang::compile::Paths;
+    fn within(&self, set: &crate::model::Paths) -> usize {
+        use crate::model::Paths;
         match set {
             Paths::Name(name) => self.group_paths.get(name).copied().unwrap_or(0),
             Paths::Globs(globs) => self.count(globs),
         }
     }
 
-    fn holds(&self, when: &crate::lang::compile::Cond, selected: &[String]) -> bool {
-        use crate::lang::compile::{Cond, Paths};
+    fn holds(&self, when: &crate::model::Cond, selected: &[String]) -> bool {
+        use crate::model::{Cond, Paths};
         when.eval(&|fact| match fact {
             Cond::Touched(Paths::Name(name)) => self.touched.contains(name),
             Cond::Touched(set) => self.within(set) > 0,
