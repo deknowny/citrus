@@ -1,16 +1,14 @@
-citrus 1
+#![citrus(2)]
 
-# The smallest setup: checks are Make targets.
-# `paths` select a check when they change; `reads` only invalidate its
-# earlier pass. A pass is reused while both are unchanged.
-
-# API unit tests.
-check test-api = make("test-api") {
-  paths = ["api/**"]
-  reads = ["Cargo.lock"]
+/// API unit tests.
+#[paths("api/**")]
+#[reads("Cargo.lock")]
+check test_api {
+    run!("make test-api")?;
 }
 
-# Markdown links and spelling.
-check lint-docs = make("lint-docs") {
-  paths = ["docs/**", "*.md"]
+/// Markdown links and spelling.
+#[paths("docs/**", "*.md")]
+check lint_docs {
+    run!("make lint-docs")?;
 }

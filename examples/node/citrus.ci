@@ -1,16 +1,21 @@
-citrus 1
+#![citrus(2)]
 
-# A pnpm workspace with a Next.js app and a shared component library.
-
-# The shop: the Next.js app and every workspace package it uses.
+/// The shop: the Next.js app and every workspace package it uses.
+#[paths(std::paths::next("@acme/shop"))]
 group shop {
-  paths = next("@acme/shop")
-  check unit = pnpm.test("@acme/shop")
-  check build = pnpm.build("@acme/shop")
+    check unit {
+        run!("pnpm --dir . --filter @acme/shop run test")?;
+    }
+
+    check build {
+        run!("pnpm --dir . --filter @acme/shop run build")?;
+    }
 }
 
-# Components shared by the apps.
+/// Components shared by the apps.
+#[paths(std::paths::package("@acme/ui"))]
 group ui {
-  paths = package("@acme/ui")
-  check unit = pnpm.test("@acme/ui")
+    check unit {
+        run!("pnpm --dir . --filter @acme/ui run test")?;
+    }
 }

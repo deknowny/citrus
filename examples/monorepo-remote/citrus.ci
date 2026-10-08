@@ -1,56 +1,62 @@
-citrus 1
+#![citrus(2)]
+#![toolchain(["rust-toolchain.toml", ".python-version"])]
+#![runner(cmd!("make remote-check"), status = cmd!("make builders-status"))]
 
-# A Rust and Next.js monorepo whose checks run on shared builders.
+/// Fast checks never touch a database: SQLx reads the committed metadata.
+#[env(SQLX_OFFLINE = "true")]
+profile fast;
 
-project {
-  toolchain = ["rust-toolchain.toml", ".python-version"]
+/// Slow checks against real services.
+profile e2e;
+
+/// PostgreSQL for the e2e checks.
+service database {
+    start {
+        run!("docker compose up -d postgres")?;
+    }
+    ready {
+        std::wait::tcp("localhost:5432", 1m)?;
+    }
 }
 
-# Fast checks never touch a database: SQLx reads the committed metadata.
-profile fast {
-  env {
-    SQLX_OFFLINE = "true"
-  }
-}
-
-# Slow checks against real services.
-profile e2e
-
-# PostgreSQL for the e2e checks.
-service database = compose.up("postgres") {
-  ready = wait.tcp("localhost:5432", timeout: 60s)
-}
-
-# The builders run the planned checks and report each one in the runner
-# protocol; `status` describes the machines (shown from a snapshot).
-runner builders = make("remote-check") {
-  status = make("builders-status")
-}
-
-# The API and its migrations.
+/// The API and its migrations.
+#[paths(std::paths::cargo("api") + ["migrations/**"])]
 group api {
-  paths = crate("api") + ["migrations/**"]
-  check unit = cargo.test("api")
+    check unit {
+        run!("cargo test --locked -p api")?;
+    }
 
-  # Against a real database, so only in the slow profile.
-  check database = make("test-api-db") {
-    profile = e2e
-    needs = [database]
-  }
+    /// Against a real database, so only in the slow profile.
+    #[profile(e2e)]
+    #[needs(database)]
+    check database {
+        run!("make test-api-db")?;
+    }
 }
 
-# The storefront.
+/// The storefront.
+#[paths(std::paths::next("@acme/web"))]
 group web {
-  paths = next("@acme/web")
-  check unit = pnpm.test("@acme/web")
+    check unit {
+        run!("pnpm --dir . --filter @acme/web run test")?;
+    }
 }
 
-# CI scripts: which contract test runs depends on what else changed.
+/// CI scripts: which contract test runs depends on what else changed.
+#[paths("scripts/**", "Makefile")]
 group pipeline {
-  paths = ["scripts/**", "Makefile"]
-  check contract = match changed {
-    only(pipeline) => make("test-pipeline")
-    without(web) => make("test-pipeline-api")
-    _ => make("test-pipeline-all")
-  }
+    #[when((only(pipeline)))]
+    check contract_0 {
+        run!("make test-pipeline")?;
+    }
+
+    #[when(!(only(pipeline)) && (without(web)))]
+    check contract_1 {
+        run!("make test-pipeline-api")?;
+    }
+
+    #[when(!(only(pipeline)) && !(without(web)))]
+    check contract {
+        run!("make test-pipeline-all")?;
+    }
 }
