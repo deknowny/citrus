@@ -297,3 +297,93 @@ check inside {
     assert_eq!(result(&run, "inside")["result"], "passed", "{run}");
     assert!(worker.wait().unwrap().success());
 }
+
+/// A stopped agent hands its checks back; another agent finishes them.
+#[test]
+fn a_stopped_agent_hands_its_checks_back() {
+    let Ok(pool) = std::env::var("CITRUS_TEST_POOL") else {
+        eprintln!("CITRUS_TEST_POOL is not set: pool tests skipped");
+        return;
+    };
+    let work = tempfile::tempdir().unwrap();
+    let project = work.path().join("project");
+    let origin = work.path().join("origin.git");
+    let cache = work.path().join("agents");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("citrus.ci"),
+        "#![citrus(2)]\n\n#[paths(\"src/**\")]\ncheck slow {\n    run!(\"sleep 4\")?;\n}\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/a.txt"), "one\n").unwrap();
+    git(&project, &["init", "-q", "-b", "main"]);
+    git(&project, &["add", "-A"]);
+    git(
+        &project,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    git(
+        work.path(),
+        &["init", "-q", "--bare", "-b", "main", "origin.git"],
+    );
+    git(
+        &project,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&project, &["push", "-q", "-u", "origin", "main"]);
+    fs::write(project.join("src/a.txt"), "two\n").unwrap();
+
+    let mut first = agent(&project, &pool, &cache.join("first"), "first", "plain");
+    let requester = citrus(&project, &pool, &cache, &["run", "--remote", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Wait until the first agent runs the check, then stop it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let overview = json(
+            &Command::new(env!("CARGO_BIN_EXE_citrus"))
+                .args(["pool", "--json"])
+                .env("CITRUS_POOL", &pool)
+                .output()
+                .unwrap(),
+        );
+        let running = overview["pool"]["running"].as_array().unwrap();
+        if running.iter().any(|row| row[2] == "first") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first agent never took the check"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // SAFETY: plain signal delivery to a child this test started.
+    unsafe { libc::kill(first.id() as libc::pid_t, libc::SIGTERM) };
+    assert!(first.wait().unwrap().success());
+    let mut second = agent(&project, &pool, &cache.join("second"), "second", "plain");
+    let output = requester.wait_with_output().unwrap();
+    let run = json(&output);
+    assert_eq!(output.status.code(), Some(0), "{run}");
+    assert_eq!(result(&run, "slow")["result"], "passed", "{run}");
+    let id = run["run"]["id"].as_str().unwrap();
+    let log = citrus(&project, &pool, &cache, &["log", id, "--full", "--text"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("first stopped: slow back in the queue"),
+        "{}",
+        String::from_utf8_lossy(&log.stdout)
+    );
+    assert!(second.wait().unwrap().success());
+}
