@@ -2971,8 +2971,10 @@ group lib {
     }
 }
 
-/// Selected by a condition: nothing tells what it reads.
+/// Selected by a condition: nothing tells what it reads (its Makefile is
+/// not all it reads), so even asked to it is not reused.
 #[when(selected(lib::unit))]
+#[cache(true)]
 check after {
     run!("make ok")?;
 }
@@ -3374,6 +3376,37 @@ check api {
     assert_eq!(
         targets["targets"][0]["meta"]["understood"][0],
         "scripts/cargo-test.sh = cargo test -p api"
+    );
+    // Inside a Make recipe the same commands are understood: the target's
+    // checks read the crates, and say what the target runs.
+    project.write(
+        "Makefile",
+        "test-api:\n\t@SQLX_OFFLINE=true ./scripts/cargo-test.sh \\\n\t\t-p api --lib -- $(ARGS)\n",
+    );
+    project.write(
+        "citrus.ci",
+        r#"#![citrus(2)]
+#![tool("scripts/cargo-test.sh", cmd!("cargo test"))]
+
+#[paths("crates/api/**")]
+check api {
+    run!("make test-api")?;
+}
+"#,
+    );
+    project.git(&["add", "-A"]);
+    let (targets, code) = project.json(&["targets"]);
+    assert_eq!(code, 0, "{targets}");
+    assert_eq!(
+        targets["targets"][0]["meta"]["understood"][0],
+        "make test-api (scripts/cargo-test.sh = cargo test -p api)"
+    );
+    let reads = targets["targets"][0]["extra_inputs"].to_string();
+    assert!(
+        reads.contains("Makefile")
+            && reads.contains("crates/core/**")
+            && reads.contains("scripts/cargo-test.sh"),
+        "{reads}"
     );
     project.write(
         "citrus.ci",

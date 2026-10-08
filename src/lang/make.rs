@@ -158,6 +158,38 @@ impl Makefiles {
         includes
     }
 
+    /// Recipe lines of the rules `make <target>` runs, in no particular order.
+    pub fn recipes(&self, target: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut queue = vec![target.to_owned()];
+        while let Some(name) = queue.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Some(rule) = self.rules.get(&name) else {
+                continue;
+            };
+            queue.extend(rule.prereqs.iter().cloned());
+            for line in &rule.recipe {
+                let words = words(line);
+                for (index, word) in words.iter().enumerate() {
+                    if (word == "$(MAKE)" || word == "make")
+                        && let Some(rest) = words.get(index + 1..)
+                    {
+                        queue.extend(
+                            rest.iter()
+                                .filter(|word| self.rules.contains_key(word.as_str()))
+                                .cloned(),
+                        );
+                    }
+                }
+                lines.push(line.clone());
+            }
+        }
+        lines
+    }
+
     /// Every rule's name.
     pub fn targets(&self) -> impl Iterator<Item = &str> {
         self.rules.keys().map(String::as_str)

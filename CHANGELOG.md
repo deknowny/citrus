@@ -18,6 +18,10 @@ Breaking: a new configuration language (docs/design/language.md). Every
   packages it builds, and a misspelled subcommand or package is an error.
 - Outside the language names use `-` for `_` (`test_db` → `test-db`),
   like Cargo crate names; the command line takes either.
+- Commands in a target's recipe that Citrus understands (Cargo, declared
+  wrappers) add what they read; `citrus deps` checks those targets too. Only
+  paths and `#[reads]` let a pass be reused: inputs inferred from a recipe
+  alone do not.
 - `run!("make target")` is understood: the target's Makefiles, the
   variables and the files its recipes name join the check's fingerprint,
   and a misspelled target is an error when the file loads.

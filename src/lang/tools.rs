@@ -124,7 +124,7 @@ pub fn understand(
             let Some(makefiles) = make.get_or_init(|| super::make::Makefiles::load(files)) else {
                 return Ok(None);
             };
-            make_targets(&literal[1..], span, files, makefiles)
+            make_targets(&literal[1..], span, files, tools, makefiles)
         }
         _ => Ok(None),
     }
@@ -135,6 +135,7 @@ fn make_targets(
     args: &[Option<String>],
     span: Span,
     files: &dyn Files,
+    tools: &[(String, Vec<String>)],
     makefiles: &super::make::Makefiles,
 ) -> Result<Option<Understood>, Error> {
     let mut targets = Vec::new();
@@ -166,7 +167,22 @@ fn make_targets(
         return Ok(None);
     }
     let mut inputs: Vec<String> = Vec::new();
+    let mut inner: Vec<String> = Vec::new();
     for target in &targets {
+        // Recipe commands Citrus understands (Cargo, declared wrappers) add
+        // what they read, and say what the target runs.
+        for line in makefiles.recipes(target) {
+            if let Some(found) = recipe_command(&line, span, files, tools)? {
+                for input in found.inputs {
+                    if !inputs.contains(&input) {
+                        inputs.push(input);
+                    }
+                }
+                if !inner.contains(&found.summary) {
+                    inner.push(found.summary);
+                }
+            }
+        }
         let Some(found) = makefiles.inputs(target, files) else {
             let mut error = Error::at(span, format!("no Make target `{target}`"));
             if let Some(close) = suggest(target, makefiles.targets()) {
@@ -180,11 +196,82 @@ fn make_targets(
             }
         }
     }
+    let summary = if inner.is_empty() {
+        format!("make {}", targets.join(" "))
+    } else {
+        format!("make {} ({})", targets.join(" "), inner.join("; "))
+    };
     Ok(Some(Understood {
-        summary: format!("make {}", targets.join(" ")),
+        summary,
         inputs,
         selects: false,
     }))
+}
+
+/// One recipe line as a command: `@`, `-`, `+`, leading `VAR=value` words
+/// and a line continued over `\` are a shell's business. A line using
+/// shell syntax or Make variables in the command is not understood; a
+/// misspelled package in a recipe is not an error here (Make owns it).
+fn recipe_command(
+    line: &str,
+    span: Span,
+    files: &dyn Files,
+    tools: &[(String, Vec<String>)],
+) -> Result<Option<Understood>, Error> {
+    let line = line.trim().trim_start_matches(['@', '-', '+']).trim();
+    if line.contains(['|', ';', '&', '<', '>', '`']) {
+        return Ok(None);
+    }
+    let mut words: Vec<&str> = line.split_whitespace().collect();
+    while words.first().is_some_and(|word| {
+        word.split_once('=').is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        })
+    }) {
+        words.remove(0);
+    }
+    // `-- $(TEST_ARGS)`: what follows `--` belongs to the test binary.
+    let cut = words
+        .iter()
+        .position(|word| *word == "--")
+        .unwrap_or(words.len());
+    if words[..cut].iter().any(|word| word.contains('$')) || words.is_empty() {
+        return Ok(None);
+    }
+    let literal: Vec<Option<String>> = words[..cut]
+        .iter()
+        .map(|word| Some((*word).to_owned()))
+        .collect();
+    let program = literal[0]
+        .as_deref()
+        .unwrap_or_default()
+        .trim_start_matches("./")
+        .to_owned();
+    let expanded: Vec<Option<String>> = match tools.iter().find(|(wrapper, _)| *wrapper == program)
+    {
+        Some((wrapper, argv)) => {
+            let mut expanded: Vec<Option<String>> = argv.iter().cloned().map(Some).collect();
+            expanded.extend(literal[1..].iter().cloned());
+            return Ok(match expanded.first() {
+                Some(Some(first)) if first == "cargo" => cargo(&expanded[1..], span, files)
+                    .ok()
+                    .flatten()
+                    .map(|mut found| {
+                        found.summary = format!("{wrapper} = {}", found.summary);
+                        found
+                    }),
+                _ => None,
+            });
+        }
+        None => literal,
+    };
+    Ok(match expanded.first() {
+        Some(Some(first)) if first == "cargo" => cargo(&expanded[1..], span, files).ok().flatten(),
+        _ => None,
+    })
 }
 
 fn cargo(

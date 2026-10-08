@@ -218,6 +218,10 @@ pub struct Check {
     /// `cache` as the check or its group says; otherwise the project's default.
     #[serde(skip)]
     pub cache_set: Option<bool>,
+    /// Its paths or `#[reads]` say what it reads; what Citrus inferred from
+    /// a Make recipe alone does not let a pass be reused.
+    #[serde(skip)]
+    pub known_inputs: bool,
     pub resources: Vec<String>,
     /// Project-specific data for the project's own tools (`meta = { … }`).
     pub meta: BTreeMap<String, serde_json::Value>,

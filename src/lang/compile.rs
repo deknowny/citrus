@@ -519,6 +519,7 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
     }
     let (mut reads, _) = compiler.globs(&item.attrs, "reads")?;
     reads.extend(from.reads.iter().cloned());
+    let known_inputs = !owns.is_empty() || !reads.is_empty() || !via.is_empty();
     for glob in understood_reads {
         if !reads.contains(&glob) {
             reads.push(glob);
@@ -569,6 +570,7 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         reads,
         cache: true,
         cache_set: compiler.flag(&item.attrs, "cache")?.or(from.cache),
+        known_inputs,
         resources,
         meta,
         env,
@@ -1161,8 +1163,7 @@ pub fn compile(
             reads.append(&mut check.reads);
             check.reads = reads;
         }
-        check.cache = check.cache_set.unwrap_or(default_cache)
-            && !(check.owns.is_empty() && check.reads.is_empty());
+        check.cache = check.cache_set.unwrap_or(default_cache) && check.known_inputs;
     }
     project.files = sources
         .files
