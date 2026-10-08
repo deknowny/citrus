@@ -413,7 +413,7 @@ enum PoolAction {
         #[arg(long)]
         platform: Option<String>,
     },
-    /// The Citrus builds the pool holds.
+    /// The Citrus builds the pool holds, newest first.
     Binaries,
 }
 
