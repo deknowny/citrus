@@ -1351,14 +1351,15 @@ fn executor(
         "builds Citrus {} for {platform} (once per version)",
         &version[..12.min(version.len())]
     ))?;
+    // Incremental: one target directory per machine (or Docker volume) kept
+    // between versions, profile `fast`; the next commit rebuilds in seconds.
     let status = match container {
         None => Command::new("cargo")
-            .args([
-                "install", "--quiet", "--locked", "--git", REPOSITORY, "--rev", version,
-            ])
-            .arg("--root")
+            .args(["install", "--quiet", "--locked", "--git", REPOSITORY])
+            .args(["--rev", version, "--profile", "fast", "--root"])
             .arg(&staging)
             .env("CITRUS_BUILD_COMMIT", version)
+            .env("CARGO_TARGET_DIR", machine.cache.join("citrus-target"))
             .stdin(Stdio::null())
             .status()
             .context("cargo builds Citrus for this machine")?,
@@ -1369,6 +1370,12 @@ fn executor(
             .args([
                 "-v",
                 "citrus-cargo-registry:/usr/local/cargo/registry",
+                "-v",
+                "citrus-cargo-git:/usr/local/cargo/git",
+                "-v",
+                "citrus-build-target:/citrus-target",
+                "-e",
+                "CARGO_TARGET_DIR=/citrus-target",
                 "-e",
                 &format!("CITRUS_BUILD_COMMIT={version}"),
                 "rust:1-bookworm",
@@ -1380,6 +1387,8 @@ fn executor(
                 REPOSITORY,
                 "--rev",
                 version,
+                "--profile",
+                "fast",
                 "--root",
                 "/out",
             ])
@@ -1396,7 +1405,26 @@ fn executor(
         // Another agent on this machine built it first.
         let _ = std::fs::remove_dir_all(&staging);
     }
+    // The other agents take this build instead of compiling it again.
+    if let Some(url) = url()
+        && let Ok(mut client) = connect(&url)
+    {
+        let _ = store_binary(&mut client, version, &platform, &binary);
+    }
     Ok(binary)
+}
+
+/// Keep `file` as the build of `commit` for `platform` unless one is held.
+fn store_binary(client: &mut Client, commit: &str, platform: &str, file: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let data = std::fs::read(file)?;
+    let sha = hex::encode(Sha256::digest(&data));
+    client.execute(
+        "insert into citrus.binaries (commit_sha, platform, sha256, data) values ($1, $2, $3, $4)
+         on conflict (commit_sha, platform) do nothing",
+        &[&commit, &platform, &sha, &data],
+    )?;
+    Ok(sha)
 }
 
 /// A published build of `commit` for `platform`, written to `to` (checked
@@ -1436,7 +1464,6 @@ pub fn fetch_published(commit: &str, platform: &str, to: &Path) -> Result<bool> 
 /// (`citrus --version`) and `platform` (default: this machine's). The first
 /// build of a commit stays: whoever took it keeps the same bytes.
 pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, String, String)> {
-    use sha2::{Digest, Sha256};
     let output = Command::new(file)
         .arg("--version")
         .stdin(Stdio::null())
@@ -1458,8 +1485,6 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
     let platform = platform
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{}-{}", os_label(), arch()));
-    let data = std::fs::read(file)?;
-    let sha = hex::encode(Sha256::digest(&data));
     let url = url()
         .or_else(|| {
             std::env::var("CITRUS_AGENT_POOL")
@@ -1468,11 +1493,7 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
         })
         .context("no pool: set CITRUS_POOL or ~/.config/citrus/pool")?;
     let mut client = connect(&url)?;
-    client.execute(
-        "insert into citrus.binaries (commit_sha, platform, sha256, data) values ($1, $2, $3, $4)
-         on conflict (commit_sha, platform) do nothing",
-        &[&commit, &platform, &sha, &data],
-    )?;
+    let sha = store_binary(&mut client, &commit, &platform, file)?;
     Ok((commit, platform, sha))
 }
 

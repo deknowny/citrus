@@ -415,6 +415,14 @@ enum PoolAction {
     },
     /// The Citrus builds the pool holds, newest first.
     Binaries,
+    /// Write the pool's build of a commit to a file (installers, agents).
+    Fetch {
+        commit: String,
+        to: std::path::PathBuf,
+        /// `linux-x86_64`, `macos-aarch64`…; default: this machine's.
+        #[arg(long)]
+        platform: Option<String>,
+    },
 }
 
 fn pool_command(action: Option<&PoolAction>, json: bool) -> Result<i32> {
@@ -435,6 +443,24 @@ fn pool_command(action: Option<&PoolAction>, json: bool) -> Result<i32> {
                 "published Citrus {} for {platform} · sha256 {}",
                 &commit[..12],
                 &sha[..12]
+            );
+            return Ok(0);
+        }
+        Some(PoolAction::Fetch {
+            commit,
+            to,
+            platform,
+        }) => {
+            let platform = platform
+                .clone()
+                .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
+            if !pool::fetch_published(commit, &platform, to)? {
+                anyhow::bail!("the pool holds no Citrus {commit} for {platform}");
+            }
+            println!(
+                "fetched Citrus {} for {platform} to {}",
+                &commit[..12.min(commit.len())],
+                to.display()
             );
             return Ok(0);
         }
