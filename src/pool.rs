@@ -236,10 +236,20 @@ pub fn snapshot(repo: &crate::repo::Repo, run: &str) -> Result<(String, String, 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     };
     let head = git(&["rev-parse", "--verify", "-q", "HEAD"]).ok();
-    match &head {
-        Some(_) => git(&["read-tree", "HEAD"])?,
-        None => git(&["read-tree", "--empty"])?,
-    };
+    // A copy of the worktree's index keeps its stat data: `git add -A` then
+    // hashes only what changed, not every file.
+    let current = repo.git(&["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    let copied = current
+        .ok()
+        .map(|path| PathBuf::from(path.trim()))
+        .filter(|path| path.is_file())
+        .is_some_and(|path| std::fs::copy(path, &index).is_ok());
+    if !copied {
+        match &head {
+            Some(_) => git(&["read-tree", "HEAD"])?,
+            None => git(&["read-tree", "--empty"])?,
+        };
+    }
     git(&["add", "-A", "--", "."])?;
     let private: Vec<String> = repo
         .config
