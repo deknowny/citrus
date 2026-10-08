@@ -45,6 +45,10 @@ def _citrus_observe():
                 return
             if isinstance(flags, int) and flags & 3 == _os.O_WRONLY:
                 return
+            # os.open may resolve a relative name against a dir_fd the audit
+            # event does not carry: only absolute names are certain there.
+            if mode is None and not _os.path.isabs(_os.fsdecode(args[0])):
+                return
             note("file", args[0])
         # os.listdir is how imports look for modules; scandir and glob are
         # how programs list what they then read.
@@ -178,6 +182,25 @@ pub fn read(log: &Path, root: &Path) -> Vec<String> {
         });
     }
     found.into_iter().collect()
+}
+
+/// Only what belongs to the repository counts: its files (tracked, or
+/// untracked and not ignored) and directories holding them, not caches.
+pub fn in_repository(read: Vec<String>, files: &[String]) -> Vec<String> {
+    let known: std::collections::BTreeSet<&str> = files.iter().map(String::as_str).collect();
+    read.into_iter()
+        .filter(|path| match path.strip_suffix('/') {
+            Some(dir) => {
+                let prefix = format!("{dir}/");
+                known
+                    .range(prefix.as_str()..)
+                    .next()
+                    .is_some_and(|file| file.starts_with(&prefix))
+            }
+            None if path.contains(['*', '?', '[']) => true,
+            None => known.contains(path.as_str()),
+        })
+        .collect()
 }
 
 /// What was read that `inputs` (globs) do not cover. A listed directory is

@@ -561,7 +561,10 @@ impl Context {
                 }
                 let mut outside = Vec::new();
                 if let Some((log, Ok(_))) = &watch {
-                    let read = crate::observe::read(log, &self.repo.root);
+                    let read = crate::observe::in_repository(
+                        crate::observe::read(log, &self.repo.root),
+                        &self.repo.files()?,
+                    );
                     let globs: Vec<String> = entry
                         .inputs
                         .iter()
