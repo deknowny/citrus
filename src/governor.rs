@@ -267,8 +267,26 @@ pub fn limit_cgroup(dir: &Path, budget: f64) -> bool {
 }
 
 /// The cgroup directory of a slice name (`citrus-checks.slice`), if it exists.
+/// systemd nests a dashed slice under its prefixes
+/// (`citrus.slice/citrus-checks.slice`), and creates it only while it has members.
 pub fn slice_dir(slice: &str) -> Option<PathBuf> {
-    let dir = Path::new("/sys/fs/cgroup").join(slice);
+    let stem = slice.strip_suffix(".slice")?;
+    let mut dir = PathBuf::from("/sys/fs/cgroup");
+    let mut prefix = String::new();
+    let parts: Vec<&str> = stem.split('-').collect();
+    for (index, part) in parts.iter().enumerate() {
+        if !prefix.is_empty() {
+            prefix.push('-');
+        }
+        prefix.push_str(part);
+        if index + 1 < parts.len() {
+            let parent = dir.join(format!("{prefix}.slice"));
+            if parent.is_dir() {
+                dir = parent;
+            }
+        }
+    }
+    dir = dir.join(slice);
     dir.join("cpu.stat").is_file().then_some(dir)
 }
 
