@@ -1579,7 +1579,8 @@ elif verb == "apply":
             if item["kind"] == "Deployment":
                 target = state["deployments"][item["metadata"]["name"]]
                 target["image"] = item["spec"]["template"]["spec"]["containers"][0]["image"]
-                target["annotations"].update(item["metadata"].get("annotations", {}))
+                # Like kubectl apply: what the applied set leaves out goes away.
+                target["annotations"] = dict(item["metadata"].get("annotations", {}))
                 state["lease"] = item["metadata"]["name"] + "-new-" + target["image"][-6:]
     else:
         state["jobs"].append(manifest)
@@ -1801,6 +1802,14 @@ environment gitops;
         image(0).starts_with("registry.example/web@sha256:"),
         "{state}"
     );
+    // Both rolled in the first apply; each kept its records through the
+    // other's apply of the whole set.
+    for name in ["api", "worker"] {
+        assert!(
+            state["deployments"][name]["annotations"]["citrus.dev/commit"].is_string(),
+            "{state}"
+        );
+    }
     let worker = image(1);
     assert!(
         worker.starts_with("registry.example/work@sha256:") && !worker.ends_with("stale-pin"),

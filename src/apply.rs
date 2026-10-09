@@ -543,16 +543,25 @@ fn run_step(
                     spec.container.as_str()
                 };
                 let rolling = plan.rolls.iter().find(|roll| &roll.workload == workload);
-                let image = match rolling {
-                    Some(roll) => context
+                let running = match rolling {
+                    Some(_) => None,
+                    None => Some(
+                        deploy::observe(environment)?
+                            .into_iter()
+                            .find(|item| &item.workload == workload)
+                            .with_context(|| format!("{workload} is not running"))?,
+                    ),
+                };
+                let image = match (rolling, &running) {
+                    (Some(roll), _) => context
                         .store
                         .artifact_reference(&roll.artifact, &roll.key)?
                         .context("image not built")?,
-                    None => deploy::observe(environment)?
-                        .into_iter()
-                        .find(|item| &item.workload == workload)
-                        .and_then(|item| item.image)
+                    (None, Some(running)) => running
+                        .image
+                        .clone()
                         .with_context(|| format!("{workload} runs no image"))?,
+                    (None, None) => unreachable!(),
                 };
                 let version = rolling
                     .filter(|_| !spec.version_env.is_empty())
@@ -560,9 +569,26 @@ fn run_step(
                 let object =
                     set_image(&mut items, &spec.kind, workload, container, &image, version)
                         .with_context(|| format!("{manifest}: {} {workload}", spec.kind))?;
-                if workload.as_str() == name {
+                // Every rolling workload keeps its records: kubectl apply drops
+                // the annotations a later apply of the same set leaves out.
+                if let Some(roll) = rolling {
                     for (key, value) in &annotations {
                         object["metadata"]["annotations"][key] = value.clone();
+                    }
+                    object["metadata"]["annotations"][KEY_ANNOTATION] = roll.key.clone().into();
+                }
+                // One that does not roll keeps the records it has.
+                if let Some(running) = &running {
+                    for key in [
+                        COMMIT_ANNOTATION,
+                        KEY_ANNOTATION,
+                        environment.record.annotation.as_str(),
+                    ] {
+                        if let Some(value) =
+                            running.annotations.get(key).filter(|_| !key.is_empty())
+                        {
+                            object["metadata"]["annotations"][key] = value.clone().into();
+                        }
                     }
                 }
             }
