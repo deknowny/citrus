@@ -1818,6 +1818,35 @@ environment gitops;
 }
 
 #[test]
+fn an_artifact_builds_alone_once_per_inputs() {
+    let project = apply_project();
+    project.write("src/a.txt", "v1\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "src",
+    ]);
+    let (built, code) = project.json(&["artifacts", "--build", "api"]);
+    assert_eq!(code, 0, "{built}");
+    assert!(
+        built["reference"]
+            .as_str()
+            .unwrap()
+            .starts_with("registry.example/api@sha256:"),
+        "{built}"
+    );
+    let (again, _) = project.json(&["artifacts", "--build", "api"]);
+    assert_eq!(again["reference"], built["reference"]);
+    let builds = fs::read_to_string(project.root().join(".kube/builds")).unwrap();
+    assert_eq!(builds.lines().count(), 1, "{builds}");
+}
+
+#[test]
 fn apply_builds_by_key_rolls_by_digest_and_records_the_commit() {
     let project = apply_project();
     project.write("src/a.txt", "v2\n");

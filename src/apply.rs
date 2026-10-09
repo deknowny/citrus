@@ -710,6 +710,36 @@ fn run_step(
     bail!("unknown step {step}")
 }
 
+/// Build and publish one artifact for HEAD (a committed tree), reusing a
+/// build of the same inputs: its reference.
+pub fn build_one(context: &Context, name: &str) -> Result<String> {
+    if !context
+        .repo
+        .git(&["status", "--porcelain", "--untracked-files=no"])?
+        .is_empty()
+    {
+        bail!("commit the changes first: an artifact is built from a commit");
+    }
+    let artifacts = deploy::artifacts(context)?;
+    let artifact = artifacts.get(name).with_context(|| {
+        format!(
+            "no artifact {name}; declared: {:?}",
+            artifacts.keys().collect::<Vec<_>>()
+        )
+    })?;
+    let head = context.repo.git(&["rev-parse", "HEAD"])?;
+    let paths = deploy::command_paths(context, artifact)?;
+    let (key, _) = deploy::key_at(context, name, artifact, &head, paths.as_deref())?;
+    if let Some(reference) = context.store.artifact_reference(name, &key)? {
+        return Ok(reference);
+    }
+    let reference = build_artifact(context, name, artifact, &key, &head, &BTreeMap::new())?;
+    context
+        .store
+        .put_artifact_reference(name, &key, &reference)?;
+    Ok(reference)
+}
+
 fn build_artifact(
     context: &Context,
     name: &str,
@@ -814,6 +844,7 @@ fn build_artifact(
             docker
                 .arg(text(&artifact.build, "context").unwrap_or_else(|| ".".into()))
                 .current_dir(&context.repo.root)
+                .stdout(Stdio::from(std::io::stderr()))
                 .envs(extra_env);
             run(&mut docker)?;
             let meta: serde_json::Value = serde_json::from_str(&fs::read_to_string(&metadata)?)?;
@@ -845,7 +876,8 @@ fn build_artifact(
                 .spawn()?
                 .wait_with_output()?;
             let stdout = String::from_utf8_lossy(&output.stdout);
-            print!("{stdout}");
+            // The build's own output is a log, not Citrus's answer.
+            eprint!("{stdout}");
             if !output.status.success() {
                 bail!("build of {name} failed");
             }

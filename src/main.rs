@@ -202,6 +202,10 @@ enum Command {
     Artifacts {
         #[arg(long)]
         at: Option<String>,
+        /// Build and publish this artifact for HEAD (reused when one was
+        /// built from the same inputs) and print its reference.
+        #[arg(long)]
+        build: Option<String>,
     },
     /// What an environment runs versus what HEAD would run (read-only).
     Diff { environment: String },
@@ -786,7 +790,24 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
         }
         Command::Version { action } => version_command(&context, action, json),
         Command::Targets { fingerprints } => targets_command(&context, fingerprints, json),
-        Command::Artifacts { at } => {
+        Command::Artifacts {
+            build: Some(name), ..
+        } => {
+            let name = name.replace('_', "-");
+            let reference = apply::build_one(&context, &name)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "artifact": name, "reference": reference})
+                    )?
+                );
+            } else {
+                println!("{name} {reference}");
+            }
+            Ok(0)
+        }
+        Command::Artifacts { at, build: None } => {
             let revision = context
                 .repo
                 .git(&["rev-parse", at.as_deref().unwrap_or("HEAD")])?;
