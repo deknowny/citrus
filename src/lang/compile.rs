@@ -511,24 +511,35 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         reads: understood_reads,
         summaries,
         opaque,
-        follows,
+        mut follows,
     } = understood(compiler, body)?;
     // Understood inputs select the check on their own only when every command
-    // was understood; a plain process next to them needs `#[paths]`.
+    // was understood; a plain process next to them needs `#[paths]`. Like a
+    // Make recipe's files they choose the check without taking the path from
+    // the groups and checks that own it (a crate change still runs its
+    // group's other checks), and they make its pass stale.
     let mut owns = declared.clone();
+    let mut inferred_reads: Vec<String> = Vec::new();
     if !opaque || !declared.is_empty() || !via.is_empty() {
         for glob in inferred {
-            if !owns.contains(&glob) {
-                owns.push(glob);
+            if !follows.contains(&glob) {
+                follows.push(glob.clone());
             }
+            inferred_reads.push(glob);
         }
     }
-    let narrows = !owns.is_empty() || !via.is_empty();
+    let inferred = !inferred_reads.is_empty();
+    let narrows = !owns.is_empty() || !via.is_empty() || inferred;
     if !narrows {
         owns = from.paths.clone();
     }
     let (mut reads, reads_via) = compiler.globs(&item.attrs, "reads")?;
     reads.extend(from.reads.iter().cloned());
+    for glob in inferred_reads {
+        if !reads.contains(&glob) {
+            reads.push(glob);
+        }
+    }
     let known_inputs =
         !owns.is_empty() || !reads.is_empty() || !via.is_empty() || !reads_via.is_empty();
     for glob in &understood_reads {
@@ -567,7 +578,7 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
     if !summaries.is_empty() {
         meta.insert("understood".to_owned(), json!(summaries));
     }
-    if owns.is_empty() && via.is_empty() && when.is_none() {
+    if owns.is_empty() && via.is_empty() && follows.is_empty() && when.is_none() {
         return Err(Error::at(item.name_span, format!("check {name} has no paths"))
             .help("run a command Citrus understands (cargo …), put it in a group, or give it `#[paths(\"…\")]`"));
     }
@@ -584,6 +595,7 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         known_inputs,
         reads_via,
         follows,
+        inferred,
         resources,
         meta,
         env,

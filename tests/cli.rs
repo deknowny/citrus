@@ -3389,7 +3389,12 @@ check api {
     ]);
     let (targets, code) = project.json(&["targets"]);
     assert_eq!(code, 0, "{targets}");
-    let inputs = targets["targets"][0]["inputs"].to_string();
+    // Inferred inputs select the check and make its pass stale; they do not
+    // become paths it owns.
+    let inputs = format!(
+        "{}{}",
+        targets["targets"][0]["inputs"], targets["targets"][0]["extra_inputs"]
+    );
     assert!(
         inputs.contains("crates/api/**") && inputs.contains("crates/core/**"),
         "{inputs}"
@@ -3418,7 +3423,10 @@ check api {
     project.git(&["add", "-A"]);
     let (targets, code) = project.json(&["targets"]);
     assert_eq!(code, 0, "{targets}");
-    let inputs = targets["targets"][0]["inputs"].to_string();
+    let inputs = format!(
+        "{}{}",
+        targets["targets"][0]["inputs"], targets["targets"][0]["extra_inputs"]
+    );
     assert!(
         inputs.contains("crates/api/**")
             && inputs.contains("crates/core/**")

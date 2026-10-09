@@ -47,8 +47,10 @@ pub struct Target {
     pub position: usize,
     owned: GlobList,
     extra: GlobList,
-    /// What its Make recipes read (see `follows`).
+    /// What its Make recipes read and its Cargo commands build (see `follows`).
     followed: GlobList,
+    /// Its Cargo-inferred inputs (in `follows`) are what selects it.
+    pub selected_by_follows: bool,
 }
 
 /// Globs in order; `!glob` removes matches of the globs before it, and the
@@ -104,6 +106,7 @@ impl Target {
             owned,
             extra,
             followed: GlobList::new(&check.follows)?,
+            selected_by_follows: check.inferred,
         })
     }
 

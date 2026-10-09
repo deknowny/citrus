@@ -239,6 +239,10 @@ pub struct Check {
     /// taking the path from the checks and groups that own it.
     #[serde(skip)]
     pub follows: Vec<String>,
+    /// Its Cargo commands' inputs are among `follows`: a change selects it
+    /// only through them, never as a check chosen by its condition alone.
+    #[serde(skip)]
+    pub inferred: bool,
     /// Profiles the check belongs to; empty: every profile.
     pub profiles: Vec<String>,
     /// Checks that already run this one: with one of them in a plan, this one is dropped.
