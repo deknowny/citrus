@@ -24,7 +24,10 @@ check test {
     // On an agent the daemon is the host's: the tests' bind mounts would not
     // reach it, so they see no Docker there.
     let hidden = if std::env::var("CITRUS_POOL_RUN").is_some() { "unix:///nonexistent" } else { "" };
-    let tests = cmd!("cargo test --locked --bins --test cli").env("CITRUS_TEST_STATE", url).env("DOCKER_HOST", hidden).output()?;
+    // Its own target directory: a build beside it would replace the
+    // executable the tests' workers start.
+    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or("target") + "-test";
+    let tests = cmd!("cargo test --locked --bins --test cli").env("CITRUS_TEST_STATE", url).env("CARGO_TARGET_DIR", target).env("DOCKER_HOST", hidden).output()?;
     run!("docker rm -f {name}")?;
     assert tests.code == 0, "{tests.stdout}\n{tests.stderr}";
 }
@@ -44,7 +47,10 @@ check pool {
     // On an agent the daemon is the host's: the tests' bind mounts would not
     // reach it, so they see no Docker there.
     let hidden = if std::env::var("CITRUS_POOL_RUN").is_some() { "unix:///nonexistent" } else { "" };
-    let tests = cmd!("cargo test --locked --test pool").env("CITRUS_TEST_POOL", url).env("DOCKER_HOST", hidden).output()?;
+    // Its own target directory: rebuilding the binary under the `test`
+    // check running beside it would delete the executable its workers start.
+    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or("target") + "-pool";
+    let tests = cmd!("cargo test --locked --test pool").env("CITRUS_TEST_POOL", url).env("CARGO_TARGET_DIR", target).env("DOCKER_HOST", hidden).output()?;
     run!("docker rm -f {name}")?;
     assert tests.code == 0, "{tests.stdout}\n{tests.stderr}";
 }
