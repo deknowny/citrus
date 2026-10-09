@@ -574,6 +574,7 @@ const CONFIG: &[&str] = &[
     "approval",
     "checks",
     "release_name",
+    "manifests",
     "prepare",
     "migrations",
     "verify",

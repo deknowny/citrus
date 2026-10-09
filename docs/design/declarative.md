@@ -56,6 +56,10 @@ environment shop-production = kubernetes(context: "prod", namespace: "shop") {
   # Runs to completion before workloads change.
   migrations = { artifact: "api-migrations", job: "deploy/migrate.yaml", timeout: 5m }
   record = { annotation: "example.com/release" }
+  # Optional: the environment's manifests (a file or kustomization directory),
+  # applied whole by every apply; each declared workload set to the image it
+  # should run (the build when it rolls, the running one otherwise).
+  manifests = "deploy/k3s/shop"
 
   # The container's APP_VERSION is set to the release name with each new image.
   deploy api = api { version_env = "APP_VERSION" }

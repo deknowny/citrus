@@ -521,27 +521,53 @@ fn run_step(
                 plan.release_name.clone().into(),
             );
         }
-        if !roll.manifest.is_empty() {
-            let mut manifest = workload_manifest(
-                context,
-                environment,
-                extra_env,
-                roll,
-                &image,
-                &plan.release_name,
-            )?;
-            let records = manifest
-                .iter_mut()
-                .find(|item| {
-                    item["kind"].as_str().map(str::to_lowercase).as_deref() == Some(&roll.kind)
-                        && item["metadata"]["name"] == name
-                })
-                .with_context(|| format!("{} holds no {} {name}", roll.manifest, roll.kind))?;
-            for (key, value) in &annotations {
-                records["metadata"]["annotations"][key] = value.clone();
+        let manifest = if roll.manifest.is_empty() {
+            environment.manifests.clone()
+        } else {
+            roll.manifest.clone()
+        };
+        if !manifest.is_empty() {
+            let mut items = read_objects(context, environment, extra_env, &manifest)?;
+            // From the environment's manifests every declared workload is
+            // applied: those not rolling keep the image they run, whatever
+            // an older pin in the files says.
+            let shared = roll.manifest.is_empty();
+            for (workload, spec) in environment
+                .workloads
+                .iter()
+                .filter(|(workload, _)| shared || workload.as_str() == name)
+            {
+                let container = if spec.container.is_empty() {
+                    workload.as_str()
+                } else {
+                    spec.container.as_str()
+                };
+                let rolling = plan.rolls.iter().find(|roll| &roll.workload == workload);
+                let image = match rolling {
+                    Some(roll) => context
+                        .store
+                        .artifact_reference(&roll.artifact, &roll.key)?
+                        .context("image not built")?,
+                    None => deploy::observe(environment)?
+                        .into_iter()
+                        .find(|item| &item.workload == workload)
+                        .and_then(|item| item.image)
+                        .with_context(|| format!("{workload} runs no image"))?,
+                };
+                let version = rolling
+                    .filter(|_| !spec.version_env.is_empty())
+                    .map(|_| (spec.version_env.as_str(), plan.release_name.as_str()));
+                let object =
+                    set_image(&mut items, &spec.kind, workload, container, &image, version)
+                        .with_context(|| format!("{manifest}: {} {workload}", spec.kind))?;
+                if workload.as_str() == name {
+                    for (key, value) in &annotations {
+                        object["metadata"]["annotations"][key] = value.clone();
+                    }
+                }
             }
             let text = serde_json::to_string(
-                &serde_json::json!({"apiVersion": "v1", "kind": "List", "items": manifest}),
+                &serde_json::json!({"apiVersion": "v1", "kind": "List", "items": items}),
             )?;
             let mut apply = kubectl(environment, extra_env);
             apply.args(["apply", "-f", "-"]).stdin(Stdio::piped());
@@ -549,7 +575,7 @@ fn run_step(
             std::io::Write::write_all(child.stdin.as_mut().context("stdin")?, text.as_bytes())?;
             drop(child.stdin.take());
             if !child.wait()?.success() {
-                bail!("kubectl apply of {} failed", roll.manifest);
+                bail!("kubectl apply of {manifest} failed");
             }
         } else {
             let mut container = serde_json::json!({"name": roll.container, "image": image});
@@ -810,69 +836,74 @@ fn command(
     Ok(command)
 }
 
-/// The objects of a workload's manifest file, its container set to `image`
-/// (and its version variable to the release).
-fn workload_manifest(
+/// The objects a manifest file or kustomization directory holds, as kubectl
+/// reads them.
+fn read_objects(
     context: &Context,
     environment: &Environment,
     extra_env: &BTreeMap<String, String>,
-    roll: &Roll,
-    image: &str,
-    release: &str,
+    manifest: &str,
 ) -> Result<Vec<serde_json::Value>> {
+    let path = context.repo.root.join(manifest);
     let output = kubectl(environment, extra_env)
-        .args(["create", "--dry-run=client", "-o", "json", "-f"])
-        .arg(context.repo.root.join(&roll.manifest))
+        .args(["create", "--dry-run=client", "-o", "json"])
+        .arg(if path.is_dir() { "-k" } else { "-f" })
+        .arg(&path)
         .output()?;
     if !output.status.success() {
         bail!(
-            "kubectl cannot read {}: {}",
-            roll.manifest,
+            "kubectl cannot read {manifest}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let mut items = match parsed["kind"].as_str() {
+    Ok(match parsed["kind"].as_str() {
         Some("List") => parsed["items"].as_array().cloned().unwrap_or_default(),
         _ => vec![parsed],
+    })
+}
+
+/// Set the image of `container` in the `kind` object named `name` (and, when
+/// given, an environment variable to a value); the object, for annotations.
+fn set_image<'a>(
+    items: &'a mut [serde_json::Value],
+    kind: &str,
+    name: &str,
+    container: &str,
+    image: &str,
+    variable: Option<(&str, &str)>,
+) -> Result<&'a mut serde_json::Value> {
+    let item = items
+        .iter_mut()
+        .find(|item| {
+            item["kind"].as_str().map(str::to_lowercase).as_deref() == Some(kind)
+                && item["metadata"]["name"] == name
+        })
+        .context("not in the manifest")?;
+    let spec = if kind == "cronjob" {
+        &mut item["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    } else {
+        &mut item["spec"]["template"]["spec"]
     };
-    let mut found = false;
-    for item in items.iter_mut().filter(|item| {
-        item["kind"].as_str().map(str::to_lowercase).as_deref() == Some(roll.kind.as_str())
-            && item["metadata"]["name"] == roll.workload
-    }) {
-        let spec = if roll.kind == "cronjob" {
-            &mut item["spec"]["jobTemplate"]["spec"]["template"]["spec"]
-        } else {
-            &mut item["spec"]["template"]["spec"]
-        };
-        for container in spec["containers"].as_array_mut().into_iter().flatten() {
-            if container["name"] != roll.container.as_str() {
-                continue;
-            }
-            found = true;
-            container["image"] = image.into();
-            if !roll.version_env.is_empty() {
-                let env = container["env"].as_array().cloned().unwrap_or_default();
-                let mut env: Vec<serde_json::Value> = env
-                    .into_iter()
-                    .filter(|entry| entry["name"] != roll.version_env.as_str())
-                    .collect();
-                env.push(serde_json::json!({"name": roll.version_env, "value": release}));
-                container["env"] = env.into();
-            }
-        }
+    let entry = spec["containers"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["name"] == container)
+        .with_context(|| format!("no container {container}"))?;
+    entry["image"] = image.into();
+    if let Some((variable, value)) = variable {
+        let mut env: Vec<serde_json::Value> = entry["env"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| item["name"] != variable)
+            .collect();
+        env.push(serde_json::json!({"name": variable, "value": value}));
+        entry["env"] = env.into();
     }
-    if !found {
-        bail!(
-            "{} has no container {} in {} {}",
-            roll.manifest,
-            roll.container,
-            roll.kind,
-            roll.workload
-        );
-    }
-    Ok(items)
+    Ok(item)
 }
 
 fn kubectl(environment: &Environment, extra_env: &BTreeMap<String, String>) -> Command {

@@ -1561,7 +1561,10 @@ elif verb == "patch":
 elif verb == "rollout":
     sys.exit(1 if os.path.exists(".kube/fail-rollout") else 0)
 elif verb == "create" and "--dry-run=client" in args:
-    print(open(args[args.index("-f") + 1]).read())
+    if "-k" in args:
+        print(open(os.path.join(args[args.index("-k") + 1], "all.json")).read())
+    else:
+        print(open(args[args.index("-f") + 1]).read())
 elif verb == "apply":
     manifest = sys.stdin.read()
     try:
@@ -1705,6 +1708,94 @@ environment staging;
     let env = &items[1]["spec"]["template"]["spec"]["containers"][0]["env"];
     assert_eq!(env[0]["name"], "LIMIT", "{state}");
     assert_eq!(env[1]["name"], "APP_VERSION", "{state}");
+}
+
+#[test]
+fn apply_applies_the_environment_manifests_keeping_what_does_not_roll() {
+    let project = apply_project();
+    project.declare(
+        r#"
+#[inputs("src/**")]
+#[build(provider = "command", run = cmd!("sh -c 'echo IMAGE=registry.example/{{artifact}}@sha256:{{key}}'"))]
+artifact web;
+
+#[inputs("other/**")]
+#[build(provider = "command", run = cmd!("sh -c 'echo IMAGE=registry.example/{{artifact}}@sha256:{{key}}'"))]
+artifact work;
+
+#[kubernetes(kubectl = "./kubectl.py", namespace = "shop")]
+#[manifests("k8s")]
+#[deploy("api", web)]
+#[deploy("worker", work)]
+environment gitops;
+"#,
+    );
+    let deployment = |name: &str| {
+        format!(
+            r#"{{"kind": "Deployment", "metadata": {{"name": "{name}"}}, "spec": {{"template": {{"spec": {{"containers": [{{"name": "{name}", "image": "registry.example/{name}@sha256:stale-pin"}}]}}}}}}}}"#
+        )
+    };
+    project.write(
+        "k8s/all.json",
+        &format!(
+            r#"{{"kind": "List", "items": [{}, {}]}}"#,
+            deployment("api"),
+            deployment("worker")
+        ),
+    );
+    project.write("other/w.txt", "1\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "gitops",
+    ]);
+    let mut state = kube_state(&project);
+    state["deployments"]["worker"] =
+        serde_json::json!({"image": "registry.example/work@sha256:running", "annotations": {}});
+    project.write(".kube/state.json", &state.to_string());
+    let (first, code) = project.json(&["apply", "gitops", "--approve"]);
+    assert_eq!(code, 0, "{first}");
+
+    // Only the API changes: the worker keeps the image it runs, not the pin.
+    project.write("src/a.txt", "v9\n");
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "api only",
+    ]);
+    project.write(".kube/state.json", &{
+        let mut state = kube_state(&project);
+        state["applied"] = serde_json::json!([]);
+        state.to_string()
+    });
+    let (applied, code) = project.json(&["apply", "gitops", "--approve"]);
+    assert_eq!(code, 0, "{applied}");
+    let state = kube_state(&project);
+    let items = &state["applied"][0]["items"];
+    let image = |index: usize| {
+        items[index]["spec"]["template"]["spec"]["containers"][0]["image"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(
+        image(0).starts_with("registry.example/web@sha256:"),
+        "{state}"
+    );
+    let worker = image(1);
+    assert!(
+        worker.starts_with("registry.example/work@sha256:") && !worker.ends_with("stale-pin"),
+        "{state}"
+    );
 }
 
 #[test]

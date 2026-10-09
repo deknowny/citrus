@@ -72,6 +72,11 @@ pub struct Environment {
     pub prepare: Vec<String>,
     #[serde(default)]
     pub migrations: Option<Migrations>,
+    /// The environment's manifests (a file, or a kustomization directory):
+    /// every apply applies them whole, each declared workload set to the
+    /// image it should run.
+    #[serde(default)]
+    pub manifests: String,
     #[serde(default)]
     pub verify: Verify,
 }
