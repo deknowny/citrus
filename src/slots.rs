@@ -40,6 +40,19 @@ impl Slot {
     }
 }
 
+/// How many checks two comma-separated lists share.
+fn overlap(left: &str, right: &str) -> usize {
+    let left: std::collections::BTreeSet<&str> = left
+        .trim()
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .collect();
+    right
+        .split(',')
+        .filter(|name| !name.is_empty() && left.contains(name))
+        .count()
+}
+
 fn try_lock(path: &Path) -> Result<Option<File>> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -60,15 +73,24 @@ fn try_lock(path: &Path) -> Result<Option<File>> {
     }
 }
 
-/// The lowest free slot of `root` (`<agent cache>/slots/<repository>`), of `count`.
-pub fn claim(root: &Path, count: usize) -> Result<Slot> {
+/// A free slot of `root` (`<agent cache>/slots/<repository>`), of `count`: the one
+/// whose last batch shared most checks with `work` (a comma-separated list; its
+/// build directories are warm for them), else the lowest free.
+pub fn claim(root: &Path, count: usize, work: &str) -> Result<Slot> {
     std::fs::create_dir_all(root)?;
     let started = Instant::now();
     loop {
-        for index in 0..count.max(1) {
+        let mut order: Vec<usize> = (0..count.max(1)).collect();
+        order.sort_by_key(|index| {
+            let last = std::fs::read_to_string(root.join(index.to_string()).join("last-work"))
+                .unwrap_or_default();
+            (std::cmp::Reverse(overlap(&last, work)), *index)
+        });
+        for index in order {
             let dir = root.join(index.to_string());
             std::fs::create_dir_all(&dir)?;
             if let Some(lock) = try_lock(&root.join(format!("{index}.lock")))? {
+                let _ = std::fs::write(dir.join("last-work"), work);
                 return Ok(Slot {
                     index,
                     dir,
@@ -143,13 +165,13 @@ mod tests {
     #[test]
     fn slots_are_claimed_lowest_first_and_given_back_on_drop() {
         let dir = tempfile::tempdir().unwrap();
-        let first = claim(dir.path(), 2).unwrap();
-        let second = claim(dir.path(), 2).unwrap();
+        let first = claim(dir.path(), 2, "a").unwrap();
+        let second = claim(dir.path(), 2, "b").unwrap();
         assert_eq!((first.index, second.index), (0, 1));
         assert_ne!(first.tree(), second.tree());
         assert_eq!(first.tree(), dir.path().join("0/tree"));
         drop(first);
-        let again = claim(dir.path(), 2).unwrap();
+        let again = claim(dir.path(), 2, "a").unwrap();
         assert_eq!(again.index, 0, "the same path comes back");
         assert_eq!(
             again.cache("cargo-target"),
@@ -158,10 +180,35 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_prefers_the_slot_that_last_ran_the_same_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = claim(dir.path(), 3, "backend").unwrap();
+        let b = claim(dir.path(), 3, "platform").unwrap();
+        assert_eq!((a.index, b.index), (0, 1));
+        drop(a);
+        drop(b);
+        // Slot 0 is free and lower, but slot 1 ran "platform" last.
+        let again = claim(dir.path(), 3, "platform").unwrap();
+        assert_eq!(again.index, 1);
+        let other = claim(dir.path(), 3, "backend").unwrap();
+        assert_eq!(other.index, 0);
+        let new = claim(dir.path(), 3, "docs").unwrap();
+        assert_eq!(new.index, 2, "unknown work takes the lowest free slot");
+        drop((again, other, new));
+        // One shared check is enough to count.
+        let partial = claim(dir.path(), 3, "platform,docs").unwrap();
+        assert!(
+            partial.index == 1 || partial.index == 2,
+            "overlap decides: {}",
+            partial.index
+        );
+    }
+
+    #[test]
     fn only_idle_unheld_slots_are_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let held = claim(dir.path(), 2).unwrap();
-        drop(claim(dir.path(), 2).unwrap_or_else(|_| unreachable!()));
+        let held = claim(dir.path(), 2, "a").unwrap();
+        drop(claim(dir.path(), 2, "b").unwrap_or_else(|_| unreachable!()));
         let other = dir.path().join("1");
         std::fs::create_dir_all(other.join("tree")).unwrap();
         std::fs::write(other.join("tree/file"), "x").unwrap();

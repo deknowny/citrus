@@ -1848,6 +1848,7 @@ fn execute(
     let slot = crate::slots::claim(
         &machine.cache.join("slots").join(short_hash(&run.repo)),
         machine.slots,
+        &checks.join(","),
     )?;
     emit(
         client,
