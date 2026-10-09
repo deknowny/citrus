@@ -14,6 +14,7 @@ mod dockerfile;
 mod doctor;
 mod exec;
 mod governor;
+mod hygiene;
 mod integrate;
 mod lang;
 mod manifest;
@@ -292,6 +293,9 @@ enum Command {
         /// Share of the machine the pool and everything else may use together
         #[arg(long, value_name = "FRACTION", default_value_t = 0.8)]
         target_util: f64,
+        /// Disk the slots' Cargo target directories may use together (GiB)
+        #[arg(long, value_name = "GIB", default_value_t = 200)]
+        cache_gib: u64,
     },
     /// The pool: its agents, their load, and the checks queued and running.
     Pool {
@@ -653,6 +657,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             fixed,
             min_cpus,
             target_util,
+            cache_gib,
         }) => {
             return pool::agent(&pool::AgentOptions {
                 name: name.clone(),
@@ -665,6 +670,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
                 fixed: *fixed,
                 min_cpus: Some(*min_cpus),
                 target_util: Some(*target_util),
+                cache_gib: Some(*cache_gib),
             });
         }
         Some(Command::Pool { action }) => return pool_command(action.as_ref(), json),

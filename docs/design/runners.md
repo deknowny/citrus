@@ -77,6 +77,15 @@ at most 6 CPUs, only on mains, and stops taking work while its owner is
 active. A production host can join with `--share 4 --quiet-hours 01-07` or not
 at all: heavy builds next to production workloads have hurt before.
 
+### Keeping the disk small
+
+An agent trims its own caches once an hour (no timer or script on the machine):
+incremental sessions idle for six hours and dependency artifacts unused for three
+days go; a target directory above a third of `--cache-gib` (default 200) loses its
+incremental data; above the total, the least recently used slots' build directories
+are emptied; Docker's build cache is kept to 30 GB and images unused for three days
+are dropped. Only caches: a check that needs one rebuilds it.
+
 ### Sharing a machine with production
 
 On Linux an agent adapts by itself (`--fixed` turns it off). Every two seconds

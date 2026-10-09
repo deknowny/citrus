@@ -716,6 +716,8 @@ pub struct AgentOptions {
     pub min_cpus: Option<f64>,
     /// Fraction of the machine the pool and the rest may use together (default 0.8).
     pub target_util: Option<f64>,
+    /// The most disk the Cargo target directories of the slots may use together (GiB, default 200).
+    pub cache_gib: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -987,6 +989,32 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
             }
         }))
     };
+    // Caches share the disk with production: trimmed once an hour.
+    let hygiene = {
+        let stop = stop.clone();
+        let cache = machine.cache.clone();
+        let total = options.cache_gib.unwrap_or(200).max(10);
+        let limits = crate::hygiene::Limits::gib((total / 3).max(5), total);
+        let name = machine.name.clone();
+        std::thread::spawn(move || {
+            let mut wait = Duration::from_secs(120);
+            while !stop.load(Ordering::SeqCst) {
+                let deadline = Instant::now() + wait;
+                while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let freed = crate::hygiene::prune(&cache, limits);
+                crate::hygiene::docker();
+                if freed > (1 << 30) {
+                    eprintln!("citrus agent {name}: caches trimmed by {} GiB", freed >> 30);
+                }
+                wait = Duration::from_secs(3600);
+            }
+        })
+    };
     let heartbeat = {
         let (url, name) = (url.clone(), machine.name.clone());
         let (stop, draining, running) = (stop.clone(), draining.clone(), running.clone());
@@ -1027,6 +1055,7 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
     );
     stop.store(true, Ordering::SeqCst);
     let _ = heartbeat.join();
+    let _ = hygiene.join();
     if let Some(governor) = governor {
         let _ = governor.join();
     }
