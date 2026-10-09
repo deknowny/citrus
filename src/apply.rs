@@ -836,6 +836,40 @@ pub fn build_one(context: &Context, name: &str) -> Result<String> {
     Ok(reference)
 }
 
+/// A detached worktree of one commit, removed when dropped.
+struct CleanTree<'a> {
+    context: &'a Context,
+    dir: std::path::PathBuf,
+}
+
+impl<'a> CleanTree<'a> {
+    fn checkout(context: &'a Context, commit: &str, label: &str) -> Result<Self> {
+        let parent = context.repo.state_dir().join("build-trees");
+        crate::repo::private_dir(&parent)?;
+        let dir = parent.join(format!("{label}-{}", crate::exec::unique()));
+        context.repo.git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            &dir.to_string_lossy(),
+            commit,
+        ])?;
+        Ok(Self { context, dir })
+    }
+}
+
+impl Drop for CleanTree<'_> {
+    fn drop(&mut self) {
+        let _ = self.context.repo.git(&[
+            "worktree",
+            "remove",
+            "--force",
+            &self.dir.to_string_lossy(),
+        ]);
+    }
+}
+
 fn build_artifact(
     context: &Context,
     name: &str,
@@ -937,9 +971,12 @@ fn build_artifact(
             {
                 docker.args(["--build-arg", arg]);
             }
+            // From a clean checkout of the commit: whatever the worktree
+            // holds besides (edits, untracked files) stays out of the image.
+            let tree = CleanTree::checkout(context, commit, &format!("{name}-{tag}"))?;
             docker
                 .arg(text(&artifact.build, "context").unwrap_or_else(|| ".".into()))
-                .current_dir(&context.repo.root)
+                .current_dir(&tree.dir)
                 .stdout(Stdio::from(std::io::stderr()))
                 .envs(extra_env);
             run(&mut docker)?;
