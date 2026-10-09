@@ -3682,7 +3682,8 @@ check tool {
     );
     project.write(
         "tools/check.py",
-        "import pathlib\nassert pathlib.Path('data/limits.json').read_text().strip() == '{}'\n",
+        // Built at run time: no word of the script names the file.
+        "import pathlib\nassert (pathlib.Path('data') / 'limits.json').read_text().strip() == '{}'\n",
     );
     project.write("data/limits.json", "{}\n");
     project.git(&["add", "-A"]);
