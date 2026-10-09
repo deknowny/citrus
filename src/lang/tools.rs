@@ -243,9 +243,37 @@ pub fn understand(
             };
             make_targets(&literal[1..], span, files, tools, makefiles)
         }
+        // An interpreter or a repository script run directly: what it names.
+        Some(Some(program))
+            if SCRIPT_RUNNERS.contains(&program.as_str())
+                || files
+                    .list()
+                    .iter()
+                    .any(|path| path == program.trim_start_matches("./")) =>
+        {
+            let Some(argv) = literal.iter().cloned().collect::<Option<Vec<String>>>() else {
+                return Ok(None);
+            };
+            let fallback = super::make::Makefiles::default();
+            let makefiles = make
+                .get_or_init(|| super::make::Makefiles::load(files))
+                .as_ref()
+                .unwrap_or(&fallback);
+            Ok(makefiles
+                .command_inputs(&argv, files)
+                .map(|(inputs, follows)| Understood {
+                    summary: argv.join(" "),
+                    inputs,
+                    selects: false,
+                    follows,
+                }))
+        }
         _ => Ok(None),
     }
 }
+
+/// Programs that run the script their arguments name.
+const SCRIPT_RUNNERS: &[&str] = &["python3", "python", "node", "bash", "sh"];
 
 /// `make [flags] [VAR=value] targets…` in this repository's Makefile.
 fn make_targets(

@@ -264,6 +264,46 @@ impl Makefiles {
         Some((inputs.into_iter().collect(), direct))
     }
 
+    /// What a command line run directly reads, like a recipe line: the
+    /// files its words name (Python modules too: `-m unittest scripts.x`),
+    /// followed into the scripts they name. None when it names no file.
+    pub fn command_inputs(
+        &self,
+        argv: &[String],
+        files: &dyn Files,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        let known: BTreeSet<&str> = files.list().iter().map(String::as_str).collect();
+        let mut direct: BTreeSet<String> = BTreeSet::new();
+        for word in argv {
+            let module = (!word.contains('/') && word.contains('.') && !word.ends_with(".py"))
+                .then(|| format!("{}.py", word.replace('.', "/")))
+                .filter(|path| known.contains(path.as_str()));
+            if let Some(found) = module.or_else(|| repo_path(word, "", &known)) {
+                direct.insert(found);
+            }
+        }
+        if direct.is_empty() {
+            return None;
+        }
+        let mut inputs = direct.clone();
+        let mut scripts: Vec<(String, usize)> = direct
+            .iter()
+            .filter(|path| !path.ends_with("/**"))
+            .map(|path| (path.clone(), 0))
+            .collect();
+        while let Some((script, depth)) = scripts.pop() {
+            if depth >= SCRIPT_DEPTH {
+                continue;
+            }
+            for found in self.named(&script, files, &known) {
+                if inputs.insert(found.clone()) && !found.ends_with("/**") {
+                    scripts.push((found, depth + 1));
+                }
+            }
+        }
+        Some((inputs.into_iter().collect(), direct.into_iter().collect()))
+    }
+
     /// Files a script names (none for a file that is not code).
     fn named(&self, script: &str, files: &dyn Files, known: &BTreeSet<&str>) -> Vec<String> {
         if let Some(found) = self.named.borrow().get(script) {
@@ -529,6 +569,42 @@ mod tests {
                 .map(|(path, text)| ((*path).to_owned(), (*text).to_owned()))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn a_direct_command_reads_the_scripts_and_modules_it_names() {
+        let files = fake(&[
+            (
+                "scripts/test_tool.py",
+                "import tool\nopen('data/rows.json')\n",
+            ),
+            ("scripts/tool.py", "print(1)\n"),
+            ("data/rows.json", "[]"),
+            ("scripts/other.py", ""),
+        ]);
+        let makefiles = Makefiles::default();
+        let argv = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>()
+        };
+        let (inputs, direct) = makefiles
+            .command_inputs(
+                &argv(&["python3", "-B", "-m", "unittest", "scripts.test_tool"]),
+                &files,
+            )
+            .unwrap();
+        assert_eq!(direct, ["scripts/test_tool.py"]);
+        assert_eq!(
+            inputs,
+            ["data/rows.json", "scripts/test_tool.py", "scripts/tool.py"]
+        );
+        assert!(
+            makefiles
+                .command_inputs(&argv(&["python3", "-c", "1"]), &files)
+                .is_none()
+        );
     }
 
     #[test]
