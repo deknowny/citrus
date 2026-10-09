@@ -861,12 +861,10 @@ impl<'a> CleanTree<'a> {
 
 impl Drop for CleanTree<'_> {
     fn drop(&mut self) {
-        let _ = self.context.repo.git(&[
-            "worktree",
-            "remove",
-            "--force",
-            &self.dir.to_string_lossy(),
-        ]);
+        let _ =
+            self.context
+                .repo
+                .git(&["worktree", "remove", "--force", &self.dir.to_string_lossy()]);
     }
 }
 
@@ -958,6 +956,17 @@ fn build_artifact(
             }
             if let Some(platform) = text(&artifact.build, "platform") {
                 docker.args(["--platform", &platform]);
+            }
+            // Named build contexts (`name=path`, relative to the checkout).
+            for named in artifact
+                .build
+                .get("contexts")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str())
+            {
+                docker.args(["--build-context", named]);
             }
             // Public build arguments (`NAME=value`): part of the key with the
             // rest of the build settings.

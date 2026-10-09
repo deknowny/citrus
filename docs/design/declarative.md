@@ -38,7 +38,8 @@ artifact api {
   inputs = ["crates/api/**", "Cargo.lock", "Dockerfile"]
   # A shared Dockerfile counts only with the stages `runtime` is built from.
   dockerfile = { file: "Dockerfile", target: "runtime" }
-  # `args`: public build arguments (`NAME=value`), part of the key.
+  # `args`: public build arguments (`NAME=value`), part of the key;
+  # `contexts`: named build contexts (`root=.`), paths in the checkout.
   build = { provider: "docker", dockerfile: "Dockerfile", target: "runtime", args: ["PUBLIC_URL=https://shop.example.com"] }
   publish = { registry: "registry.example.com/shop/api" }    # identity = pushed digest
 }
