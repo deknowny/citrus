@@ -173,6 +173,8 @@ impl Files for RepoFiles<'_> {
 
 const CARGO_SUBCOMMANDS: &[&str] = &[
     "test", "build", "check", "clippy", "run", "bench", "doc", "fmt", "nextest",
+    // `cargo build` linked by zig for another platform.
+    "zigbuild",
 ];
 
 /// Workspace packages (the names `-p` accepts).

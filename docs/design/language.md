@@ -353,6 +353,7 @@ the run reports with its place in the file.
 | `std::fs::read(path) -> Result<str>`, `exists`, `glob`, `copy` | files |
 | `std::paths::cargo("pkg")`, `next("@app")`, `package("@lib")` | a package's files, at load |
 | `std::env::var(name) -> Option<str>` | |
+| `std::env::platform() -> str` | `macos-aarch64`, `linux-x86_64`…: the machine the step runs on |
 | `std::wait::http(url, timeout)`, `tcp(address, timeout)`, `file(path, timeout)` | readiness |
 | `std::docs::check_links(glob)` | relative Markdown links point at files |
 | `std::log::info(message)` | a line in the log |

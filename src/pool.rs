@@ -871,8 +871,7 @@ fn serve(
     draining: &AtomicBool,
     running: &AtomicUsize,
 ) -> Result<i32> {
-    client.batch_execute("listen citrus_jobs; listen citrus_binaries")?;
-    let prebuilding = Arc::new(AtomicBool::new(false));
+    client.batch_execute("listen citrus_jobs")?;
     let free = Arc::new(AtomicUsize::new(machine.slots));
     let fatal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
@@ -944,36 +943,11 @@ fn serve(
         {
             break Ok(0);
         }
-        let mut published = Vec::new();
-        let first = client
+        let _ = client
             .notifications()
             .timeout_iter(Duration::from_secs(if limit > 0 { 5 } else { 1 }))
             .next()?;
-        let mut next = first;
-        while let Some(notification) = next {
-            if notification.channel() == "citrus_binaries" {
-                published.push(notification.payload().to_owned());
-            }
-            next = client.notifications().iter().next()?;
-        }
-        // A new Citrus was published for another platform: build this one's
-        // now, while its pin is being merged, not when the first run asks.
-        if let Some(commit) = published.pop()
-            && commit != VERSION
-            && !prebuilding.swap(true, Ordering::SeqCst)
-        {
-            let (url, machine, prebuilding) =
-                (url.to_owned(), machine.clone(), prebuilding.clone());
-            std::thread::spawn(move || {
-                if let Err(error) = prebuild(&url, &machine, &commit) {
-                    eprintln!(
-                        "citrus agent {}: prebuild {commit}: {error:#}",
-                        machine.name
-                    );
-                }
-                prebuilding.store(false, Ordering::SeqCst);
-            });
-        }
+        while client.notifications().iter().next()?.is_some() {}
     };
     // STOP kills the executors; their checks go back to the queue.
     for worker in workers {
@@ -981,42 +955,6 @@ fn serve(
     }
     running.store(0, Ordering::SeqCst);
     result
-}
-
-/// Build (or fetch) the executor of a just-published `commit` for the
-/// platform this machine runs checks on. One machine of the pool builds it,
-/// the others take it from the pool when they need it.
-fn prebuild(url: &str, machine: &Machine, commit: &str) -> Result<()> {
-    let platform = if machine.docker {
-        docker_platform()
-    } else {
-        None
-    };
-    let label = platform
-        .as_deref()
-        .map(|platform| platform.replace('/', "-"))
-        .unwrap_or_else(|| format!("{}-{}", os_label(), arch()));
-    let mut client = connect(url)?;
-    let held = client.query(
-        "select 1 from citrus.binaries where commit_sha = $1 and platform = $2",
-        &[&commit, &label],
-    )?;
-    if !held.is_empty() || machine.cache.join("bin").join(commit).join(&label).exists() {
-        return Ok(());
-    }
-    let key = format!("citrus-build:{commit}:{label}");
-    let locked: bool = client
-        .query_one("select pg_try_advisory_lock(hashtext($1))", &[&key])?
-        .get(0);
-    if !locked {
-        return Ok(());
-    }
-    eprintln!(
-        "citrus agent {}: builds Citrus {commit} for {label} ahead of its runs",
-        machine.name
-    );
-    executor(machine, commit, platform.as_deref(), &mut |_| Ok(()))?;
-    Ok(())
 }
 
 /// One claimed batch on its own connection. Its slots come back as its
@@ -1526,12 +1464,20 @@ pub fn fetch_published(commit: &str, platform: &str, to: &Path) -> Result<bool> 
 /// (`citrus --version`) and `platform` (default: this machine's). The first
 /// build of a commit stays: whoever took it keeps the same bytes.
 pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, String, String)> {
-    let output = Command::new(file)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("run {} --version", file.display()))?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let own = format!("{}-{}", os_label(), arch());
+    let platform = platform.map(str::to_owned).unwrap_or_else(|| own.clone());
+    // A cross-compiled build cannot run here: its `--version` text is read
+    // from its bytes instead.
+    let text = if platform == own {
+        let output = Command::new(file)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("run {} --version", file.display()))?;
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    } else {
+        embedded_version(&std::fs::read(file)?).unwrap_or_default()
+    };
     let commit = text
         .split(['(', ')'])
         .nth(1)
@@ -1544,9 +1490,6 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
             )
         })?
         .to_owned();
-    let platform = platform
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("{}-{}", os_label(), arch()));
     let url = url()
         .or_else(|| {
             std::env::var("CITRUS_AGENT_POOL")
@@ -1556,9 +1499,26 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
         .context("no pool: set CITRUS_POOL or ~/.config/citrus/pool")?;
     let mut client = connect(&url)?;
     let sha = store_binary(&mut client, &commit, &platform, file)?;
-    // The agents build theirs from it at once (see `prebuild`).
-    notify(&mut client, "citrus_binaries", &commit)?;
     Ok((commit, platform, sha))
+}
+
+/// The `X.Y.Z (<commit>)` version text a Citrus binary carries.
+fn embedded_version(bytes: &[u8]) -> Option<String> {
+    let hex = |c: &u8| c.is_ascii_hexdigit() && !c.is_ascii_uppercase();
+    bytes.windows(42).enumerate().find_map(|(at, window)| {
+        if window[0] != b'(' || window[41] != b')' || !window[1..41].iter().all(hex) {
+            return None;
+        }
+        // Preceded by "<digits>.<digits>.<digits> ".
+        let head = &bytes[at.saturating_sub(16)..at];
+        let head = std::str::from_utf8(head).ok()?;
+        let version = head
+            .rsplit(|c: char| !(c.is_ascii_digit() || c == '.' || c == ' '))
+            .next()?;
+        let version = version.trim();
+        (version.split('.').count() == 3 && head.ends_with(' '))
+            .then(|| format!("{version} ({})", String::from_utf8_lossy(&window[1..41])))
+    })
 }
 
 /// Published Citrus builds, newest first: commit, platform, sha256, bytes.
@@ -2035,6 +1995,14 @@ mod tests {
         // SAFETY: as above.
         unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) };
         assert!(!held(&path));
+    }
+
+    #[test]
+    fn reads_the_version_a_binary_carries() {
+        let commit = "48a229ceaefd4985c50990b14116b6d856af0985";
+        let bytes = format!("\0\0junk (0123)\0tool 0.3.0 ({commit})\0more").into_bytes();
+        assert_eq!(embedded_version(&bytes), Some(format!("0.3.0 ({commit})")));
+        assert_eq!(embedded_version(b"no version here"), None);
     }
 
     #[test]

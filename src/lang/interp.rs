@@ -1083,6 +1083,11 @@ impl<'a> Interp<'a> {
                     Err(message) => return Err(panic(span, message)),
                 }
             }
+            "std::env::platform" => Value::str(format!(
+                "{}-{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )),
             "std::env::var" => match std::env::var(arg(0).as_str()) {
                 Ok(value) => Value::Some(Box::new(Value::str(value))),
                 Err(_) => Value::None,

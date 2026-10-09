@@ -46,6 +46,19 @@ check build {
     run!("{target}/fast/citrus pool publish {target}/fast/citrus")?;
 }
 
+/// Run on a Mac, also the static Linux build the pool agents and production
+/// tools take (cargo-zigbuild, its own target directory so it runs beside
+/// `build`): no builder compiles a new Citrus itself. On Linux `build`
+/// already published it.
+#[paths(RUST)]
+check build_linux {
+    if std::env::platform() != "linux-x86_64" {
+        let musl = "x86_64-unknown-linux-musl";
+        run!("cargo zigbuild --quiet --locked --profile fast --target {musl} --target-dir target/cross")?;
+        run!("target/cross/{musl}/fast/citrus pool publish --platform linux-x86_64 target/cross/{musl}/fast/citrus")?;
+    };
+}
+
 /// Format the code.
 task fmt {
     run!("cargo fmt --all")?;
