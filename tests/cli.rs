@@ -3781,15 +3781,15 @@ service browser;
 #[paths("src/**")]
 group slow {
     check a {
-        run!("sh -c 'echo a-begins; sleep 2; echo a-ends'")?;
+        run!("sh -c 'echo a-begins; sleep 1; echo a-ends'")?;
     }
 
     check b {
-        run!("sh -c 'echo b-begins; sleep 2; echo b-ends'")?;
+        run!("sh -c 'echo b-begins; sleep 1; echo b-ends'")?;
     }
 
     check c {
-        run!("sh -c 'echo c-begins; sleep 2; echo AssertionError: c broke; exit 3'")?;
+        run!("sh -c 'echo c-begins; sleep 1; echo AssertionError: c broke; exit 3'")?;
     }
 
     #[needs(browser)]
@@ -3811,7 +3811,7 @@ group slow {
     let elapsed = started.elapsed();
     assert_eq!(code, 1, "{run}");
     assert!(
-        elapsed < std::time::Duration::from_millis(5500),
+        elapsed < std::time::Duration::from_millis(2900),
         "{elapsed:?}: {run}"
     );
     assert_eq!(target(&run, "slow.a")["result"], "passed", "{run}");

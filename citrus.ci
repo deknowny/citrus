@@ -7,8 +7,11 @@
 /// The sources every Rust check reads.
 const RUST: list<glob> = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "build.rs"];
 
-/// Unit and integration tests on throwaway Git repositories.
+/// Unit and integration tests on throwaway Git repositories. Many of them
+/// wait on child processes rather than compute, so more threads than cores
+/// keep the run as long as its slowest test.
 #[paths("examples/**")]
+#[env(RUST_TEST_THREADS = "32")]
 check test {
     run!("cargo test --locked")?;
 }
