@@ -92,13 +92,7 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
         return Ok(None);
     }
     if environment.checks == "proven" && !request.unchecked {
-        let needed = crate::release::unproven_checks(&mut *context)?;
-        if !needed.is_empty() {
-            bail!(
-                "checks not proven for this commit: {} — run `citrus run` first (or --unchecked)",
-                needed.join(", ")
-            );
-        }
+        crate::release::prove_shipped(&mut *context, &request.environment)?;
     }
     let artifacts = deploy::artifacts(context)?;
     let mut builds: Vec<Build> = Vec::new();

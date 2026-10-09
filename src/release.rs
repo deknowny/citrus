@@ -337,12 +337,19 @@ pub fn start(context: &mut Context, request: &Start) -> Result<Release> {
         );
     }
     if kind == "release" && unit.checks == "proven" && !request.unchecked {
-        let needed = unproven_checks(&mut *context)?;
-        if !needed.is_empty() {
-            bail!(
-                "checks not proven for this commit: {} — run `citrus run` first (or --unchecked to release anyway)",
-                needed.join(", ")
-            );
+        let deployed = !unit.environment.is_empty()
+            && crate::deploy::environments(context)?.contains_key(&unit.environment);
+        if !deployed {
+            let needed = unproven_checks(&mut *context)?;
+            if !needed.is_empty() {
+                bail!(
+                    "checks not proven for this commit: {} — run `citrus run` first (or --unchecked to release anyway)",
+                    needed.join(", ")
+                );
+            }
+        } else {
+            // Only what the release ships, run now when not proven yet.
+            prove_shipped(&mut *context, &unit.environment.clone())?;
         }
     }
     let started = now();
@@ -425,6 +432,92 @@ pub fn start(context: &mut Context, request: &Start) -> Result<Release> {
 }
 
 /// Checks the plan selects for HEAD that are not proven yet.
+/// The checks of a plan that are not proven for the working tree.
+fn unproven_in(context: &mut Context, plan: &crate::plan::Plan) -> Result<Vec<String>> {
+    let files = context.repo.files()?;
+    let snapshot = context.repo.snapshot()?;
+    Ok(plan
+        .targets
+        .iter()
+        .map(|name| context.decide(&files, &snapshot, name, false))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|decision| decision.result != "reused")
+        .map(|decision| decision.target)
+        .collect())
+}
+
+/// Prove what a release ships: the checks selected by the files that change
+/// between the commit `environment` runs and HEAD and that its changing
+/// artifacts are built from (another product's change needs nothing). Those
+/// not proven yet run now in the pool; an error only when one fails. Without
+/// a recorded running commit, the plan against the base branch must be proven.
+pub fn prove_shipped(context: &mut Context, environment: &str) -> Result<()> {
+    let diff = crate::deploy::diff(context, environment)?;
+    let Some(running) = diff.running_commit.clone() else {
+        let needed = unproven_checks(&mut *context)?;
+        if !needed.is_empty() {
+            bail!(
+                "checks not proven for this commit: {} — run `citrus run` first (or --unchecked)",
+                needed.join(", ")
+            );
+        }
+        return Ok(());
+    };
+    let mut paths: Vec<String> = diff
+        .workloads
+        .iter()
+        .filter(|item| item.change != "unchanged")
+        .flat_map(|item| item.changed_inputs.iter())
+        .map(|path| path.trim_end_matches(" (removed)").to_owned())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let plan = crate::plan::for_paths(&context.repo, &context.manifest, &paths, &running)?;
+    let needed = unproven_in(context, &plan)?;
+    if needed.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "{environment}: the shipped change needs {}; running them in the pool",
+        needed.join(", ")
+    );
+    let list = context
+        .repo
+        .log_dir()
+        .join(format!("shipped-{environment}-{}.paths", &diff.head[..12]));
+    crate::repo::private_dir(&context.repo.log_dir())?;
+    std::fs::write(&list, paths.join("\n") + "\n")?;
+    // In the pool when there is one: its caches are warm.
+    let mut run = std::process::Command::new(std::env::current_exe()?);
+    run.arg("run");
+    if crate::pool::url().is_some() {
+        run.arg("--remote");
+    }
+    let status = run
+        .args(["--text", "--base", &running, "--paths-file"])
+        .arg(&list)
+        .stdout(std::process::Stdio::from(std::io::stderr()))
+        .status()?;
+    if !status.success() {
+        bail!(
+            "the checks this release needs failed: {}",
+            needed.join(", ")
+        );
+    }
+    let needed = unproven_in(context, &plan)?;
+    if !needed.is_empty() {
+        bail!(
+            "checks still not proven after their run: {}",
+            needed.join(", ")
+        );
+    }
+    Ok(())
+}
+
 pub fn unproven_checks(context: &mut Context) -> Result<Vec<String>> {
     let repo = &context.repo;
     let plan = crate::plan::compute(repo, &context.manifest, None)?;

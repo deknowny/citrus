@@ -19,6 +19,8 @@ fn citrus_command() -> Command {
             command.env_remove(&key);
         }
     }
+    // Never this machine's pool (~/.config/citrus/pool).
+    command.env("CITRUS_POOL", "");
     command
 }
 
