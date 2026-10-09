@@ -96,7 +96,7 @@ pub fn connect(url: &str) -> Result<Client> {
 
 /// The pool's tables; any client creates them on first use.
 /// The schema version this build writes; bump with every change below.
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// The pool's tables. DDL takes exclusive table locks even when it changes
 /// nothing, so it runs only when the recorded version is behind; every other
@@ -187,6 +187,19 @@ fn migrate(client: &mut Client) -> Result<()> {
             created timestamptz not null default now(),
             primary key (commit_sha, platform)
         );
+        -- How long a check usually takes (smoothed over its passes): the longest
+        -- checks of a run start first, so a run ends with its longest check.
+        create table if not exists citrus.durations (
+            repo text not null,
+            check_name text not null,
+            seconds real not null,
+            primary key (repo, check_name)
+        );
+        insert into citrus.durations (repo, check_name, seconds)
+            select r.repo, j.check_name, avg(j.seconds)::real from citrus.jobs j
+            join citrus.runs r on r.id = j.run
+            where j.result = 'passed' and j.seconds is not null and j.finished > now() - interval '3 days'
+            group by 1, 2 on conflict do nothing;
         create table if not exists citrus.meta (version integer not null);
         delete from citrus.meta;
         insert into citrus.meta (version) values (SCHEMA_VERSION);
@@ -1327,8 +1340,9 @@ fn claim(
              order by r.priority desc, r.created limit 1),
          picked as (
              select j.run, j.check_name from citrus.jobs j join citrus.runs r on r.id = j.run
+             left join citrus.durations d on d.repo = r.repo and d.check_name = j.check_name
              where j.run = (select run from oldest) and j.state = 'queued' and ({fits})
-             order by j.check_name limit $5 for update of j skip locked)
+             order by coalesce(d.seconds, 90) desc, j.check_name limit $5 for update of j skip locked)
          update citrus.jobs j set state = 'claimed', agent = $6, claimed = now()
          from picked where j.run = picked.run and j.check_name = picked.check_name
          returning j.run, j.check_name"
@@ -1409,6 +1423,17 @@ fn settle(
                 &[&run, check, &result, &seconds],
             )
         })?;
+        // A passed check's time moves its smoothed duration (a failure often
+        // stops early and says nothing about how long the check takes).
+        if let ("passed", Some(seconds)) = (result, seconds) {
+            let _ = client.execute(
+                "insert into citrus.durations (repo, check_name, seconds)
+                 select r.repo, $2, $3 from citrus.runs r where r.id = $1
+                 on conflict (repo, check_name)
+                 do update set seconds = citrus.durations.seconds * 0.7 + excluded.seconds * 0.3",
+                &[&run, check, &seconds],
+            );
+        }
     }
     client.execute("select pg_notify('citrus_events', $1)", &[&run])?;
     Ok(())
