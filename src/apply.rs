@@ -657,7 +657,21 @@ fn run_step(
             }
         }
         for url in &environment.verify.http {
-            run(Command::new("curl").args(["-fsS", "--max-time", "15", "-o", "/dev/null", url]))?;
+            // A just-restarted service may need a moment: retried for two minutes.
+            let deadline = now() + 120;
+            loop {
+                let answered = Command::new("curl")
+                    .args(["-fsS", "--max-time", "15", "-o", "/dev/null", url])
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if answered {
+                    break;
+                }
+                if now() > deadline {
+                    bail!("{url} did not answer 2xx within two minutes");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
         }
         for check in &environment.verify.commands {
             let status = command(check, extra_env, context)?.status()?;
