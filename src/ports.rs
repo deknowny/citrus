@@ -59,7 +59,10 @@ fn block(run: &str, size: u32) -> Result<u32> {
 /// values of `urls` (`KEY=NAME`) moved along, and names marked `+` appended
 /// when missing.
 pub fn rewrite(text: &str, base: u32, names: &[String], urls: &[String]) -> Result<String> {
-    let plain: Vec<&str> = names.iter().map(|name| name.trim_end_matches('+')).collect();
+    let plain: Vec<&str> = names
+        .iter()
+        .map(|name| name.trim_end_matches('+'))
+        .collect();
     let offset = |name: &str| plain.iter().position(|candidate| *candidate == name);
     let lines: Vec<&str> = text.lines().collect();
     let mut old: Vec<Option<String>> = vec![None; plain.len()];
@@ -75,7 +78,8 @@ pub fn rewrite(text: &str, base: u32, names: &[String], urls: &[String]) -> Resu
         let (key, name) = url
             .split_once('=')
             .with_context(|| format!("--url wants KEY=NAME, got {url}"))?;
-        let index = offset(name).with_context(|| format!("--url {url}: {name} is not a port name"))?;
+        let index =
+            offset(name).with_context(|| format!("--url {url}: {name} is not a port name"))?;
         follow.push((key, index));
     }
     let mut seen = vec![false; plain.len()];
@@ -176,7 +180,13 @@ mod tests {
     #[test]
     fn ports_follow_the_block_and_urls_move_along() {
         let text = "A_PORT=5432\nB_PORT=8080\nDB_URL=postgres://u@127.0.0.1:5432/x\nOTHER=:5432abc\nNOTE\n";
-        let out = rewrite(text, 21010, &names(), &["DB_URL=A_PORT".into(), "OTHER=A_PORT".into()]).unwrap();
+        let out = rewrite(
+            text,
+            21010,
+            &names(),
+            &["DB_URL=A_PORT".into(), "OTHER=A_PORT".into()],
+        )
+        .unwrap();
         assert_eq!(
             out,
             "A_PORT=21010\nB_PORT=21011\nDB_URL=postgres://u@127.0.0.1:21010/x\nOTHER=:5432abc\nNOTE\nC_PORT=21012\n"
