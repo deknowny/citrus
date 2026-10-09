@@ -528,8 +528,10 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
             inferred_reads.push(glob);
         }
     }
+    // Inferred inputs add to what selects the check; only declared paths
+    // narrow it from its group's.
     let inferred = !inferred_reads.is_empty();
-    let narrows = !owns.is_empty() || !via.is_empty() || inferred;
+    let narrows = !owns.is_empty() || !via.is_empty();
     if !narrows {
         owns = from.paths.clone();
     }
