@@ -542,7 +542,11 @@ impl Context {
         let ok = finished
             .iter()
             .all(|target| matches!(target.result.as_str(), "passed" | "reused"));
-        if !passed.is_empty() && self.repo.snapshot().ok().as_deref() == Some(run.snapshot.as_str())
+        // A pool run checked exactly its snapshot; a local one checked the live
+        // tree, which must still be that snapshot.
+        if !passed.is_empty()
+            && (run.mode == "remote"
+                || self.repo.snapshot().ok().as_deref() == Some(run.snapshot.as_str()))
         {
             for target in &passed {
                 self.store

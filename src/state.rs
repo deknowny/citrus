@@ -1277,12 +1277,6 @@ impl Store {
             .and_then(|all| all.get(target).copied()))
     }
 
-    /// Drop what this process read: runs elsewhere (a pool batch, a gate)
-    /// have written evidence since.
-    pub fn forget(&self) {
-        *self.cache.borrow_mut() = Cache::default();
-    }
-
     pub fn latest_evidence(&self, target: &str, kind: &str) -> Result<Option<Evidence>> {
         self.with_evidence(|all| {
             all.get(&(target.to_owned(), kind.to_owned()))

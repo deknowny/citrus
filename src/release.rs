@@ -593,7 +593,8 @@ pub fn start_gate(context: &mut Context, environment: &str) -> Result<Option<Gat
 
 /// Wait for a gate's runs; an error unless every needed check is proven.
 pub fn finish_gate(context: &Context, gate: &Gate) -> Result<()> {
-    for (profile, run) in &gate.runs {
+    let mut rows = Vec::new();
+    for (_, run) in &gate.runs {
         let status = std::process::Command::new(std::env::current_exe()?)
             .args(["wait", run, "--text"])
             .stdout(std::process::Stdio::from(std::io::stderr()))
@@ -604,14 +605,28 @@ pub fn finish_gate(context: &Context, gate: &Gate) -> Result<()> {
                 gate.needed.join(", ")
             );
         }
-        // The run's evidence was written by other processes after this one
-        // read (and cached) what proves what.
-        context.store.forget();
-        let plan = gate_plan(context, profile, &gate.paths, &gate.base)?;
-        let needed = unproven_in(context, &plan)?;
-        if !needed.is_empty() {
-            bail!("checks still not proven after {run}: {}", needed.join(", "));
-        }
+        rows.extend(context.store.targets(run)?);
+    }
+    // The gate's runs checked the release's own snapshot: what they passed is
+    // proven, whatever the worktree holds now (someone may be editing it while
+    // the release runs).
+    let missing: Vec<String> = gate
+        .needed
+        .iter()
+        .filter(|name| {
+            !rows.iter().any(|row| {
+                &row.target == *name && matches!(row.result.as_str(), "passed" | "reused")
+            })
+        })
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let runs: Vec<&str> = gate.runs.iter().map(|(_, run)| run.as_str()).collect();
+        bail!(
+            "checks still not proven after {}: {}",
+            runs.join(", "),
+            missing.join(", ")
+        );
     }
     Ok(())
 }
