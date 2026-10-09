@@ -38,7 +38,8 @@ artifact api {
   inputs = ["crates/api/**", "Cargo.lock", "Dockerfile"]
   # A shared Dockerfile counts only with the stages `runtime` is built from.
   dockerfile = { file: "Dockerfile", target: "runtime" }
-  build = { provider: "docker", dockerfile: "Dockerfile", target: "runtime" }
+  # `args`: public build arguments (`NAME=value`), part of the key.
+  build = { provider: "docker", dockerfile: "Dockerfile", target: "runtime", args: ["PUBLIC_URL=https://shop.example.com"] }
   publish = { registry: "registry.example.com/shop/api" }    # identity = pushed digest
 }
 
@@ -56,7 +57,8 @@ environment shop-production = kubernetes(context: "prod", namespace: "shop") {
   migrations = { artifact: "api-migrations", job: "deploy/migrate.yaml", timeout: 5m }
   record = { annotation: "example.com/release" }
 
-  deploy api = api
+  # The container's APP_VERSION is set to the release name with each new image.
+  deploy api = api { version_env = "APP_VERSION" }
   # Never two at once: wait until the old one released its lease.
   deploy bot = bot {
     fence = "bot-session"

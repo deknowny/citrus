@@ -141,6 +141,10 @@ pub struct Workload {
     /// CronJobs: suspended while the environment changes, restored after.
     #[serde(default)]
     pub quiesce: bool,
+    /// An environment variable of the container set to the release name
+    /// whenever the image changes (the version the program reports).
+    #[serde(default)]
+    pub version_env: String,
     #[serde(default = "five_minutes")]
     pub timeout: u64,
 }

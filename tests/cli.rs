@@ -1592,7 +1592,7 @@ artifact migrations;
 #[kubernetes(kubectl = "./kubectl.py", namespace = "shop")]
 #[record(annotation = "example.com/release", tag_prefix = "v")]
 #[migrations(artifact = migrations, job = "job.yaml")]
-#[deploy("api", api, fence = "api-lease", timeout = 10s)]
+#[deploy("api", api, fence = "api-lease", timeout = 10s, version_env = "APP_VERSION")]
 #[deploy("backup", backup, kind = "cronjob", quiesce = true)]
 environment prod;
 "#,
@@ -1720,6 +1720,8 @@ fn apply_builds_by_key_rolls_by_digest_and_records_the_commit() {
     let calls = fs::read_to_string(project.root().join(".kube/calls")).unwrap();
     let suspend = calls.find(r#"{"spec":{"suspend":true}}"#).unwrap();
     let roll = calls.find("patch deployment api").unwrap();
+    // The container learns its release (the name apply records).
+    assert!(calls.contains(r#""name":"APP_VERSION""#), "{calls}");
     let resume = calls.find(r#"{"spec":{"suspend":false}}"#).unwrap();
     assert!(suspend < roll && roll < resume, "{calls}");
 

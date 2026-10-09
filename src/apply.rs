@@ -34,6 +34,8 @@ struct Roll {
     key: String,
     fence: Option<String>,
     timeout: u64,
+    #[serde(default)]
+    version_env: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +125,7 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
             key: item.desired_key.clone(),
             fence: spec.fence.clone(),
             timeout: spec.timeout,
+            version_env: spec.version_env.clone(),
         });
     }
     let migrate = match &environment.migrations {
@@ -515,7 +518,12 @@ fn run_step(
                 plan.release_name.clone().into(),
             );
         }
-        let containers = serde_json::json!([{"name": roll.container, "image": image}]);
+        let mut container = serde_json::json!({"name": roll.container, "image": image});
+        if !roll.version_env.is_empty() {
+            container["env"] =
+                serde_json::json!([{"name": roll.version_env, "value": plan.release_name}]);
+        }
+        let containers = serde_json::json!([container]);
         let patch = if already {
             // Same image: record only. Touching the pod template would restart it for nothing.
             serde_json::json!({"metadata": {"annotations": annotations}})
@@ -687,6 +695,18 @@ fn build_artifact(
             }
             if let Some(platform) = text(&artifact.build, "platform") {
                 docker.args(["--platform", &platform]);
+            }
+            // Public build arguments (`NAME=value`): part of the key with the
+            // rest of the build settings.
+            for arg in artifact
+                .build
+                .get("args")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str())
+            {
+                docker.args(["--build-arg", arg]);
             }
             docker
                 .arg(text(&artifact.build, "context").unwrap_or_else(|| ".".into()))
