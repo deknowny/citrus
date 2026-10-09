@@ -17,51 +17,70 @@ pub const MARKER: &str = "cargo-lock:";
 
 /// package name → its entries (every version), as normalized text.
 type Entries = BTreeMap<String, Vec<String>>;
-/// (package, the names it depends on)
-type Edges = Vec<(String, Vec<String>)>;
 
-fn parse(text: &str) -> Option<(Entries, Edges)> {
+fn parse(text: &str) -> Option<Entries> {
     let table: toml::Table = text.parse().ok()?;
     let packages = table.get("package")?.as_array()?;
     let mut entries: Entries = BTreeMap::new();
-    let mut edges: Edges = Vec::new();
     for package in packages {
         let table = package.as_table()?;
         let name = table.get("name")?.as_str()?.to_owned();
-        let dependencies: Vec<String> = table
-            .get("dependencies")
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str())
-                    .filter_map(|item| item.split_whitespace().next())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        entries
-            .entry(name.clone())
-            .or_default()
-            .push(format!("{table:?}"));
-        edges.push((name, dependencies));
+        entries.entry(name).or_default().push(format!("{table:?}"));
     }
     for versions in entries.values_mut() {
         versions.sort();
     }
-    Some((entries, edges))
+    Some(entries)
+}
+
+/// name → the names it depends on (every version merged).
+type Graph = BTreeMap<String, BTreeSet<String>>;
+
+/// The dependency graph of a lock file, once per distinct content: every Cargo
+/// closure of a configuration asks for it.
+fn graph(lock: &str) -> Option<std::sync::Arc<Graph>> {
+    use std::hash::{Hash, Hasher};
+    static CACHE: Mutex<BTreeMap<u64, Option<std::sync::Arc<Graph>>>> = Mutex::new(BTreeMap::new());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lock.hash(&mut hasher);
+    let key = hasher.finish();
+    if let Some(found) = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        return found.clone();
+    }
+    let built = lock.parse::<toml::Table>().ok().and_then(|table| {
+        let mut graph: Graph = BTreeMap::new();
+        for package in table.get("package")?.as_array()? {
+            let package = package.as_table()?;
+            let name = package.get("name")?.as_str()?.to_owned();
+            let next = graph.entry(name).or_default();
+            for item in package
+                .get("dependencies")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.as_str())
+            {
+                if let Some(first) = item.split_whitespace().next() {
+                    next.insert(first.to_owned());
+                }
+            }
+        }
+        Some(std::sync::Arc::new(graph))
+    });
+    CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, built.clone());
+    built
 }
 
 /// Every lock package reachable from `members` (their names), members included.
 pub fn reach(lock: &str, members: &[String]) -> Option<BTreeSet<String>> {
-    let (_, edges) = parse(lock)?;
-    let mut graph: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for (name, dependencies) in &edges {
-        graph
-            .entry(name)
-            .or_default()
-            .extend(dependencies.iter().map(String::as_str));
-    }
+    let graph = graph(lock)?;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut pending: Vec<&str> = members.iter().map(String::as_str).collect();
     while let Some(name) = pending.pop() {
@@ -69,7 +88,7 @@ pub fn reach(lock: &str, members: &[String]) -> Option<BTreeSet<String>> {
             continue;
         }
         if let Some(next) = graph.get(name) {
-            pending.extend(next.iter().copied());
+            pending.extend(next.iter().map(String::as_str));
         }
     }
     Some(seen)
@@ -78,8 +97,8 @@ pub fn reach(lock: &str, members: &[String]) -> Option<BTreeSet<String>> {
 /// The packages whose entries differ between two lock files; None when either
 /// cannot be read (everything counts as changed then).
 pub fn changed(old: &str, new: &str) -> Option<BTreeSet<String>> {
-    let (old, _) = parse(old)?;
-    let (new, _) = parse(new)?;
+    let old = parse(old)?;
+    let new = parse(new)?;
     let names: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
     Some(
         names
@@ -95,7 +114,7 @@ pub fn slice_digest(lock: &str, reach: &BTreeSet<String>) -> String {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
     match parse(lock) {
-        Some((entries, _)) => {
+        Some(entries) => {
             for name in reach {
                 if let Some(versions) = entries.get(name) {
                     for entry in versions {
@@ -112,6 +131,18 @@ pub fn slice_digest(lock: &str, reach: &BTreeSet<String>) -> String {
 
 /// The packages the plan being made sees changed; None: unknown, all of them.
 static CHANGED: Mutex<Option<BTreeSet<String>>> = Mutex::new(None);
+
+/// A `#[test]` plan asks about paths alone, with no lock file to compare:
+/// there `Cargo.lock` counts as changed for everyone.
+static UNKNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn assume_unknown(on: bool) {
+    UNKNOWN.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn unknown() -> bool {
+    UNKNOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 pub fn set_changed(changed: Option<BTreeSet<String>>) {
     *CHANGED

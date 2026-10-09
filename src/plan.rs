@@ -176,7 +176,10 @@ pub fn for_change(repo: &Repo, manifest: &Manifest, change: &Change, before: &st
     let mut paths = change.paths.clone();
     paths.sort();
     paths.dedup();
-    let mut plan = select(&repo, manifest, paths, before, true, &change.env)?;
+    crate::lock::assume_unknown(true);
+    let selected = select(&repo, manifest, paths, before, true, &change.env);
+    crate::lock::assume_unknown(false);
+    let mut plan = selected?;
     narrow(&mut plan, &repo, manifest);
     Ok(plan)
 }
@@ -185,6 +188,10 @@ pub fn for_change(repo: &Repo, manifest: &Manifest, change: &Change, before: &st
 /// those whose entries differ between `fork` and the working tree.
 fn lock_scope(repo: &Repo, fork: &str, paths: &[String]) {
     use std::collections::BTreeSet;
+    if crate::lock::unknown() {
+        crate::lock::set_changed(None);
+        return;
+    }
     if !paths.iter().any(|path| path == "Cargo.lock") {
         crate::lock::set_changed(Some(BTreeSet::new()));
         return;
@@ -533,7 +540,7 @@ impl Facts<'_> {
     /// Changed paths matching a glob list.
     fn count(&self, globs: &[String]) -> usize {
         crate::manifest::GlobList::new(globs)
-            .map(|list| self.paths.iter().filter(|path| list.matches(path)).count())
+            .map(|list| self.paths.iter().filter(|path| list.selects(path)).count())
             .unwrap_or(0)
     }
 
