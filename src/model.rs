@@ -176,6 +176,9 @@ pub enum Cond {
     Selected(String),
     /// The project's signal command printed this signal.
     Signal(String),
+    /// `NAME=value`: the plan's environment (the process's, or a test's
+    /// `.env()`) has it.
+    Env(String),
     /// The plan is for this profile.
     Profile(String),
     /// Every changed path is in it.

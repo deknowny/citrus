@@ -378,6 +378,7 @@ fn condition_in(
                 "only" => Cond::Only(paths(arg, compiler)?),
                 "without" => Cond::Without(paths(arg, compiler)?),
                 "signal" => Cond::Signal(name(arg, compiler)?),
+                "env" => Cond::Env(name(arg, compiler)?),
                 "selected" => Cond::Selected(name(arg, compiler)?),
                 "profile" => Cond::Profile(name(arg, compiler)?),
                 other => {

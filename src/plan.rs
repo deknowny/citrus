@@ -339,6 +339,7 @@ fn select(
         group_paths: &group_paths,
         paths: &paths,
         profile: repo.config.plan.profile.as_deref(),
+        env,
     };
     // Owners whose condition holds, and checks selected by condition alone;
     // repeated until stable because conditions may name selected checks.
@@ -506,6 +507,7 @@ struct Facts<'a> {
     group_paths: &'a BTreeMap<String, usize>,
     paths: &'a [String],
     profile: Option<&'a str>,
+    env: &'a [(String, String)],
 }
 
 impl Facts<'_> {
@@ -532,6 +534,18 @@ impl Facts<'_> {
             Cond::Touched(set) => self.within(set) > 0,
             Cond::Selected(name) => selected.contains(name),
             Cond::Signal(name) => self.signals.contains(name),
+            Cond::Env(pair) => {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                let set = self
+                    .env
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+                    .or_else(|| std::env::var(key).ok())
+                    .unwrap_or_default();
+                set == value
+            }
             Cond::Profile(name) => self.profile == Some(name.as_str()),
             Cond::Only(set) => !self.paths.is_empty() && self.within(set) == self.paths.len(),
             Cond::Without(set) => self.within(set) == 0,

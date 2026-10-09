@@ -4272,3 +4272,32 @@ check env {
     assert_eq!(code, 0, "{run}");
     assert_eq!(target(&run, "env")["result"], "passed", "{run}");
 }
+
+/// `env("NAME=value")` selects by the plan's environment.
+#[test]
+fn env_conditions_follow_the_plan_environment() {
+    let project = Project::v2(
+        r#"#![citrus(2)]
+#[paths("src/**")]
+#[when(env("GATE=1"))]
+check gated {
+    run!("true")?;
+}
+
+#[test]
+fn gated_by_env() -> Result<()> {
+    let plan = std::plan::change(["src/a.txt"]).env("GATE", "1").plan()?;
+    assert plan.selects("gated");
+    let plan = std::plan::of(["src/a.txt"])?;
+    assert !plan.selects("gated");
+}
+"#,
+    );
+    let output = project.citrus(&["test", "--text"]);
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

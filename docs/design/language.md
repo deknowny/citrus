@@ -148,7 +148,8 @@ A check whose commands Citrus understands needs no `#[paths]` (see
 ### Conditions
 
 `touched(x)`, `only(x)`, `without(x)` (a group, a check, or globs),
-`signal("name")`, `selected(check)`, `profile(name)`, combined with `&&`,
+`signal("name")`, `env("NAME=value")` (the plan's environment: the
+process's, or a test's `.env()`), `selected(check)`, `profile(name)`, combined with `&&`,
 `||` and `!`. A condition is a value of type `Cond`: it can live in a
 `const` and be built by a `const fn`.
 

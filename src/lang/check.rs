@@ -543,7 +543,7 @@ fn check_item_in(item: &Item, globals: &Globals, group: Option<&str>) -> Result<
 /// Attribute arguments are evaluated when the file loads.
 /// Conditions of the plan, usable in `#[when]`, `#![label]`, `const` and `const fn`.
 pub const CONDITION_FNS: &[&str] = &[
-    "touched", "only", "without", "signal", "selected", "profile",
+    "touched", "only", "without", "signal", "selected", "profile", "env",
 ];
 
 /// Attributes that name items, and the kind each names.
