@@ -635,7 +635,17 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
                     label: work.label(),
                     work: work.clone(),
                 };
-                code = i64::from(crate::model::execute(&step, &context.repo.root, false)?);
+                // A step may run `citrus apply`: it releases under this
+                // release's lock and records this version.
+                code = i64::from(crate::model::execute_env(
+                    &step,
+                    &context.repo.root,
+                    false,
+                    &[
+                        ("CITRUS_RELEASE_ID".to_owned(), release.id.clone()),
+                        ("CITRUS_RELEASE_VERSION".to_owned(), version.clone()),
+                    ],
+                )?);
                 if code != 0 {
                     break;
                 }

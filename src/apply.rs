@@ -175,10 +175,14 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
         .map(|(name, _)| name.clone())
         .collect();
     let short = &diff.head[..12.min(diff.head.len())];
-    let release_name = environment
-        .release_name
-        .replace("{short}", short)
-        .replace("{commit}", &diff.head);
+    // Inside a release unit's step: that release's version names it.
+    let release_name = match std::env::var("CITRUS_RELEASE_VERSION") {
+        Ok(version) if !version.is_empty() => version,
+        _ => environment
+            .release_name
+            .replace("{short}", short)
+            .replace("{commit}", &diff.head),
+    };
     let plan = Plan {
         environment: request.environment.clone(),
         commit: diff.head.clone(),
@@ -256,7 +260,11 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
         log: log.display().to_string(),
     };
     context.store.insert_release(&release, &steps)?;
-    if let Some(holder) = context.store.lock_environment(&request.environment, &id)? {
+    // A release unit's step applies under the lock its release holds.
+    let parent = std::env::var("CITRUS_RELEASE_ID").unwrap_or_default();
+    if let Some(holder) = context.store.lock_environment(&request.environment, &id)?
+        && holder != parent
+    {
         context.store.finish_release(
             &id,
             "cancelled",
@@ -615,10 +623,55 @@ fn build_artifact(
                 .repo
                 .log_dir()
                 .join(format!("build-{name}-{tag}.json"));
+            // A named builder (a remote BuildKit with its caches): created
+            // from `endpoint` the first time this machine needs it.
+            let builder = text(&artifact.build, "builder");
+            if let Some(builder) = &builder {
+                let known = Command::new("docker")
+                    .args(["buildx", "inspect", builder])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if !known {
+                    let endpoint = text(&artifact.build, "endpoint").with_context(|| {
+                        format!("builder {builder} is unknown here and has no build.endpoint")
+                    })?;
+                    let mut create = Command::new("docker");
+                    create.args([
+                        "buildx",
+                        "create",
+                        "--name",
+                        builder,
+                        "--driver",
+                        "docker-container",
+                    ]);
+                    for option in artifact
+                        .build
+                        .get("driver_opts")
+                        .and_then(|value| value.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| value.as_str())
+                    {
+                        create.args(["--driver-opt", option]);
+                    }
+                    if let Some(config) = text(&artifact.build, "config") {
+                        create
+                            .arg("--buildkitd-config")
+                            .arg(context.repo.root.join(config));
+                    }
+                    create.arg(&endpoint).envs(extra_env);
+                    run(&mut create)?;
+                }
+            }
             let mut docker = Command::new("docker");
+            docker.arg("buildx");
+            if let Some(builder) = &builder {
+                docker.args(["--builder", builder]);
+            }
             docker
                 .args([
-                    "buildx",
                     "build",
                     "--push",
                     "--tag",
