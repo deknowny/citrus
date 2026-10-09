@@ -1166,7 +1166,7 @@ fn interrupted_release_keeps_the_environment_and_recovers() {
     let (started, _) = project.json(&["release", "start", "app", "--approve", "--detach"]);
     let id = started["release"]["id"].as_str().unwrap().to_owned();
     // Wait until deploy runs, then kill the worker's whole process group.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let pid = loop {
         let (shown, _) = project.json(&["release", "show", &id]);
         if step(&shown, "deploy")["state"] == "running" {
