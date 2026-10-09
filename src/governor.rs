@@ -27,8 +27,9 @@ pub struct Config {
     pub floor: f64,
     /// Fraction of the machine the pool and production may use together.
     pub target: f64,
-    /// The pool's cgroup directory, when the agent runs its checks in one.
-    pub cgroup: Option<PathBuf>,
+    /// The slice the agent's check containers run in, when it has one. The
+    /// cgroup exists only while checks run, so it is looked up on every tick.
+    pub slice: Option<String>,
 }
 
 /// One measurement over the time since the previous one.
@@ -156,15 +157,15 @@ fn parse_usage_usec(text: &str) -> Option<f64> {
 
 pub struct Sampler {
     cores: f64,
-    cgroup: Option<PathBuf>,
+    slice: Option<String>,
     last: Option<(f64, f64, Option<f64>, Instant)>,
 }
 
 impl Sampler {
-    pub fn new(cores: f64, cgroup: Option<PathBuf>) -> Sampler {
+    pub fn new(cores: f64, slice: Option<String>) -> Sampler {
         Sampler {
             cores,
-            cgroup,
+            slice,
             last: None,
         }
     }
@@ -174,8 +175,9 @@ impl Sampler {
         let stat = std::fs::read_to_string("/proc/stat").ok()?;
         let (busy, total) = parse_stat(&stat)?;
         let usage = self
-            .cgroup
-            .as_ref()
+            .slice
+            .as_deref()
+            .and_then(slice_dir)
             .and_then(|dir| std::fs::read_to_string(dir.join("cpu.stat")).ok())
             .and_then(|text| parse_usage_usec(&text));
         let now = Instant::now();
@@ -234,7 +236,7 @@ mod tests {
             share: 10.0,
             floor: 1.0,
             target: 0.8,
-            cgroup: None,
+            slice: None,
         }
     }
 

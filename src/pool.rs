@@ -929,10 +929,9 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
             share: share as f64,
             floor: options.min_cpus.unwrap_or(1.0).clamp(0.1, share as f64),
             target: options.target_util.unwrap_or(0.8).clamp(0.1, 1.0),
-            cgroup: std::env::var("CITRUS_AGENT_CGROUP_PARENT")
+            slice: std::env::var("CITRUS_AGENT_CGROUP_PARENT")
                 .ok()
-                .filter(|value| !value.is_empty())
-                .and_then(|slice| crate::governor::slice_dir(&slice)),
+                .filter(|value| !value.is_empty()),
         };
         let (stop, allowed, budget, throttle) = (
             stop.clone(),
@@ -942,7 +941,7 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
         );
         let (name, slots) = (machine.name.clone(), machine.slots);
         Some(std::thread::spawn(move || {
-            let mut sampler = crate::governor::Sampler::new(config.cores, config.cgroup.clone());
+            let mut sampler = crate::governor::Sampler::new(config.cores, config.slice.clone());
             let mut current = config.share;
             let mut announced = current;
             while !stop.load(Ordering::SeqCst) {
@@ -955,8 +954,9 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
                     );
                     budget.store((current * 1000.0) as usize, Ordering::SeqCst);
                     *throttle.lock().unwrap() = decision.reason;
-                    if let Some(dir) = &config.cgroup {
-                        crate::governor::limit_cgroup(dir, current);
+                    if let Some(dir) = config.slice.as_deref().and_then(crate::governor::slice_dir)
+                    {
+                        crate::governor::limit_cgroup(&dir, current);
                     }
                     if (current - announced).abs() >= 1.0 {
                         eprintln!(
@@ -976,8 +976,8 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
                     std::thread::sleep(Duration::from_millis(200));
                 }
             }
-            if let Some(dir) = &config.cgroup {
-                crate::governor::limit_cgroup(dir, config.share);
+            if let Some(dir) = config.slice.as_deref().and_then(crate::governor::slice_dir) {
+                crate::governor::limit_cgroup(&dir, config.share);
             }
         }))
     };
