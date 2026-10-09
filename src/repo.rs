@@ -118,10 +118,13 @@ impl Repo {
     pub fn snapshot(&self) -> Result<String> {
         let dir = self.state_dir().join("tmp");
         private_dir(&dir)?;
+        // Batches of one agent share the mirror's Git directory: the name
+        // carries the tree and a random part besides the pid.
         let index = dir.join(format!(
-            "index-{}-{}",
-            std::process::id(),
-            crate::manifest::now()
+            "index-{}-{}-{}",
+            crate::exec::unique(),
+            crate::manifest::now(),
+            short_path_hash(&self.root)
         ));
         let current = PathBuf::from(self.git(&[
             "rev-parse",
@@ -193,4 +196,10 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// A short stable name for a path (temporary files of different trees).
+fn short_path_hash(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(path.to_string_lossy().as_bytes())[..4])
 }

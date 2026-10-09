@@ -1399,6 +1399,17 @@ pub fn agent() -> String {
     std::env::var("CITRUS_AGENT").unwrap_or_else(|_| "human".into())
 }
 
+/// A temporary file's distinguishing part: the pid alone repeats across the
+/// containers of one agent (each executor is pid 7 or so there).
+pub fn unique() -> String {
+    format!(
+        "{}-{:04x}{:04x}",
+        std::process::id(),
+        random16(),
+        random16()
+    )
+}
+
 pub fn random16() -> u16 {
     let mut bytes = [0u8; 2];
     if fs::File::open("/dev/urandom")

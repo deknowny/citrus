@@ -447,7 +447,7 @@ fn signals(
     crate::repo::private_dir(&dir)?;
     let file = dir.join(format!(
         "signal-paths-{}-{}",
-        std::process::id(),
+        crate::exec::unique(),
         crate::manifest::now()
     ));
     std::fs::write(

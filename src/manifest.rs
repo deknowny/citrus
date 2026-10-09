@@ -241,7 +241,7 @@ impl Manifest {
             &hex::encode(Sha256::digest(&text))[..16]
         ));
         if !path.exists() {
-            let partial = path.with_extension(format!("{}.part", std::process::id()));
+            let partial = path.with_extension(format!("{}.part", crate::exec::unique()));
             fs::write(&partial, &text)?;
             fs::rename(&partial, &path)?;
         }
@@ -526,7 +526,7 @@ impl Receipts {
         let path = self.path(target, fingerprint);
         let temporary = self
             .dir
-            .join(format!(".receipt-citrus-{}", std::process::id()));
+            .join(format!(".receipt-citrus-{}", crate::exec::unique()));
         fs::write(
             &temporary,
             format!(
