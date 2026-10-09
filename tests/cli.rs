@@ -1906,6 +1906,9 @@ fn apply_builds_by_key_rolls_by_digest_and_records_the_commit() {
         [
             "build:api",
             "build:migrations",
+            // The unproven check runs while the images build; nothing
+            // changes before it passed.
+            "gate",
             "quiesce",
             "migrate",
             "roll:api",

@@ -17,7 +17,7 @@ use crate::deploy::{self, COMMIT_ANNOTATION, Environment, KEY_ANNOTATION};
 use crate::exec::{Context, agent, read_log, segment};
 use crate::manifest::now;
 use crate::report::{self, compact_utc};
-use crate::state::Release;
+use crate::state::{Release, ReleaseStep};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Build {
@@ -49,6 +49,9 @@ struct Plan {
     migrate: Option<String>,
     quiesce: Vec<String>,
     rolls: Vec<Roll>,
+    /// The checks the shipped change needs, running while it builds.
+    #[serde(default)]
+    gate: Option<crate::release::Gate>,
 }
 
 #[derive(Debug)]
@@ -91,9 +94,11 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
     if diff.workloads.iter().all(|item| item.change == "unchanged") {
         return Ok(None);
     }
-    if environment.checks == "proven" && !request.unchecked {
-        crate::release::prove_shipped(&mut *context, &request.environment)?;
-    }
+    let gate = if environment.checks == "proven" && !request.unchecked {
+        crate::release::start_gate(&mut *context, &request.environment)?
+    } else {
+        None
+    };
     let artifacts = deploy::artifacts(context)?;
     let mut builds: Vec<Build> = Vec::new();
     let mut rolls = Vec::new();
@@ -191,6 +196,7 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
         migrate,
         quiesce,
         rolls,
+        gate,
     };
 
     let mut steps = Vec::new();
@@ -202,6 +208,10 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
             .iter()
             .map(|build| format!("build:{}", build.artifact)),
     );
+    // Nothing changes in the environment before its checks passed.
+    if plan.gate.is_some() {
+        steps.push("gate".into());
+    }
     if !plan.quiesce.is_empty() {
         steps.push("quiesce".into());
     }
@@ -295,6 +305,61 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
     let artifacts = deploy::artifacts(context)?;
     let env_file = std::path::Path::new(&release.log).with_extension("env");
     let quiesced_file = std::path::Path::new(&release.log).with_extension("quiesced");
+    // The builds run side by side (one `citrus artifacts --build` each, after
+    // `prepare` gave them their environment); the other steps one by one.
+    let prepared = context.store.release_steps(id)?.iter().all(|step| {
+        step.name != "prepare" || matches!(step.state.as_str(), "passed" | "recovered")
+    });
+    let builds: Vec<ReleaseStep> = context
+        .store
+        .release_steps(id)?
+        .into_iter()
+        .filter(|step| step.name.starts_with("build:"))
+        .filter(|step| !matches!(step.state.as_str(), "passed" | "recovered"))
+        .collect();
+    if prepared && builds.len() > 1 {
+        let extra_env = read_env(&env_file);
+        let started = now();
+        let mut children = Vec::new();
+        for mut step in builds {
+            println!("CITRUS_STEP target={} status=START", step.name);
+            step.state = "running".into();
+            context.store.update_step(id, &step)?;
+            let name = step.name.trim_start_matches("build:").to_owned();
+            let child = Command::new(std::env::current_exe()?)
+                .args(["artifacts", "--build", &name, "--text"])
+                .envs(&extra_env)
+                .current_dir(&context.repo.root)
+                .spawn()?;
+            children.push((step, child));
+        }
+        let mut failed = None;
+        for (mut step, mut child) in children {
+            let ok = child.wait()?.success();
+            step.seconds = Some((now() - started) as i64);
+            step.exit = Some(if ok { 0 } else { 1 });
+            step.state = if ok { "passed" } else { "failed" }.into();
+            println!(
+                "CITRUS_STEP target={} status={} exit={} seconds={}",
+                step.name,
+                if ok { "PASS" } else { "FAIL" },
+                if ok { 0 } else { 1 },
+                step.seconds.unwrap_or_default()
+            );
+            if !ok {
+                step.first_error = Some(format!("the build of {} failed", step.name));
+                failed.get_or_insert(step.name.clone());
+            }
+            context.store.update_step(id, &step)?;
+        }
+        if let Some(name) = failed {
+            context
+                .store
+                .finish_release(id, "failed", &format!("step {name} failed"))?;
+            context.store.unlock_environment(&release.environment, id)?;
+            return Ok(());
+        }
+    }
     for mut step in context.store.release_steps(id)? {
         if matches!(step.state.as_str(), "passed" | "recovered") {
             continue;
@@ -418,6 +483,10 @@ fn run_step(
             .store
             .put_artifact_reference(name, &build.key, &reference)?;
         return Ok(());
+    }
+    if step == "gate" {
+        let gate = plan.gate.as_ref().context("no gate in the plan")?;
+        return crate::release::finish_gate(context, gate);
     }
     if step == "quiesce" {
         let mut suspended = Vec::new();
