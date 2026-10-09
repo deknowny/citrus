@@ -297,6 +297,10 @@ enum Command {
         /// Disk the slots' Cargo target directories may use together (GiB)
         #[arg(long, value_name = "GIB", default_value_t = 200)]
         cache_gib: u64,
+        /// Write bandwidth the pool's checks may use on the cache disk (MiB/s);
+        /// the agent halves it while the disk syncs slowly. 0 = no limit
+        #[arg(long, value_name = "MIB", default_value_t = 200.0)]
+        io_mib: f64,
     },
     /// The pool: its agents, their load, and the checks queued and running.
     Pool {
@@ -659,6 +663,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             min_cpus,
             target_util,
             cache_gib,
+            io_mib,
         }) => {
             return pool::agent(&pool::AgentOptions {
                 name: name.clone(),
@@ -672,6 +677,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
                 min_cpus: *min_cpus,
                 target_util: Some(*target_util),
                 cache_gib: Some(*cache_gib),
+                io_mib: Some(*io_mib),
             });
         }
         Some(Command::Pool { action }) => return pool_command(action.as_ref(), json),

@@ -45,6 +45,10 @@ pub struct Sample {
     pub io_pressure: f64,
     /// MemAvailable / MemTotal.
     pub memory_free: f64,
+    /// Worst `fdatasync` of a small file on the cache disk over the last few
+    /// ticks, milliseconds: what etcd and every database on the machine feel
+    /// (0 when there is no probe).
+    pub fsync_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,6 +62,8 @@ pub struct Decision {
 const CPU_PRESSURE_LIMIT: f64 = 25.0;
 const IO_PRESSURE_LIMIT: f64 = 10.0;
 const MEMORY_FREE_LIMIT: f64 = 0.08;
+/// A healthy NVMe mirror syncs in a few ms; etcd complains at 100 ms.
+pub const FSYNC_LIMIT_MS: f64 = 40.0;
 /// Added per tick while there is room (CPUs).
 const GROW: f64 = 0.5;
 /// The pool is blamed for pressure only when it uses at least this many CPUs.
@@ -73,6 +79,8 @@ pub fn decide(config: &Config, previous: f64, sample: &Sample) -> Decision {
         (true, "cpu pressure")
     } else if sample.io_pressure > IO_PRESSURE_LIMIT {
         (true, "disk pressure")
+    } else if sample.fsync_ms > FSYNC_LIMIT_MS {
+        (true, "disk latency")
     } else if sample.memory_free < MEMORY_FREE_LIMIT {
         (true, "low memory")
     } else {
@@ -241,6 +249,7 @@ impl Sampler {
             })
             .unwrap_or(0.0),
             memory_free: read(Path::new("/proc/meminfo"), parse_memory).unwrap_or(1.0),
+            fsync_ms: 0.0,
         })
     }
 }
@@ -261,6 +270,128 @@ pub fn limit_cgroup(dir: &Path, budget: f64) -> bool {
 pub fn slice_dir(slice: &str) -> Option<PathBuf> {
     let dir = Path::new("/sys/fs/cgroup").join(slice);
     dir.join("cpu.stat").is_file().then_some(dir)
+}
+
+/// Times `fdatasync` of a small file the way a write-ahead log does it. The
+/// worst of the last few probes counts: a stall is what hurts, not the mean.
+pub struct DiskProbe {
+    file: std::fs::File,
+    path: PathBuf,
+    recent: std::collections::VecDeque<f64>,
+}
+
+impl DiskProbe {
+    const KEEP: usize = 3;
+
+    /// A probe file in `dir` (which must be on the disk production syncs to).
+    pub fn new(dir: &Path) -> Option<DiskProbe> {
+        std::fs::create_dir_all(dir).ok()?;
+        // Files of agents that were killed.
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fsync-probe-")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let path = dir.join(format!(".fsync-probe-{}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .ok()?;
+        Some(DiskProbe {
+            file,
+            path,
+            recent: Default::default(),
+        })
+    }
+
+    /// One probe; the worst latency of the last few, in milliseconds.
+    pub fn probe(&mut self) -> f64 {
+        use std::io::{Seek, SeekFrom, Write};
+        let started = Instant::now();
+        let synced = self
+            .file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.file.write_all(&[0x5a; 8192]))
+            .and_then(|_| self.file.sync_data());
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        // A failed write says nothing about latency.
+        if synced.is_ok() {
+            self.recent.push_back(ms);
+            if self.recent.len() > Self::KEEP {
+                self.recent.pop_front();
+            }
+        }
+        self.recent.iter().copied().fold(0.0, f64::max)
+    }
+}
+
+impl Drop for DiskProbe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The write bandwidth the pool's cgroup may use on the cache disk: halved
+/// while the disk's sync latency is high, restored step by step when it calms.
+/// It is what keeps a build's dirty pages from starving production's `fsync`.
+pub struct WriteLimit {
+    device: String,
+    cap: f64,
+    floor: f64,
+    current: f64,
+}
+
+impl WriteLimit {
+    /// `cap_mib` MiB/s at most, never below a tenth of it (at least 8).
+    /// None off Linux or when the disk is not a block device.
+    pub fn new(dir: &Path, cap_mib: f64) -> Option<WriteLimit> {
+        use std::os::unix::fs::MetadataExt;
+        if cap_mib <= 0.0 {
+            return None;
+        }
+        let dev = std::fs::metadata(dir).ok()?.dev();
+        // glibc's major()/minor().
+        let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+        let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+        if major == 0 {
+            return None;
+        }
+        Some(WriteLimit {
+            device: format!("{major}:{minor}"),
+            cap: cap_mib,
+            floor: (cap_mib / 10.0).max(8.0).min(cap_mib),
+            current: cap_mib,
+        })
+    }
+
+    /// The limit after a tick with the disk this slow (MiB/s).
+    pub fn adjust(&mut self, fsync_ms: f64) -> f64 {
+        self.current = if fsync_ms > FSYNC_LIMIT_MS {
+            (self.current * 0.5).max(self.floor)
+        } else if fsync_ms > FSYNC_LIMIT_MS / 2.0 {
+            self.current
+        } else {
+            (self.current * 1.25 + 1.0).min(self.cap)
+        };
+        self.current
+    }
+
+    /// Writes `io.max` for the slice; best effort like the CPU limit.
+    pub fn apply(&self, dir: &Path) -> bool {
+        let bytes = (self.current * 1024.0 * 1024.0) as u64;
+        std::fs::write(dir.join("io.max"), format!("{} wbps={bytes}", self.device)).is_ok()
+    }
+
+    /// Lifts the limit (the agent leaves).
+    pub fn lift(&self, dir: &Path) -> bool {
+        std::fs::write(dir.join("io.max"), format!("{} wbps=max", self.device)).is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +415,7 @@ mod tests {
             cpu_pressure: 0.0,
             io_pressure: 0.0,
             memory_free: 0.5,
+            fsync_ms: 0.0,
         }
     }
 
@@ -384,5 +516,44 @@ mod tests {
             parse_usage_usec("usage_usec 5000000\nuser_usec 1\n"),
             Some(5e6)
         );
+    }
+
+    #[test]
+    fn slow_syncs_cut_the_pool_and_halve_its_write_limit() {
+        let mut sample = calm(8.0, 6.0);
+        sample.fsync_ms = 300.0;
+        let decision = decide(&config(), 12.0, &sample);
+        assert_eq!(decision.reason, "disk latency");
+        assert!(decision.budget < 12.0);
+        let mut limit = WriteLimit {
+            device: "9:1".into(),
+            cap: 200.0,
+            floor: 20.0,
+            current: 200.0,
+        };
+        assert_eq!(limit.adjust(300.0), 100.0);
+        assert_eq!(limit.adjust(300.0), 50.0);
+        assert_eq!(limit.adjust(300.0), 25.0);
+        assert_eq!(limit.adjust(300.0), 20.0, "never below the floor");
+        assert_eq!(
+            limit.adjust(30.0),
+            20.0,
+            "holds while the disk is not yet calm"
+        );
+        assert!(limit.adjust(3.0) > 20.0, "recovers when it is");
+        for _ in 0..40 {
+            limit.adjust(3.0);
+        }
+        assert_eq!(limit.adjust(3.0), 200.0, "back to the cap");
+    }
+
+    #[test]
+    fn a_probe_on_a_real_disk_reports_a_latency() {
+        let dir = std::env::temp_dir().join(format!("citrus-probe-{}", std::process::id()));
+        let mut probe = DiskProbe::new(&dir).unwrap();
+        let ms = probe.probe();
+        assert!(ms > 0.0 && ms < 5000.0, "{ms}");
+        drop(probe);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

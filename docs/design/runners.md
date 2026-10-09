@@ -102,6 +102,13 @@ kernel's pressure counters (PSI) for CPU, disk and memory:
   and is written to the pool's cgroup (`cpu.max` of `CITRUS_AGENT_CGROUP_PARENT`),
   so checks already running slow down too, and the agent restores the full
   share when it stops;
+- the disk is watched by what production feels: every tick the agent times an
+  8 KiB `fdatasync` on the cache disk (the shape of a write-ahead log's sync;
+  the worst of the last three counts). Above 40 ms it cuts the budget like any
+  pressure (`disk latency`) and halves the pool cgroup's write bandwidth
+  (`io.max wbps` of the cache disk, from `--io-mib`, default 200 MiB/s, never
+  below a tenth of it); it grows back by a quarter per calm tick. A build's
+  dirty pages are what stalls a database's sync, so the cap acts at the source;
 - `citrus pool` shows `limited to N CPUs (reason)` while an agent holds back.
 
 A production node can therefore offer a generous `--share` and still get out of
@@ -112,6 +119,7 @@ the way when the node's own workloads need the CPUs.
 ```
 citrus agent [--share N] [--labels a,b] [--name NAME]   # join the pool
              [--min-cpus N] [--target-util F] [--fixed]  # adapt to the machine's own load
+             [--io-mib N]                                # write bandwidth cap, halved while syncs are slow
 citrus pool                     # agents, their load, queued and running checks
 citrus pool drain NAME          # finish current checks, take no more
 citrus run --remote             # through the pool when one is configured

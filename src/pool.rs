@@ -714,6 +714,8 @@ pub struct AgentOptions {
     pub fixed: bool,
     /// The least CPUs the pool keeps under pressure (default 1).
     pub min_cpus: Option<f64>,
+    /// Write bandwidth cap for the pool's cgroup on the cache disk, MiB/s.
+    pub io_mib: Option<f64>,
     /// Fraction of the machine the pool and the rest may use together (default 0.8).
     pub target_util: Option<f64>,
     /// The most disk the Cargo target directories of the slots may use together (GiB, default 200).
@@ -945,14 +947,20 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
             throttle.clone(),
         );
         let (name, slots) = (machine.name.clone(), machine.slots);
+        let cache = machine.cache.clone();
+        let io_mib = options.io_mib.unwrap_or(200.0);
         Some(std::thread::spawn(move || {
             let mut sampler = crate::governor::Sampler::new(config.cores, config.slice.clone());
+            let mut probe = crate::governor::DiskProbe::new(&cache);
+            let mut write_limit = crate::governor::WriteLimit::new(&cache, io_mib);
             let mut current = config.share;
             let mut announced = current;
             let mut announced_at = Instant::now() - Duration::from_secs(60);
             let mut smoother = crate::governor::Smoother::default();
             while !stop.load(Ordering::SeqCst) {
-                if let Some(sample) = sampler.sample() {
+                let fsync_ms = probe.as_mut().map_or(0.0, |probe| probe.probe());
+                if let Some(mut sample) = sampler.sample() {
+                    sample.fsync_ms = fsync_ms;
                     let sample = smoother.smooth(sample);
                     let decision = crate::governor::decide(&config, current, &sample);
                     current = decision.budget;
@@ -965,6 +973,10 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
                     if let Some(dir) = config.slice.as_deref().and_then(crate::governor::slice_dir)
                     {
                         crate::governor::limit_cgroup(&dir, current);
+                        if let Some(limit) = write_limit.as_mut() {
+                            limit.adjust(fsync_ms);
+                            limit.apply(&dir);
+                        }
                     }
                     if (current - announced).abs() >= 1.0
                         && announced_at.elapsed() >= Duration::from_secs(30)
@@ -989,6 +1001,9 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
             }
             if let Some(dir) = config.slice.as_deref().and_then(crate::governor::slice_dir) {
                 crate::governor::limit_cgroup(&dir, config.share);
+                if let Some(limit) = write_limit.as_ref() {
+                    limit.lift(&dir);
+                }
             }
         }))
     };
