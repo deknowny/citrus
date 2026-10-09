@@ -891,7 +891,28 @@ fn set_image<'a>(
         .flatten()
         .find(|entry| entry["name"] == container)
         .with_context(|| format!("no container {container}"))?;
+    let previous = entry["image"]
+        .as_str()
+        .map(|old| repository(old).to_owned());
     entry["image"] = image.into();
+    let entry = entry.clone();
+    // Other containers of the pod running the same repository (an init
+    // container preparing for it) take the same build.
+    for list in ["containers", "initContainers"] {
+        for other in spec[list].as_array_mut().into_iter().flatten() {
+            if other["name"] != container
+                && other["image"].as_str().map(repository) == previous.as_deref()
+            {
+                other["image"] = image.into();
+            }
+        }
+    }
+    let entry = spec["containers"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .find(|item| item["name"] == entry["name"])
+        .context("container")?;
     if let Some((variable, value)) = variable {
         let mut env: Vec<serde_json::Value> = entry["env"]
             .as_array()
@@ -904,6 +925,15 @@ fn set_image<'a>(
         entry["env"] = env.into();
     }
     Ok(item)
+}
+
+/// `registry/name` of an image reference, without its tag or digest.
+fn repository(image: &str) -> &str {
+    let image = image.split('@').next().unwrap_or(image);
+    match image.rsplit_once(':') {
+        Some((name, tag)) if !tag.contains('/') => name,
+        _ => image,
+    }
 }
 
 fn kubectl(environment: &Environment, extra_env: &BTreeMap<String, String>) -> Command {

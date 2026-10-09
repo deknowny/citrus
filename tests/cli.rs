@@ -1672,7 +1672,7 @@ environment staging;
         "k8s/api.json",
         r#"{"kind": "List", "items": [
   {"kind": "Service", "metadata": {"name": "api"}},
-  {"kind": "Deployment", "metadata": {"name": "api"}, "spec": {"template": {"spec": {"containers": [
+  {"kind": "Deployment", "metadata": {"name": "api"}, "spec": {"template": {"spec": {"initContainers": [{"name": "prepare", "image": "placeholder"}], "containers": [
     {"name": "api", "image": "placeholder", "env": [{"name": "LIMIT", "value": "5"}]}]}}}}
 ]}"#,
     );
@@ -1708,6 +1708,14 @@ environment staging;
     let env = &items[1]["spec"]["template"]["spec"]["containers"][0]["env"];
     assert_eq!(env[0]["name"], "LIMIT", "{state}");
     assert_eq!(env[1]["name"], "APP_VERSION", "{state}");
+    // An init container of the same image takes the build too.
+    let init = &items[1]["spec"]["template"]["spec"]["initContainers"][0]["image"];
+    assert!(
+        init.as_str()
+            .unwrap()
+            .starts_with("registry.example/web@sha256:"),
+        "{state}"
+    );
 }
 
 #[test]
