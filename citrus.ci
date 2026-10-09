@@ -21,7 +21,10 @@ check test {
     run!("docker exec {name} sh -c 'until pg_isready -U postgres -h 127.0.0.1 -q; do sleep 0.2; done'")?;
     let port = cmd!("docker port {name} 5432").output()?.stdout.trim().split(":").last().unwrap_or("");
     let url = "postgres://postgres:t@127.0.0.1:{port}/postgres?sslmode=disable";
-    let tests = cmd!("cargo test --locked --bins --test cli").env("CITRUS_TEST_STATE", url).output()?;
+    // On an agent the daemon is the host's: the tests' bind mounts would not
+    // reach it, so they see no Docker there.
+    let hidden = if std::env::var("CITRUS_POOL_RUN").is_some() { "unix:///nonexistent" } else { "" };
+    let tests = cmd!("cargo test --locked --bins --test cli").env("CITRUS_TEST_STATE", url).env("DOCKER_HOST", hidden).output()?;
     run!("docker rm -f {name}")?;
     assert tests.code == 0, "{tests.stdout}\n{tests.stderr}";
 }
@@ -38,7 +41,10 @@ check pool {
     run!("docker exec {name} sh -c 'until pg_isready -U postgres -h 127.0.0.1 -q; do sleep 0.2; done'")?;
     let port = cmd!("docker port {name} 5432").output()?.stdout.trim().split(":").last().unwrap_or("");
     let url = "postgres://postgres:t@127.0.0.1:{port}/postgres?sslmode=disable";
-    let tests = cmd!("cargo test --locked --test pool").env("CITRUS_TEST_POOL", url).output()?;
+    // On an agent the daemon is the host's: the tests' bind mounts would not
+    // reach it, so they see no Docker there.
+    let hidden = if std::env::var("CITRUS_POOL_RUN").is_some() { "unix:///nonexistent" } else { "" };
+    let tests = cmd!("cargo test --locked --test pool").env("CITRUS_TEST_POOL", url).env("DOCKER_HOST", hidden).output()?;
     run!("docker rm -f {name}")?;
     assert tests.code == 0, "{tests.stdout}\n{tests.stderr}";
 }
