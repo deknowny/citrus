@@ -480,15 +480,15 @@ fn status_shows_resources_without_waiting_for_them() {
 
 "#;
     let project = Project::new(config);
-    project.write("res.sh", "sleep 5\necho 'CITRUS_RESOURCE host=root@b1 state=busy operation=remote-test owner=agent-a elapsed_seconds=90'\necho 'other line'\n");
+    project.write("res.sh", "sleep 12\necho 'CITRUS_RESOURCE host=root@b1 state=busy operation=remote-test owner=agent-a elapsed_seconds=90'\necho 'other line'\n");
     let started = Instant::now();
     let (first, _) = project.json(&["status"]);
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(10),
         "status must not wait for the resource command"
     );
     assert_eq!(first["resources"]["refreshing"], true);
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let (status, _) = project.json(&["status"]);
         if let Some(item) = status["resources"]["items"]

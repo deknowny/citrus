@@ -1088,6 +1088,16 @@ fn serve(
     let mut idle_since = Instant::now();
     let mut maintained = Instant::now() - Duration::from_secs(3600);
     let mut paused = false;
+    // Batch names must not repeat after a restart of the agent: the state schema
+    // and the container of a stopped batch are still being removed while the
+    // requeued checks run again under the next process.
+    let process = short_hash(&format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    ));
     let mut batches = 0usize;
     let result = loop {
         workers.retain(|worker| !worker.is_finished());
@@ -1141,7 +1151,7 @@ fn serve(
         if let Some((run, checks)) = claimed {
             free.fetch_sub(checks.len(), Ordering::SeqCst);
             batches += 1;
-            let batch = format!("{}-{batches}", run.id);
+            let batch = format!("{}-{}-{batches}", run.id, &process[..6]);
             let (url, machine) = (url.to_owned(), machine.clone());
             let (free, fatal) = (free.clone(), fatal.clone());
             workers.push(std::thread::spawn(move || {
