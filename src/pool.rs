@@ -1375,8 +1375,13 @@ fn git_at(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// The run's tree in a worktree of a cached mirror of its repository.
-fn checkout(machine: &Machine, run: &RunRow, batch: &str) -> Result<(PathBuf, PathBuf)> {
+/// The run's commit in the tree of a slot: a worktree of a cached mirror of the
+/// repository, at a path that never changes (see `slots`).
+fn checkout(
+    machine: &Machine,
+    run: &RunRow,
+    slot: &crate::slots::Slot,
+) -> Result<(PathBuf, PathBuf)> {
     // Batches of one agent share the mirror: one fetch or worktree at a time.
     static MIRRORS: Mutex<()> = Mutex::new(());
     let _guard = MIRRORS
@@ -1390,36 +1395,40 @@ fn checkout(machine: &Machine, run: &RunRow, batch: &str) -> Result<(PathBuf, Pa
         std::fs::create_dir_all(&mirror)?;
         git_at(&mirror, &["init", "--bare", "-q"])?;
     }
-    let tree = batch_tree(machine, run, batch);
-    if !tree.join(".git").exists() {
-        let commit = format!("{}^{{commit}}", run.commit);
-        if git_at(&mirror, &["cat-file", "-e", &commit]).is_err() {
-            let spec = format!("+{}:{}", run.refname, run.refname);
-            git_at(&mirror, &["fetch", "-q", "--no-tags", &run.repo, &spec])?;
-        }
-        std::fs::create_dir_all(tree.parent().context("work dir")?)?;
+    let commit = format!("{}^{{commit}}", run.commit);
+    if git_at(&mirror, &["cat-file", "-e", &commit]).is_err() {
+        let spec = format!("+{}:{}", run.refname, run.refname);
+        git_at(&mirror, &["fetch", "-q", "--no-tags", &run.repo, &spec])?;
+    }
+    let tree = slot.tree();
+    if tree.join(".git").exists() {
+        // Unchanged files keep their times, so Cargo rebuilds what changed.
+        git_at(
+            &tree,
+            &["checkout", "-q", "--force", "--detach", &run.commit],
+        )?;
+        // Whatever the previous run left behind, ignored files included.
+        git_at(&tree, &["clean", "-ffdxq"])?;
+    } else {
+        let _ = std::fs::remove_dir_all(&tree);
+        std::fs::create_dir_all(tree.parent().context("slot dir")?)?;
+        let _ = git_at(&mirror, &["worktree", "prune"]);
         let target = tree.to_string_lossy().into_owned();
         git_at(
             &mirror,
-            &["worktree", "add", "-q", "--detach", &target, &run.commit],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--force",
+                "--detach",
+                &target,
+                &run.commit,
+            ],
         )?;
-        // A fresh checkout must not make Cargo recompile unchanged sources.
-        let ledger = machine
-            .cache
-            .join("source-times")
-            .join(format!("{}.json", short_hash(&run.repo)));
-        if let Err(error) = crate::source_times::restore(&ledger, &tree) {
-            eprintln!("citrus agent: source times not restored: {error:#}");
-        }
-        overlay(&machine_files(&run.repo), &tree)?;
     }
+    overlay(&machine_files(&run.repo), &tree)?;
     Ok((mirror, tree))
-}
-
-/// A batch's own tree under its run's directory (`work/<run>/<batch>`), so
-/// batches of one run on one machine never share files or test stacks.
-fn batch_tree(machine: &Machine, run: &RunRow, batch: &str) -> PathBuf {
-    machine.cache.join("work").join(&run.id).join(batch)
 }
 
 /// Files this machine adds to every tree of a repository (`#![private]`
@@ -1764,6 +1773,30 @@ fn build_image(tree: &Path, image: &crate::model::Image) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// The Cargo target directories an image's environment names (see `slots`).
+fn slot_targets(image: &str) -> Vec<String> {
+    let output = Command::new("docker")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}",
+            image,
+        ])
+        .stdin(Stdio::null())
+        .output();
+    let mut names = match output {
+        Ok(output) if output.status.success() => {
+            crate::slots::target_dirs(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => Vec::new(),
+    };
+    if !names.iter().any(|name| name == "cargo-target") {
+        names.insert(0, "cargo-target".to_owned());
+    }
+    names
+}
+
 fn execute(
     client: &mut Client,
     machine: &Machine,
@@ -1782,18 +1815,21 @@ fn execute(
             format!("CITRUS_STAGE {} runs {}", machine.name, checks.join(", ")),
         ],
     )?;
-    if !batch_tree(machine, run, batch).join(".git").exists() {
-        emit(
-            client,
-            &run.id,
-            &machine.name,
-            &[format!(
-                "CITRUS_STAGE {} fetches the snapshot",
-                machine.name
-            )],
-        )?;
-    }
-    let (mirror, tree) = checkout(machine, run, batch)?;
+    // A tree of its own for the batch, at a path that stays the same between runs.
+    let slot = crate::slots::claim(
+        &machine.cache.join("slots").join(short_hash(&run.repo)),
+        machine.slots,
+    )?;
+    emit(
+        client,
+        &run.id,
+        &machine.name,
+        &[format!(
+            "CITRUS_STAGE {} fetches the snapshot",
+            machine.name
+        )],
+    )?;
+    let (mirror, tree) = checkout(machine, run, &slot)?;
     let in_container = run.image.is_some() && machine.docker;
     let platform = if in_container {
         docker_platform()
@@ -1928,6 +1964,24 @@ fn execute(
             format!("citrus-cache-{}", short_hash(&run.repo))
         };
         command.arg("-v").arg(format!("{cache}:/citrus-cache"));
+        // Cargo's target directories belong to the slot: what Cargo built in
+        // this tree's path is only ever used in this tree's path.
+        for name in slot_targets(&image) {
+            let source = if std::env::consts::OS == "linux" {
+                let dir = slot.cache(&name);
+                std::fs::create_dir_all(&dir)?;
+                dir.to_string_lossy().into_owned()
+            } else {
+                format!(
+                    "citrus-slot-{}-{}-{name}",
+                    short_hash(&run.repo),
+                    slot.index
+                )
+            };
+            command
+                .arg("-v")
+                .arg(format!("{source}:/citrus-cache/{name}"));
+        }
         command
             .arg("-v")
             .arg(format!("{}:/usr/local/bin/citrus-pool:ro", exe.display()))
@@ -1963,6 +2017,9 @@ fn execute(
         let argv = with_prepare(&run.prepare, &exe.to_string_lossy(), &args);
         command = Command::new(&argv[0]);
         command.args(&argv[1..]).current_dir(&tree);
+        let target = slot.cache("cargo-target");
+        std::fs::create_dir_all(&target)?;
+        command.env("CARGO_TARGET_DIR", target);
         for (key, value) in &env {
             command.env(key, value);
         }
@@ -2134,6 +2191,12 @@ fn maintain(client: &mut Client, machine: &Machine) -> Result<()> {
         "delete from citrus.runs where closed < now() - interval '7 days'",
         &[],
     )?;
+    // Slots nobody used for two weeks go with their build directories.
+    if let Ok(repos) = std::fs::read_dir(machine.cache.join("slots")) {
+        for repo in repos.flatten() {
+            crate::slots::remove_idle(&repo.path(), crate::slots::IDLE_DAYS);
+        }
+    }
     let work = machine.cache.join("work");
     let Ok(entries) = std::fs::read_dir(&work) else {
         return Ok(());
