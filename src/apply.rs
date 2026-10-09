@@ -62,6 +62,48 @@ pub struct Request {
     pub plan: Option<String>,
 }
 
+/// The migrations artifact and its key at HEAD, when they differ from what
+/// the running commit built (or nothing records a running commit).
+fn migration_change(
+    context: &Context,
+    environment: &deploy::Environment,
+    artifacts: &std::collections::BTreeMap<String, deploy::Artifact>,
+    diff: &deploy::Diff,
+) -> Result<Option<(String, String)>> {
+    let Some(migrations) = &environment.migrations else {
+        return Ok(None);
+    };
+    let artifact = artifacts
+        .get(&migrations.artifact)
+        .with_context(|| format!("unknown migrations artifact {}", migrations.artifact))?;
+    let paths = deploy::command_paths(context, artifact)?;
+    let (key, _) = deploy::key_at(
+        context,
+        &migrations.artifact,
+        artifact,
+        &diff.head,
+        paths.as_deref(),
+    )?;
+    let running = match &diff.running_commit {
+        Some(commit) => Some(
+            deploy::key_at(
+                context,
+                &migrations.artifact,
+                artifact,
+                commit,
+                paths.as_deref(),
+            )?
+            .0,
+        ),
+        None => None,
+    };
+    Ok(if running.as_deref() == Some(key.as_str()) {
+        None
+    } else {
+        Some((migrations.artifact.clone(), key))
+    })
+}
+
 /// Plan and gates; returns None when the environment already runs HEAD's build.
 pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>> {
     let environments = deploy::environments(context)?;
@@ -91,7 +133,10 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
             request.environment
         );
     }
-    if diff.workloads.iter().all(|item| item.change == "unchanged") {
+    let artifacts = deploy::artifacts(context)?;
+    let migration = migration_change(context, environment, &artifacts, &diff)?;
+    // A release of migrations alone changes no workload and still has work.
+    if diff.workloads.iter().all(|item| item.change == "unchanged") && migration.is_none() {
         return Ok(None);
     }
     let gate = if environment.checks == "proven" && !request.unchecked {
@@ -99,7 +144,6 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
     } else {
         None
     };
-    let artifacts = deploy::artifacts(context)?;
     let mut builds: Vec<Build> = Vec::new();
     let mut rolls = Vec::new();
     for item in diff
@@ -130,46 +174,15 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
             manifest: spec.manifest.clone(),
         });
     }
-    let migrate = match &environment.migrations {
-        Some(migrations) => {
-            let artifact = artifacts
-                .get(&migrations.artifact)
-                .with_context(|| format!("unknown migrations artifact {}", migrations.artifact))?;
-            let paths = deploy::command_paths(context, artifact)?;
-            let (key, _) = deploy::key_at(
-                context,
-                &migrations.artifact,
-                artifact,
-                &diff.head,
-                paths.as_deref(),
-            )?;
-            let running = match &diff.running_commit {
-                Some(commit) => Some(
-                    deploy::key_at(
-                        context,
-                        &migrations.artifact,
-                        artifact,
-                        commit,
-                        paths.as_deref(),
-                    )?
-                    .0,
-                ),
-                None => None,
-            };
-            if running.as_deref() == Some(key.as_str()) {
-                None
-            } else {
-                if !builds
-                    .iter()
-                    .any(|build| build.artifact == migrations.artifact)
-                {
-                    builds.push(Build {
-                        artifact: migrations.artifact.clone(),
-                        key,
-                    });
-                }
-                Some(migrations.artifact.clone())
+    let migrate = match migration {
+        Some((artifact, key)) => {
+            if !builds.iter().any(|build| build.artifact == artifact) {
+                builds.push(Build {
+                    artifact: artifact.clone(),
+                    key,
+                });
             }
+            Some(artifact)
         }
         None => None,
     };
@@ -551,6 +564,26 @@ fn run_step(
             &format!("job/{name}"),
             &format!("--timeout={}s", migrations.timeout),
         ]))?;
+        // Nothing rolls: the workloads still record this commit and release
+        // (metadata only, no restart), or the next apply migrates again.
+        if plan.rolls.is_empty() {
+            for (workload, spec) in &environment.workloads {
+                let mut annotate = kubectl(environment, extra_env);
+                annotate.args([
+                    "annotate",
+                    "--overwrite",
+                    &format!("{}/{workload}", spec.kind),
+                    &format!("{COMMIT_ANNOTATION}={}", plan.commit),
+                ]);
+                if !environment.record.annotation.is_empty() {
+                    annotate.arg(format!(
+                        "{}={}",
+                        environment.record.annotation, plan.release_name
+                    ));
+                }
+                run(&mut annotate)?;
+            }
+        }
         return Ok(());
     }
     if let Some(name) = step.strip_prefix("roll:") {

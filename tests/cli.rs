@@ -1598,6 +1598,13 @@ elif verb == "apply":
     save()
 elif verb == "wait":
     sys.exit(0 if state["jobs"] else 1)
+elif verb == "annotate":
+    kind, name = args[2].split("/")
+    target = state["deployments" if kind == "deployment" else "cronjobs"][name]
+    for pair in args[3:]:
+        key, value = pair.split("=", 1)
+        target["annotations"][key] = value
+    save()
 else:
     sys.exit("unsupported: " + " ".join(args))
 "#;
@@ -1855,6 +1862,74 @@ fn an_artifact_builds_alone_once_per_inputs() {
     assert_eq!(again["reference"], built["reference"]);
     let builds = fs::read_to_string(project.root().join(".kube/builds")).unwrap();
     assert_eq!(builds.lines().count(), 1, "{builds}");
+}
+
+/// A release of migrations alone runs them, rolls nothing and records the
+/// commit, so the next apply has nothing to do.
+#[test]
+fn apply_runs_migrations_that_changed_alone() {
+    let project = apply_project();
+    project.write("src/a.txt", "v2\n");
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "v2",
+    ]);
+    let (first, code) = project.json(&["apply", "prod", "--approve", "--unchecked"]);
+    assert_eq!(code, 0, "{first}");
+    let jobs = kube_state(&project)["jobs"].as_array().unwrap().len();
+
+    project.write("migrations/3.sql", "alter table t;\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "migration",
+    ]);
+    let head = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(project.root())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let (applied, code) = project.json(&["apply", "prod", "--approve", "--unchecked"]);
+    assert_eq!(code, 0, "{applied}");
+    let steps: Vec<&str> = applied["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .map(|step| step["name"].as_str().unwrap())
+        .collect();
+    assert!(steps.contains(&"migrate"), "{applied}");
+    assert!(
+        !steps.iter().any(|step| step.starts_with("roll:")),
+        "{applied}"
+    );
+    let state = kube_state(&project);
+    assert_eq!(state["jobs"].as_array().unwrap().len(), jobs + 1, "{state}");
+    assert_eq!(
+        state["deployments"]["api"]["annotations"]["citrus.dev/commit"],
+        head.as_str()
+    );
+    assert_eq!(
+        project
+            .json(&["apply", "prod", "--approve", "--unchecked"])
+            .0["state"],
+        "unchanged"
+    );
 }
 
 #[test]
