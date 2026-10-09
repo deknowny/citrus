@@ -354,7 +354,9 @@ fn select(
             if selected.contains(&target.name)
                 || ((!target.inputs.is_empty()
                     || !target.via.is_empty()
-                    || target.selected_by_follows)
+                    // Cargo's inputs choose a check that has no condition;
+                    // a `when` still decides on its own.
+                    || (target.selected_by_follows && target.when.is_none()))
                     && !touched.contains(&target.name)
                     && !edited_checks.contains(&target.name))
             {
