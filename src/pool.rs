@@ -944,8 +944,11 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
             let mut sampler = crate::governor::Sampler::new(config.cores, config.slice.clone());
             let mut current = config.share;
             let mut announced = current;
+            let mut announced_at = Instant::now() - Duration::from_secs(60);
+            let mut smoother = crate::governor::Smoother::default();
             while !stop.load(Ordering::SeqCst) {
                 if let Some(sample) = sampler.sample() {
+                    let sample = smoother.smooth(sample);
                     let decision = crate::governor::decide(&config, current, &sample);
                     current = decision.budget;
                     allowed.store(
@@ -958,7 +961,10 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
                     {
                         crate::governor::limit_cgroup(&dir, current);
                     }
-                    if (current - announced).abs() >= 1.0 {
+                    if (current - announced).abs() >= 1.0
+                        && announced_at.elapsed() >= Duration::from_secs(30)
+                    {
+                        announced_at = Instant::now();
                         eprintln!(
                             "citrus agent {name}: {current:.1} of {:.0} CPUs for the pool{}",
                             config.share,

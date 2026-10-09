@@ -100,6 +100,32 @@ pub fn decide(config: &Config, previous: f64, sample: &Sample) -> Decision {
     }
 }
 
+/// Exponentially smoothed measurements: one busy second must not move the budget.
+#[derive(Debug, Default)]
+pub struct Smoother {
+    busy: Option<f64>,
+    pool: Option<f64>,
+}
+
+impl Smoother {
+    const ALPHA: f64 = 0.2;
+
+    /// The sample with its CPU figures smoothed; pressure stays as measured
+    /// (the kernel already averages it over ten seconds).
+    pub fn smooth(&mut self, sample: Sample) -> Sample {
+        let blend = |old: &mut Option<f64>, new: f64| {
+            let value = old.map_or(new, |old| old + Self::ALPHA * (new - old));
+            *old = Some(value);
+            value
+        };
+        Sample {
+            busy: blend(&mut self.busy, sample.busy),
+            pool: blend(&mut self.pool, sample.pool),
+            ..sample
+        }
+    }
+}
+
 /// Checks the agent may run at once for a budget: a slot is `share / slots` CPUs.
 pub fn allowed_slots(budget: f64, share: f64, slots: usize) -> usize {
     let per_slot = (share / slots as f64).max(0.1);
@@ -300,6 +326,18 @@ mod tests {
             budget = decide(&config(), budget, &sample).budget;
         }
         assert_eq!(budget, 1.0);
+    }
+
+    #[test]
+    fn a_short_spike_barely_moves_the_smoothed_load() {
+        let mut smoother = Smoother::default();
+        let mut last = Sample::default();
+        for _ in 0..10 {
+            last = smoother.smooth(calm(10.0, 0.0));
+        }
+        assert!((last.busy - 10.0).abs() < 1e-9);
+        let spiked = smoother.smooth(calm(30.0, 0.0));
+        assert!((spiked.busy - 14.0).abs() < 1e-9, "{spiked:?}");
     }
 
     #[test]
