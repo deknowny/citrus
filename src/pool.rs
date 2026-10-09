@@ -1502,7 +1502,7 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
     Ok((commit, platform, sha))
 }
 
-/// The `X.Y.Z (<commit>)` version text a Citrus binary carries.
+/// The `X.Y.Z (<commit>)` version text a Citrus binary carries (`--version`).
 fn embedded_version(bytes: &[u8]) -> Option<String> {
     let hex = |c: &u8| c.is_ascii_hexdigit() && !c.is_ascii_uppercase();
     bytes.windows(42).enumerate().find_map(|(at, window)| {
