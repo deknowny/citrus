@@ -1560,9 +1560,24 @@ elif verb == "patch":
     save()
 elif verb == "rollout":
     sys.exit(1 if os.path.exists(".kube/fail-rollout") else 0)
+elif verb == "create" and "--dry-run=client" in args:
+    print(open(args[args.index("-f") + 1]).read())
 elif verb == "apply":
     manifest = sys.stdin.read()
-    state["jobs"].append(manifest)
+    try:
+        parsed = json.loads(manifest)
+    except ValueError:
+        parsed = None
+    if parsed and parsed.get("kind") == "List":
+        state.setdefault("applied", []).append(parsed)
+        for item in parsed["items"]:
+            if item["kind"] == "Deployment":
+                target = state["deployments"][item["metadata"]["name"]]
+                target["image"] = item["spec"]["template"]["spec"]["containers"][0]["image"]
+                target["annotations"].update(item["metadata"].get("annotations", {}))
+                state["lease"] = item["metadata"]["name"] + "-new-" + target["image"][-6:]
+    else:
+        state["jobs"].append(manifest)
     save()
 elif verb == "wait":
     sys.exit(0 if state["jobs"] else 1)
@@ -1632,6 +1647,64 @@ environment prod;
 fn kube_state(project: &Project) -> Value {
     serde_json::from_str(&fs::read_to_string(project.root().join(".kube/state.json")).unwrap())
         .unwrap()
+}
+
+#[test]
+fn apply_rolls_a_workload_from_its_manifest_with_the_built_image() {
+    let project = apply_project();
+    project.declare(
+        r#"
+/// The API image and its manifest.
+#[inputs("src/**", "k8s/api.json")]
+#[build(provider = "command", run = cmd!("sh -c 'echo IMAGE=registry.example/{{artifact}}@sha256:{{key}}'"))]
+artifact web;
+
+#[kubernetes(kubectl = "./kubectl.py", namespace = "shop")]
+#[deploy("api", web, manifest = "k8s/api.json", version_env = "APP_VERSION")]
+environment staging;
+"#,
+    );
+    // kubectl reads YAML or JSON; the fake one reads JSON.
+    project.write(
+        "k8s/api.json",
+        r#"{"kind": "List", "items": [
+  {"kind": "Service", "metadata": {"name": "api"}},
+  {"kind": "Deployment", "metadata": {"name": "api"}, "spec": {"template": {"spec": {"containers": [
+    {"name": "api", "image": "placeholder", "env": [{"name": "LIMIT", "value": "5"}]}]}}}}
+]}"#,
+    );
+    project.write("src/a.txt", "v2\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "manifest",
+    ]);
+    let (applied, code) = project.json(&["apply", "staging", "--approve"]);
+    assert_eq!(code, 0, "{applied}");
+    let state = kube_state(&project);
+    let api = &state["deployments"]["api"];
+    assert!(
+        api["image"]
+            .as_str()
+            .unwrap()
+            .starts_with("registry.example/web@sha256:"),
+        "{state}"
+    );
+    assert!(
+        api["annotations"]["citrus.dev/commit"].is_string(),
+        "{state}"
+    );
+    // The whole file was applied: its Service too, the spec's own variables kept.
+    let items = &state["applied"][0]["items"];
+    assert_eq!(items[0]["kind"], "Service", "{state}");
+    let env = &items[1]["spec"]["template"]["spec"]["containers"][0]["env"];
+    assert_eq!(env[0]["name"], "LIMIT", "{state}");
+    assert_eq!(env[1]["name"], "APP_VERSION", "{state}");
 }
 
 #[test]

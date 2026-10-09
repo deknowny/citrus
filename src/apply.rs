@@ -36,6 +36,8 @@ struct Roll {
     timeout: u64,
     #[serde(default)]
     version_env: String,
+    #[serde(default)]
+    manifest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +128,7 @@ pub fn start(context: &mut Context, request: &Request) -> Result<Option<Release>
             fence: spec.fence.clone(),
             timeout: spec.timeout,
             version_env: spec.version_env.clone(),
+            manifest: spec.manifest.clone(),
         });
     }
     let migrate = match &environment.migrations {
@@ -518,32 +521,66 @@ fn run_step(
                 plan.release_name.clone().into(),
             );
         }
-        let mut container = serde_json::json!({"name": roll.container, "image": image});
-        if !roll.version_env.is_empty() {
-            container["env"] =
-                serde_json::json!([{"name": roll.version_env, "value": plan.release_name}]);
-        }
-        let containers = serde_json::json!([container]);
-        let patch = if already {
-            // Same image: record only. Touching the pod template would restart it for nothing.
-            serde_json::json!({"metadata": {"annotations": annotations}})
-        } else if roll.kind == "cronjob" {
-            serde_json::json!({"metadata": {"annotations": annotations}, "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": containers}}}}}})
+        if !roll.manifest.is_empty() {
+            let mut manifest = workload_manifest(
+                context,
+                environment,
+                extra_env,
+                roll,
+                &image,
+                &plan.release_name,
+            )?;
+            let records = manifest
+                .iter_mut()
+                .find(|item| {
+                    item["kind"].as_str().map(str::to_lowercase).as_deref() == Some(&roll.kind)
+                        && item["metadata"]["name"] == name
+                })
+                .with_context(|| format!("{} holds no {} {name}", roll.manifest, roll.kind))?;
+            for (key, value) in &annotations {
+                records["metadata"]["annotations"][key] = value.clone();
+            }
+            let text = serde_json::to_string(
+                &serde_json::json!({"apiVersion": "v1", "kind": "List", "items": manifest}),
+            )?;
+            let mut apply = kubectl(environment, extra_env);
+            apply.args(["apply", "-f", "-"]).stdin(Stdio::piped());
+            let mut child = apply.spawn()?;
+            std::io::Write::write_all(child.stdin.as_mut().context("stdin")?, text.as_bytes())?;
+            drop(child.stdin.take());
+            if !child.wait()?.success() {
+                bail!("kubectl apply of {} failed", roll.manifest);
+            }
         } else {
-            serde_json::json!({"metadata": {"annotations": annotations}, "spec": {"template": {"metadata": {"annotations": annotations}, "spec": {"containers": containers}}}})
-        };
-        if already {
-            println!("{name} already runs {image}: recording the release without restarting it");
+            let mut container = serde_json::json!({"name": roll.container, "image": image});
+            if !roll.version_env.is_empty() {
+                container["env"] =
+                    serde_json::json!([{"name": roll.version_env, "value": plan.release_name}]);
+            }
+            let containers = serde_json::json!([container]);
+            let patch = if already {
+                // Same image: record only. Touching the pod template would restart it for nothing.
+                serde_json::json!({"metadata": {"annotations": annotations}})
+            } else if roll.kind == "cronjob" {
+                serde_json::json!({"metadata": {"annotations": annotations}, "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": containers}}}}}})
+            } else {
+                serde_json::json!({"metadata": {"annotations": annotations}, "spec": {"template": {"metadata": {"annotations": annotations}, "spec": {"containers": containers}}}})
+            };
+            if already {
+                println!(
+                    "{name} already runs {image}: recording the release without restarting it"
+                );
+            }
+            run(kubectl(environment, extra_env).args([
+                "patch",
+                &roll.kind,
+                name,
+                "--type",
+                "strategic",
+                "-p",
+                &patch.to_string(),
+            ]))?;
         }
-        run(kubectl(environment, extra_env).args([
-            "patch",
-            &roll.kind,
-            name,
-            "--type",
-            "strategic",
-            "-p",
-            &patch.to_string(),
-        ]))?;
         if roll.kind == "deployment" {
             run(kubectl(environment, extra_env).args([
                 "rollout",
@@ -771,6 +808,71 @@ fn command(
         .current_dir(&context.repo.root)
         .stdin(Stdio::null());
     Ok(command)
+}
+
+/// The objects of a workload's manifest file, its container set to `image`
+/// (and its version variable to the release).
+fn workload_manifest(
+    context: &Context,
+    environment: &Environment,
+    extra_env: &BTreeMap<String, String>,
+    roll: &Roll,
+    image: &str,
+    release: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let output = kubectl(environment, extra_env)
+        .args(["create", "--dry-run=client", "-o", "json", "-f"])
+        .arg(context.repo.root.join(&roll.manifest))
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "kubectl cannot read {}: {}",
+            roll.manifest,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let mut items = match parsed["kind"].as_str() {
+        Some("List") => parsed["items"].as_array().cloned().unwrap_or_default(),
+        _ => vec![parsed],
+    };
+    let mut found = false;
+    for item in items.iter_mut().filter(|item| {
+        item["kind"].as_str().map(str::to_lowercase).as_deref() == Some(roll.kind.as_str())
+            && item["metadata"]["name"] == roll.workload
+    }) {
+        let spec = if roll.kind == "cronjob" {
+            &mut item["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+        } else {
+            &mut item["spec"]["template"]["spec"]
+        };
+        for container in spec["containers"].as_array_mut().into_iter().flatten() {
+            if container["name"] != roll.container.as_str() {
+                continue;
+            }
+            found = true;
+            container["image"] = image.into();
+            if !roll.version_env.is_empty() {
+                let env = container["env"].as_array().cloned().unwrap_or_default();
+                let mut env: Vec<serde_json::Value> = env
+                    .into_iter()
+                    .filter(|entry| entry["name"] != roll.version_env.as_str())
+                    .collect();
+                env.push(serde_json::json!({"name": roll.version_env, "value": release}));
+                container["env"] = env.into();
+            }
+        }
+    }
+    if !found {
+        bail!(
+            "{} has no container {} in {} {}",
+            roll.manifest,
+            roll.container,
+            roll.kind,
+            roll.workload
+        );
+    }
+    Ok(items)
 }
 
 fn kubectl(environment: &Environment, extra_env: &BTreeMap<String, String>) -> Command {

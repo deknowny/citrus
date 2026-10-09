@@ -145,6 +145,11 @@ pub struct Workload {
     /// whenever the image changes (the version the program reports).
     #[serde(default)]
     pub version_env: String,
+    /// A manifest file holding this workload (and what goes with it): applied
+    /// whole with the workload's image set to the build, so changes to its
+    /// spec roll out too. Declare it among the artifact's inputs.
+    #[serde(default)]
+    pub manifest: String,
     #[serde(default = "five_minutes")]
     pub timeout: u64,
 }

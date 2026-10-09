@@ -63,6 +63,9 @@ environment shop-production = kubernetes(context: "prod", namespace: "shop") {
   deploy bot = bot {
     fence = "bot-session"
   }
+  # Applied from its manifest file (with what else it holds), the image set to
+  # the build: changes to the spec roll out with it.
+  deploy worker = worker { manifest = "deploy/worker.yaml" }
   # Suspended while the environment changes, restored after.
   deploy backup = backup {
     kind = cronjob
