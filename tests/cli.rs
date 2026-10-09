@@ -1562,7 +1562,9 @@ elif verb == "rollout":
     sys.exit(1 if os.path.exists(".kube/fail-rollout") else 0)
 elif verb == "create" and "--dry-run=client" in args:
     if "-k" in args:
-        print(open(os.path.join(args[args.index("-k") + 1], "all.json")).read())
+        # kubectl prints several objects one after another, not a List.
+        for item in json.load(open(os.path.join(args[args.index("-k") + 1], "all.json")))["items"]:
+            print(json.dumps(item, indent=2))
     else:
         print(open(args[args.index("-f") + 1]).read())
 elif verb == "apply":

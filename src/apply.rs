@@ -856,11 +856,18 @@ fn read_objects(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    Ok(match parsed["kind"].as_str() {
-        Some("List") => parsed["items"].as_array().cloned().unwrap_or_default(),
-        _ => vec![parsed],
-    })
+    // One object, a List, or (for several resources) one object after another.
+    let mut items = Vec::new();
+    for parsed in
+        serde_json::Deserializer::from_slice(&output.stdout).into_iter::<serde_json::Value>()
+    {
+        let parsed = parsed.with_context(|| format!("kubectl's rendering of {manifest}"))?;
+        match parsed["kind"].as_str() {
+            Some("List") => items.extend(parsed["items"].as_array().cloned().unwrap_or_default()),
+            _ => items.push(parsed),
+        }
+    }
+    Ok(items)
 }
 
 /// Set the image of `container` in the `kind` object named `name` (and, when
