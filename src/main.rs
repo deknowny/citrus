@@ -287,9 +287,9 @@ enum Command {
         /// Keep the share fixed instead of adapting to the machine's other load
         #[arg(long)]
         fixed: bool,
-        /// The least CPUs the pool keeps when production needs the machine
-        #[arg(long, value_name = "CPUS", default_value_t = 1.0)]
-        min_cpus: f64,
+        /// The least CPUs the pool keeps when production needs the machine (default: a quarter of the share)
+        #[arg(long, value_name = "CPUS")]
+        min_cpus: Option<f64>,
         /// Share of the machine the pool and everything else may use together
         #[arg(long, value_name = "FRACTION", default_value_t = 0.8)]
         target_util: f64,
@@ -668,7 +668,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
                 idle_exit: *idle_exit,
                 pause_while_locked: pause_while_locked.clone(),
                 fixed: *fixed,
-                min_cpus: Some(*min_cpus),
+                min_cpus: *min_cpus,
                 target_util: Some(*target_util),
                 cache_gib: Some(*cache_gib),
             });

@@ -60,6 +60,8 @@ const IO_PRESSURE_LIMIT: f64 = 10.0;
 const MEMORY_FREE_LIMIT: f64 = 0.08;
 /// Added per tick while there is room (CPUs).
 const GROW: f64 = 0.5;
+/// The pool is blamed for pressure only when it uses at least this many CPUs.
+const BLAME_CPUS: f64 = 1.0;
 /// What is kept per tick under pressure.
 const KEEP: f64 = 0.6;
 
@@ -77,8 +79,17 @@ pub fn decide(config: &Config, previous: f64, sample: &Sample) -> Decision {
         (false, "")
     };
     if pressured {
+        // Giving CPUs back only helps when the pool is part of the problem: a
+        // pool using next to nothing keeps its budget (it just does not grow)
+        // while production presses on itself.
+        if sample.pool < BLAME_CPUS {
+            return Decision {
+                budget: previous.min(ceiling).max(config.floor),
+                reason,
+            };
+        }
         return Decision {
-            budget: (previous * KEEP)
+            budget: (previous.min(sample.pool + 1.0) * KEEP)
                 .max(config.floor)
                 .min(ceiling.max(config.floor)),
             reason,
@@ -303,23 +314,34 @@ mod tests {
     }
 
     #[test]
-    fn pressure_cuts_the_budget_whatever_the_load_says() {
-        let mut sample = calm(1.0, 0.0);
+    fn pressure_cuts_the_budget_when_the_pool_is_using_cpus() {
+        let mut sample = calm(9.0, 8.0);
         sample.cpu_pressure = 40.0;
         let decision = decide(&config(), 10.0, &sample);
-        assert_eq!(decision.budget, 6.0);
+        // 60 % of what the pool really uses (8 + 1).
+        assert!((decision.budget - 5.4).abs() < 1e-9, "{decision:?}");
         assert_eq!(decision.reason, "cpu pressure");
-        sample = calm(1.0, 0.0);
+        sample = calm(9.0, 8.0);
         sample.io_pressure = 30.0;
         assert_eq!(decide(&config(), 10.0, &sample).reason, "disk pressure");
-        sample = calm(1.0, 0.0);
+        sample = calm(9.0, 8.0);
         sample.memory_free = 0.02;
         assert_eq!(decide(&config(), 10.0, &sample).reason, "low memory");
     }
 
     #[test]
+    fn pressure_production_makes_itself_does_not_starve_an_idle_pool() {
+        // The machine presses on itself; the pool uses 0.2 CPU. Cutting it helps nobody.
+        let mut sample = calm(20.0, 0.2);
+        sample.cpu_pressure = 60.0;
+        let decision = decide(&config(), 5.0, &sample);
+        assert_eq!(decision.budget, 5.0);
+        assert_eq!(decision.reason, "cpu pressure");
+    }
+
+    #[test]
     fn the_floor_holds_under_sustained_pressure() {
-        let mut sample = calm(31.0, 0.0);
+        let mut sample = calm(31.0, 20.0);
         sample.cpu_pressure = 90.0;
         let mut budget = 10.0;
         for _ in 0..20 {

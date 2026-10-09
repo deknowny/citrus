@@ -929,7 +929,10 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
         let config = crate::governor::Config {
             cores: cpus as f64,
             share: share as f64,
-            floor: options.min_cpus.unwrap_or(1.0).clamp(0.1, share as f64),
+            floor: options
+                .min_cpus
+                .unwrap_or((share as f64 / 4.0).max(1.0))
+                .clamp(0.1, share as f64),
             target: options.target_util.unwrap_or(0.8).clamp(0.1, 1.0),
             slice: std::env::var("CITRUS_AGENT_CGROUP_PARENT")
                 .ok()

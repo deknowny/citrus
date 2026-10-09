@@ -93,9 +93,11 @@ its governor measures what everything *except* the pool is using, and the
 kernel's pressure counters (PSI) for CPU, disk and memory:
 
 - the pool may use `target × cores − foreign load` CPUs, never more than
-  `--share` and never less than `--min-cpus` (defaults: target 0.8, floor 1);
-- CPU or disk pressure, or low free memory, cuts the budget to 60 % per tick
-  until the machine recovers; with room the budget grows by half a CPU a tick;
+  `--share` and never less than `--min-cpus` (defaults: target 0.8, floor a quarter of the share);
+- CPU or disk pressure, or low free memory, cuts the budget to 60 % of what the
+  pool really uses, per tick, until the machine recovers — but only when the pool
+  uses at least a CPU: pressure production makes by itself is not blamed on an idle
+  pool, which then just stops growing; with room the budget grows by half a CPU a tick;
 - the budget sets how many checks run at once (a slot is `share / slots` CPUs)
   and is written to the pool's cgroup (`cpu.max` of `CITRUS_AGENT_CGROUP_PARENT`),
   so checks already running slow down too, and the agent restores the full
