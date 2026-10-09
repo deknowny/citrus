@@ -1365,9 +1365,17 @@ fn shell_quote(word: &str) -> String {
 fn with_prepare(prepare: &[String], exe: &str, args: &[String]) -> Vec<String> {
     let mut argv = Vec::new();
     if !prepare.is_empty() {
+        // `citrus …` in the command is this run's own executor.
         let script = prepare
             .iter()
-            .map(|word| shell_quote(word))
+            .enumerate()
+            .map(|(at, word)| {
+                if at == 0 && word == "citrus" {
+                    shell_quote(exe)
+                } else {
+                    shell_quote(word)
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ");
         argv.extend([
@@ -2081,6 +2089,16 @@ mod tests {
             ["/bin/citrus", "run"]
         );
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn a_prepare_command_named_citrus_runs_the_runs_own_executor() {
+        let argv = with_prepare(
+            &["citrus".into(), "ports".into(), "a.env".into()],
+            "/opt/citrus-1",
+            &["run".into()],
+        );
+        assert_eq!(argv[2], "/opt/citrus-1 ports a.env && exec \"$@\"");
     }
 
     #[test]

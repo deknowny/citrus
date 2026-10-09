@@ -21,6 +21,7 @@ mod observe;
 mod pin;
 mod plan;
 mod pool;
+mod ports;
 mod release;
 mod repo;
 mod report;
@@ -291,6 +292,16 @@ enum Command {
     Myself {
         #[command(subcommand)]
         action: SelfAction,
+    },
+    /// Moves a test stack's ports in FILE to a free block (for `#![prepare]`)
+    Ports {
+        file: std::path::PathBuf,
+        /// Port variables: NAME gets block + its position; NAME+ is added when missing
+        #[arg(required = true)]
+        names: Vec<String>,
+        /// A variable whose value mentions a port follows it: KEY=NAME
+        #[arg(long = "url")]
+        urls: Vec<String>,
     },
     #[command(hide = true)]
     Worker { run: String },
@@ -601,6 +612,9 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
     // A parallel worker's child needs no configuration: its steps are given.
     if let Some(Command::ExecSteps { file }) = &command {
         return exec::exec_steps(file);
+    }
+    if let Some(Command::Ports { file, names, urls }) = &command {
+        return ports::run(&ports::Request { file, names, urls });
     }
     // The pool serves any repository: no configuration is read.
     match &command {
@@ -973,6 +987,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
         Command::Agent { .. } | Command::Pool { .. } | Command::Myself { .. } => {
             unreachable!("handled before the configuration")
         }
+        Command::Ports { .. } => unreachable!("handled before the configuration is read"),
         Command::Worker { run } => {
             context.work(&run)?;
             Ok(0)

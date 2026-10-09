@@ -51,7 +51,11 @@ start.
   agent copies them into every tree of that repository.
 - **`#![prepare(cmd!("…"))]` runs in the tree before the checks**, inside
   the image, with `CITRUS_POOL_RUN` set to the run id so per-run resources
-  (Compose projects, ports) do not collide on a shared machine.
+  (Compose projects, ports) do not collide on a shared machine. A command
+  that starts with `citrus` runs the run's own executor; `citrus ports FILE
+  NAME… [--url KEY=NAME]…` moves the ports named in an env file to a free
+  block picked from the run id (`NAME` gets block + its position, `NAME+` is
+  added when missing, and `--url` follows the port inside another value).
 - **The executor is the requester's Citrus version.** Agents keep a cache of
   Citrus binaries by commit (built or downloaded as `bin/citrus` does) and run
   the job with the matching one; for a container, the Linux build of it.
