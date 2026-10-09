@@ -21,7 +21,16 @@ fn citrus_command() -> Command {
     }
     // Never this machine's pool (~/.config/citrus/pool).
     command.env("CITRUS_POOL", "");
+    // State in a test database: each temporary repository gets its own schema.
+    command.env("CITRUS_STATE", test_state());
     command
+}
+
+/// CITRUS_TEST_STATE, else the local test Postgres (docker run -p 55432:5432 postgres).
+fn test_state() -> String {
+    std::env::var("CITRUS_TEST_STATE").unwrap_or_else(|_| {
+        "postgres://postgres:t@localhost:55432/postgres?sslmode=disable".to_owned()
+    })
 }
 
 struct Project {

@@ -796,6 +796,11 @@ fn cache_root() -> PathBuf {
     home().join(".cache/citrus/agent")
 }
 
+/// The throwaway state schema of a batch's executor.
+fn batch_schema(batch: &str) -> String {
+    format!("citrus_batch_{}", short_hash(batch))
+}
+
 fn short_hash(text: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(&Sha256::digest(text.as_bytes())[..8])
@@ -1055,6 +1060,7 @@ fn work(
             free,
             &mut released,
         );
+        let _ = crate::state::Store::drop_schema(url, &batch_schema(batch));
         let rest: Vec<String> = checks
             .iter()
             .filter(|check| !released.contains(check))
@@ -1718,6 +1724,10 @@ fn execute(
         ("CITRUS_POOL_SHARE".into(), machine.share.to_string()),
         // Names per-run resources (Compose projects, ports) on a shared machine.
         ("CITRUS_POOL_RUN".into(), batch.to_owned()),
+        // The executor's own state: a throwaway schema of the pool's database,
+        // dropped when the batch ends (the requester keeps the results).
+        ("CITRUS_STATE".into(), url().unwrap_or_default()),
+        ("CITRUS_STATE_SCHEMA".into(), batch_schema(batch)),
         // The repository's own launcher (bin/citrus) runs this build too.
         (
             "CITRUS_BIN".into(),

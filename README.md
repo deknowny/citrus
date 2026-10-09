@@ -138,7 +138,7 @@ learn a status, a declared check instead of a new wrapper.
 
 ## State
 
-One SQLite file, receipts and run logs in the Git common directory
+State in Postgres (one schema per repository: this machine's `~/.config/citrus/state`, else the pool's database); receipts and run logs in the Git common directory
 (`.git/citrus/`), shared by every worktree of a clone; nothing in the work
 tree, nothing to host. Runs execute in their own session (`setsid`), so they
 outlive the terminal or agent that started them. A shared server backend for

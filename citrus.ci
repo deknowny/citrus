@@ -7,13 +7,40 @@
 /// The sources every Rust check reads.
 const RUST: list<glob> = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "build.rs"];
 
-/// Unit and integration tests on throwaway Git repositories. Many of them
-/// wait on child processes rather than compute, so more threads than cores
-/// keep the run as long as its slowest test.
+/// Unit and integration tests on throwaway Git repositories, their state in
+/// a throwaway Postgres (each repository its own schema). Many tests wait on
+/// child processes rather than compute, so more threads than cores keep the
+/// run as long as its slowest test.
 #[paths("examples/**")]
 #[env(RUST_TEST_THREADS = "32")]
 check test {
-    run!("cargo test --locked")?;
+    let run = std::env::var("CITRUS_POOL_RUN").unwrap_or("local");
+    let name = "citrus-test-pg-{run}";
+    run!("docker rm -f {name}")?;
+    run!("docker run -d --name {name} -e POSTGRES_PASSWORD=t -p 127.0.0.1::5432 postgres:17-alpine")?;
+    run!("docker exec {name} sh -c 'until pg_isready -U postgres -h 127.0.0.1 -q; do sleep 0.2; done'")?;
+    let port = cmd!("docker port {name} 5432").output()?.stdout.trim().split(":").last().unwrap_or("");
+    let url = "postgres://postgres:t@127.0.0.1:{port}/postgres?sslmode=disable";
+    let tests = cmd!("cargo test --locked --bins --test cli").env("CITRUS_TEST_STATE", url).output()?;
+    run!("docker rm -f {name}")?;
+    assert tests.code == 0, "{tests.stdout}\n{tests.stderr}";
+}
+
+/// The pool against a throwaway Postgres (agents, queue, outputs): only when
+/// the pool's code changes, it takes a minute.
+#[paths("src/pool.rs", "src/state.rs", "tests/pool.rs")]
+#[reads(RUST)]
+check pool {
+    let run = std::env::var("CITRUS_POOL_RUN").unwrap_or("local");
+    let name = "citrus-pool-pg-{run}";
+    run!("docker rm -f {name}")?;
+    run!("docker run -d --name {name} -e POSTGRES_PASSWORD=t -p 127.0.0.1::5432 postgres:17-alpine")?;
+    run!("docker exec {name} sh -c 'until pg_isready -U postgres -h 127.0.0.1 -q; do sleep 0.2; done'")?;
+    let port = cmd!("docker port {name} 5432").output()?.stdout.trim().split(":").last().unwrap_or("");
+    let url = "postgres://postgres:t@127.0.0.1:{port}/postgres?sslmode=disable";
+    let tests = cmd!("cargo test --locked --test pool").env("CITRUS_TEST_POOL", url).output()?;
+    run!("docker rm -f {name}")?;
+    assert tests.code == 0, "{tests.stdout}\n{tests.stderr}";
 }
 
 /// rustfmt and clippy with warnings as errors.
