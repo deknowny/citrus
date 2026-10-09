@@ -641,7 +641,7 @@ pub fn check_attr_in(attr: &Attr, globals: &Globals, group: Option<&str>) -> Res
         return Ok(());
     }
     match name {
-        "paths" | "reads" => {
+        "paths" | "reads" | "outputs" => {
             for (_, arg) in &attr.args {
                 // A group's name: its paths select the check too.
                 if let Expr::Path(segments, span) = arg {
@@ -724,7 +724,15 @@ pub fn check_attr_in(attr: &Attr, globals: &Globals, group: Option<&str>) -> Res
                 .map(|(name, _)| *name)
                 .chain(CONFIG.iter().copied())
                 .chain(CONDITIONS.iter().copied())
-                .chain(["paths", "reads", "cache", "production", "version", "test"]);
+                .chain([
+                    "paths",
+                    "reads",
+                    "outputs",
+                    "cache",
+                    "production",
+                    "version",
+                    "test",
+                ]);
             let mut error = Error::at(attr.span, format!("unknown attribute `#[{other}]`"));
             if let Some(close) = suggest(other, known) {
                 error = error.help(format!("did you mean `#[{close}]`?"));

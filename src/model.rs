@@ -214,6 +214,9 @@ pub struct Check {
     pub description: Option<String>,
     pub owns: Vec<String>,
     pub reads: Vec<String>,
+    /// Files a pool run of it brings back into the requester's tree
+    /// (`#[outputs(…)]`): what it generates, such as SQLx metadata.
+    pub outputs: Vec<String>,
     pub cache: bool,
     /// `cache` as the check or its group says; otherwise the project's default.
     #[serde(skip)]

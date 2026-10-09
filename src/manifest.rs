@@ -21,6 +21,8 @@ pub struct Target {
     pub description: Option<String>,
     pub inputs: Vec<String>,
     pub extra_inputs: Vec<String>,
+    /// Files a pool run brings back (`#[outputs]`).
+    pub outputs: Vec<String>,
     pub cache: bool,
     /// Resource classes the project's scheduler gives this target (free-form for Citrus).
     pub resources: Vec<String>,
@@ -90,6 +92,7 @@ impl Target {
             description: check.description.clone(),
             inputs: check.owns.clone(),
             extra_inputs: check.reads.clone(),
+            outputs: check.outputs.clone(),
             cache: check.cache,
             resources: check.resources.clone(),
             extensions: check.meta.clone(),

@@ -764,3 +764,82 @@ fn a_published_build_is_held_by_commit_and_platform() {
     assert_eq!(rows.len(), 1, "{listed}");
     assert_eq!(rows[0]["platform"], "linux-x86_64");
 }
+
+/// A named check runs in the pool, and what it generates (`#[outputs]`)
+/// lands in the requester's tree.
+#[test]
+fn a_checks_outputs_come_back_from_the_pool() {
+    let Ok(pool) = std::env::var("CITRUS_TEST_POOL") else {
+        eprintln!("CITRUS_TEST_POOL is not set: pool tests skipped");
+        return;
+    };
+    let _serial = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let work = tempfile::tempdir().unwrap();
+    let project = work.path().join("project");
+    let origin = work.path().join("origin.git");
+    let cache = work.path().join("agents");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir_all(work.path().join("files")).unwrap();
+    fs::write(
+        project.join("citrus.ci"),
+        r#"#![citrus(2)]
+
+/// Generates metadata the requester keeps.
+#[paths("src/**")]
+#[outputs("gen/**")]
+check generate {
+    run!("sh -c 'mkdir -p gen && cat src/a.txt > gen/meta.json'")?;
+}
+"#,
+    )
+    .unwrap();
+    fs::write(project.join("src/a.txt"), "{\"v\": 1}\n").unwrap();
+    git(&project, &["init", "-q", "-b", "main"]);
+    git(&project, &["add", "-A"]);
+    git(
+        &project,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    git(
+        work.path(),
+        &["init", "-q", "--bare", "-b", "main", "origin.git"],
+    );
+    git(
+        &project,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&project, &["push", "-q", "-u", "origin", "main"]);
+
+    let mut agent = agent(&project, &pool, &cache.join("one"), "one", "plain");
+    let output = citrus(
+        &project,
+        &pool,
+        &cache,
+        &["run", "--remote", "generate", "--json"],
+    )
+    .output()
+    .unwrap();
+    let run = json(&output);
+    let id = run["run"]["id"].as_str().unwrap().to_owned();
+    let output = citrus(&project, &pool, &cache, &["wait", &id, "--json"])
+        .output()
+        .unwrap();
+    let run = json(&output);
+    assert_eq!(result(&run, "generate")["result"], "passed", "{run}");
+    assert_eq!(
+        fs::read_to_string(project.join("gen/meta.json")).unwrap_or_default(),
+        "{\"v\": 1}\n",
+        "{run}"
+    );
+    assert!(agent.wait().unwrap().success());
+}

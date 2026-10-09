@@ -133,6 +133,7 @@ group's `paths`, `reads`, `needs`, `env`, `profile`, `cache` and `when`.
 |---|---|
 | `#[paths(…)]` | Globs (and group names) that select the check; a check's own paths narrow its group's, and a path a check names is that check's alone |
 | `#[reads(…)]` | More inputs of its fingerprint that do not select it |
+| `#[outputs(…)]` | Files it generates that a pool run brings back into the requester's tree (SQLx metadata, generated code) |
 | `#[when(cond)]` | Selected only when the condition holds (and, with paths, one changed) |
 | `#[needs(service, …)]` | Resources it runs with |
 | `#[profile(name)]` | Belongs to these profiles only |

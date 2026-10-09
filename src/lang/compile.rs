@@ -541,6 +541,7 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         owns = from.paths.clone();
     }
     let (mut reads, reads_via) = compiler.globs(&item.attrs, "reads")?;
+    let (outputs, _) = compiler.globs(&item.attrs, "outputs")?;
     reads.extend(from.reads.iter().cloned());
     for glob in inferred_reads {
         if !reads.contains(&glob) {
@@ -597,6 +598,7 @@ fn check(compiler: &mut Compiler, item: &Item, name: &str, from: &Inherited) -> 
         description: item.doc.clone(),
         owns,
         reads,
+        outputs,
         cache: true,
         cache_set: compiler.flag(&item.attrs, "cache")?.or(from.cache),
         known_inputs,

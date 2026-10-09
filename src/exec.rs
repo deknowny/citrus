@@ -264,7 +264,8 @@ impl Context {
                 "no remote runner: join a pool (CITRUS_POOL) or declare a `runner` in the configuration"
             );
         }
-        if explicit && request.mode == Mode::Remote {
+        // A pool takes named checks; a runner script only the planned set.
+        if explicit && request.mode == Mode::Remote && !self.uses_pool() {
             bail!("--remote runs the planned set; drop the target names or use --local");
         }
         let names = if explicit {

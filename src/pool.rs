@@ -96,7 +96,7 @@ pub fn connect(url: &str) -> Result<Client> {
 
 /// The pool's tables; any client creates them on first use.
 /// The schema version this build writes; bump with every change below.
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 /// The pool's tables. DDL takes exclusive table locks even when it changes
 /// nothing, so it runs only when the recorded version is behind; every other
@@ -169,6 +169,9 @@ fn migrate(client: &mut Client) -> Result<()> {
         alter table citrus.events add column if not exists tx xid8 not null default pg_current_xact_id();
         create index if not exists events_by_run on citrus.events (run, id);
         create index if not exists jobs_queued on citrus.jobs (state) where state = 'queued';
+        -- A check's #[outputs]: the files its passing run brings back (a tar).
+        alter table citrus.jobs add column if not exists outputs text[] not null default '{}';
+        alter table citrus.jobs add column if not exists output bytea;
         -- Citrus builds by commit and platform (`citrus pool publish`): agents
         -- and launchers take them instead of compiling a version each.
         create table if not exists citrus.binaries (
@@ -422,9 +425,15 @@ pub fn run(
                 .get(check)
                 .map(requirements)
                 .unwrap_or_default();
+            let outputs = context
+                .manifest
+                .targets
+                .get(check)
+                .map(|target| target.outputs.clone())
+                .unwrap_or_default();
             tx.execute(
-                "insert into citrus.jobs (run, check_name, requires) values ($1, $2, $3)",
-                &[&id, check, &needs],
+                "insert into citrus.jobs (run, check_name, requires, outputs) values ($1, $2, $3, $4)",
+                &[&id, check, &needs, &outputs],
             )?;
         }
         tx.execute("select pg_notify('citrus_jobs', $1)", &[&id])?;
@@ -433,6 +442,9 @@ pub fn run(
     context.store.set_fact(&format!("pool:{id}"), &refname)?;
     on_line(format!("CITRUS_WAIT pool · {} checks queued", checks.len()))?;
     let outcome = follow(&mut client, id, on_line);
+    if outcome.is_ok() {
+        bring_back(&mut client, id, &context.repo.root, on_line)?;
+    }
     if outcome.is_err() {
         let _ = client.execute(
             "update citrus.runs set state = 'cancelled', closed = now() where id = $1 and state = 'open'",
@@ -445,6 +457,61 @@ pub fn run(
     );
     delete_ref(&context.repo, &refname);
     outcome
+}
+
+/// Unpack the #[outputs] of the passed checks of run `id` into `root`.
+fn bring_back(
+    client: &mut Client,
+    id: &str,
+    root: &Path,
+    on_line: &mut dyn FnMut(String) -> Result<()>,
+) -> Result<()> {
+    for row in client.query(
+        "select check_name, output from citrus.jobs where run = $1 and output is not null and result = 'passed'",
+        &[&id],
+    )? {
+        let (check, data): (String, Vec<u8>) = (row.get(0), row.get(1));
+        let mut tar = Command::new("tar")
+            .args(["-x", "-f", "-", "-C"])
+            .arg(root)
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("tar unpacks the outputs")?;
+        std::io::Write::write_all(tar.stdin.as_mut().context("stdin")?, &data)?;
+        drop(tar.stdin.take());
+        if !tar.wait()?.success() {
+            bail!("could not unpack the outputs of {check}");
+        }
+        on_line(format!("CITRUS_STAGE {check}: its outputs are in the tree"))?;
+    }
+    Ok(())
+}
+
+/// The files of a finished check's #[outputs] in its tree, as a tar.
+fn pack_outputs(tree: &Path, globs: &[String]) -> Result<Option<Vec<u8>>> {
+    let list = crate::manifest::GlobList::new(globs)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(tree)
+        .args(["ls-files", "-co", "--exclude-standard", "-z"])
+        .output()?;
+    let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty() && list.matches(path) && tree.join(path).is_file())
+        .map(str::to_owned)
+        .collect();
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let output = Command::new("tar")
+        .args(["-c", "-f", "-", "-C"])
+        .arg(tree)
+        .args(&files)
+        .output()?;
+    if !output.status.success() {
+        bail!("tar could not pack the outputs");
+    }
+    Ok(Some(output.stdout))
 }
 
 fn follow(
@@ -1606,6 +1673,15 @@ fn execute(
             &[format!("CITRUS_STAGE {} {what}", machine.name)],
         )
     })?;
+    // What each check brings back when it passes (#[outputs]).
+    let outputs: BTreeMap<String, Vec<String>> = client
+        .query(
+            "select check_name, outputs from citrus.jobs where run = $1 and check_name = any($2)",
+            &[&run.id, &checks],
+        )?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
     let jobs = checks.len().to_string();
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -1807,9 +1883,20 @@ fn execute(
                         && status != "START"
                     {
                         let seconds = field("seconds=").and_then(|value| value.parse().ok());
+                        let passed = status == "PASS";
                         reported.insert(target.clone(), (status, seconds));
                         // The result is final: report it and free its slot now.
                         if checks.contains(&target) && !released.contains(&target) {
+                            if passed
+                                && let Some(globs) =
+                                    outputs.get(&target).filter(|globs| !globs.is_empty())
+                                && let Some(data) = pack_outputs(&tree, globs)?
+                            {
+                                client.execute(
+                                    "update citrus.jobs set output = $3 where run = $1 and check_name = $2",
+                                    &[&run.id, &target, &data],
+                                )?;
+                            }
                             pending.push(line);
                             emit(client, &run.id, &machine.name, &pending)?;
                             pending.clear();
