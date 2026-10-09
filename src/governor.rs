@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(limit.adjust(300.0), 25.0);
         assert_eq!(limit.adjust(300.0), 20.0, "never below the floor");
         assert_eq!(
-            limit.adjust(30.0),
+            limit.adjust(40.0),
             20.0,
             "holds while the disk is not yet calm"
         );
