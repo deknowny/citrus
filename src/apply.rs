@@ -581,11 +581,11 @@ fn run_step(
                 &patch.to_string(),
             ]))?;
         }
-        if roll.kind == "deployment" {
+        if ["deployment", "statefulset", "daemonset"].contains(&roll.kind.as_str()) {
             run(kubectl(environment, extra_env).args([
                 "rollout",
                 "status",
-                &format!("deployment/{name}"),
+                &format!("{}/{name}", roll.kind),
                 &format!("--timeout={}s", roll.timeout),
             ]))?;
         }

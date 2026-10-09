@@ -385,6 +385,28 @@ fn observe_kubernetes(
                 if synced { "" } else { ", rollout pending" }
             ),
         )
+    } else if workload.kind == "statefulset" || workload.kind == "daemonset" {
+        let (wanted, ready) = if workload.kind == "daemonset" {
+            (
+                item["status"]["desiredNumberScheduled"]
+                    .as_i64()
+                    .unwrap_or(0),
+                item["status"]["numberReady"].as_i64().unwrap_or(0),
+            )
+        } else {
+            (
+                item["spec"]["replicas"].as_i64().unwrap_or(1),
+                item["status"]["readyReplicas"].as_i64().unwrap_or(0),
+            )
+        };
+        let synced = item["status"]["observedGeneration"] == item["metadata"]["generation"];
+        (
+            ready == wanted && synced,
+            format!(
+                "{ready}/{wanted} ready{}",
+                if synced { "" } else { ", rollout pending" }
+            ),
+        )
     } else {
         (true, workload.kind.clone())
     };
