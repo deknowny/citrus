@@ -169,6 +169,14 @@ impl Files for RepoFiles<'_> {
     fn list(&self) -> &[String] {
         &self.listed
     }
+
+    fn tree(&self) -> Option<String> {
+        Some(format!(
+            "{}\0{}",
+            self.root.display(),
+            self.revision.unwrap_or("")
+        ))
+    }
 }
 
 const CARGO_SUBCOMMANDS: &[&str] = &[

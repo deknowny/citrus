@@ -352,12 +352,13 @@ pub fn dead_globs(project: &Project, root: &Path) -> Vec<Error> {
     if files.is_empty() {
         return dead;
     }
+    let mut matcher = crate::manifest::Matcher::new(&files);
     for check in project.checks.iter().filter(|check| check.cache) {
         let mut reported: Vec<&String> = Vec::new();
         for pattern in check.owns.iter().chain(&check.reads) {
             if pattern.starts_with('!')
                 || reported.contains(&pattern)
-                || crate::manifest::pattern_matches_any(pattern, &files).unwrap_or(true)
+                || matcher.any(pattern).unwrap_or(true)
             {
                 continue;
             }

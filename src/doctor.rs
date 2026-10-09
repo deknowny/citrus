@@ -3,7 +3,6 @@
 use serde::Serialize;
 
 use crate::exec::Context;
-use crate::manifest::pattern_matches_any;
 use crate::plan;
 
 #[derive(Debug, Serialize)]
@@ -59,6 +58,8 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
     }
     match context.repo.paths() {
         Ok(files) => {
+            let mut matcher = crate::manifest::Matcher::new(&files);
+            let definitions = definitions(context, &files);
             for target in context.manifest.targets.values() {
                 // A reused pass must cover what the check reads; selection
                 // paths may name removed or future files.
@@ -68,7 +69,7 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
                     .chain(&target.extra_inputs)
                     .filter(|_| target.cache)
                     .filter(|pattern| !pattern.starts_with('!'))
-                    .filter(|pattern| !pattern_matches_any(pattern, &files).unwrap_or(false))
+                    .filter(|pattern| !matcher.any(pattern).unwrap_or(false))
                     .collect();
                 if !unmatched.is_empty() {
                     let list = unmatched
@@ -95,7 +96,7 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
                     _ => None,
                 });
                 for rule in rules {
-                    match defined(context, &rule) {
+                    match defined(&definitions, &rule) {
                         Ok(false) => note(
                             &format!("check {}", target.name),
                             "fail",
@@ -184,27 +185,32 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
 }
 
 /// Whether a rule for `name` exists in the configured target definition files.
-fn defined(context: &Context, name: &str) -> anyhow::Result<bool> {
+/// The text of the files `target_definitions` names (Makefiles), read once;
+/// `None` when nothing is declared, so every rule counts as defined.
+fn definitions(context: &Context, files: &[String]) -> Option<Vec<String>> {
     let patterns = &context.repo.config.target_definitions;
     if patterns.is_empty() {
-        return Ok(true);
+        return None;
     }
-    let files = context.repo.files()?;
-    for path in &files {
-        if !patterns.iter().any(|pattern| {
-            pattern_matches_any(pattern, std::slice::from_ref(path)).unwrap_or(false)
-        }) {
-            continue;
-        }
-        let text = std::fs::read_to_string(context.repo.root.join(path)).unwrap_or_default();
-        let found = text.lines().any(|line| {
+    let list = crate::manifest::GlobList::new(patterns).ok()?;
+    Some(
+        files
+            .iter()
+            .filter(|path| list.matches(path))
+            .map(|path| std::fs::read_to_string(context.repo.root.join(path)).unwrap_or_default())
+            .collect(),
+    )
+}
+
+fn defined(definitions: &Option<Vec<String>>, name: &str) -> anyhow::Result<bool> {
+    let Some(texts) = definitions else {
+        return Ok(true);
+    };
+    Ok(texts.iter().any(|text| {
+        text.lines().any(|line| {
             line.strip_prefix(name)
                 .map(str::trim_start)
                 .is_some_and(|rest| rest.starts_with(':') && !rest.starts_with(":="))
-        });
-        if found {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        })
+    }))
 }

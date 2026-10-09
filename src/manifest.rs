@@ -268,6 +268,40 @@ pub fn pattern_matches_any(pattern: &str, files: &[String]) -> Result<bool> {
     Ok(files.iter().any(|path| glob.matches(path)))
 }
 
+/// `pattern_matches_any` over one file list, for many patterns: each answered
+/// once, a literal one (most inputs name a file) without a scan.
+#[derive(Debug)]
+pub struct Matcher<'a> {
+    files: &'a [String],
+    listed: std::collections::HashSet<&'a str>,
+    answered: std::collections::HashMap<String, bool>,
+}
+
+impl<'a> Matcher<'a> {
+    pub fn new(files: &'a [String]) -> Matcher<'a> {
+        Matcher {
+            files,
+            listed: files.iter().map(String::as_str).collect(),
+            answered: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Whether `pattern` matches a file; `None` for an invalid pattern.
+    pub fn any(&mut self, pattern: &str) -> Option<bool> {
+        if let Some(&known) = self.answered.get(pattern) {
+            return Some(known);
+        }
+        let bare = pattern.strip_prefix('!').unwrap_or(pattern);
+        let found = if !bare.contains(['*', '?', '[', '{']) && self.listed.contains(bare) {
+            true
+        } else {
+            pattern_matches_any(pattern, self.files).ok()?
+        };
+        self.answered.insert(pattern.to_owned(), found);
+        Some(found)
+    }
+}
+
 /// Path glob: `**/` spans whole directories, `**` anything, `*` and `?` stay in one segment.
 /// `dir/**` is the directory with everything in it: it also matches `dir`
 /// itself, as a gitlink or a removed directory appears in a diff.

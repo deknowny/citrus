@@ -12,6 +12,33 @@ use std::collections::{BTreeMap, BTreeSet};
 pub trait Files {
     fn read(&self, path: &str) -> Option<String>;
     fn list(&self) -> &[String];
+    /// Names the tree these files come from, when results computed from it
+    /// may be kept for the rest of the process.
+    fn tree(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Closures already computed in this process: (tree, package) → globs.
+static CLOSURES: std::sync::Mutex<BTreeMap<(String, String), Vec<String>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// `closure` once per tree and package: every Cargo command of a
+/// configuration asks again, and each answer reads every manifest.
+fn closure_of(files: &dyn Files, package: &str) -> Result<Vec<String>, String> {
+    let Some(tree) = files.tree() else {
+        return closure(files, package);
+    };
+    let key = (tree, package.to_owned());
+    if let Some(globs) = CLOSURES.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return Ok(globs.clone());
+    }
+    let globs = closure(files, package)?;
+    CLOSURES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, globs.clone());
+    Ok(globs)
 }
 
 /// `crate("a", "platform-*", …)`: the union of the closures of these
@@ -34,7 +61,7 @@ pub fn crates(files: &dyn Files, names: &[String]) -> Result<Vec<String>, String
             return Err(format!("no Cargo package `{name}` in this repository"));
         }
         for package in matched {
-            for glob in closure(files, package)? {
+            for glob in closure_of(files, package)? {
                 if !globs.contains(&glob) {
                     globs.push(glob);
                 }
@@ -199,9 +226,10 @@ pub fn closure(files: &dyn Files, package: &str) -> Result<Vec<String>, String> 
             globs.insert(format!("{dir}/**"));
         }
     }
+    let root_list = crate::manifest::GlobList::new(&root_globs).ok();
     let covered = |path: &str| {
         dirs.iter().any(|dir| !dir.is_empty() && within(path, dir))
-            || crate::manifest::GlobList::new(&root_globs).is_ok_and(|list| list.matches(path))
+            || root_list.as_ref().is_some_and(|list| list.matches(path))
     };
     // Sources may pull in files from outside their crate.
     for dir in &dirs {
