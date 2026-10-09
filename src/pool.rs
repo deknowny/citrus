@@ -1403,6 +1403,14 @@ fn checkout(machine: &Machine, run: &RunRow, batch: &str) -> Result<(PathBuf, Pa
             &mirror,
             &["worktree", "add", "-q", "--detach", &target, &run.commit],
         )?;
+        // A fresh checkout must not make Cargo recompile unchanged sources.
+        let ledger = machine
+            .cache
+            .join("source-times")
+            .join(format!("{}.json", short_hash(&run.repo)));
+        if let Err(error) = crate::source_times::restore(&ledger, &tree) {
+            eprintln!("citrus agent: source times not restored: {error:#}");
+        }
         overlay(&machine_files(&run.repo), &tree)?;
     }
     Ok((mirror, tree))

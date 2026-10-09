@@ -27,6 +27,7 @@ mod release;
 mod repo;
 mod report;
 mod resources;
+mod source_times;
 mod state;
 mod tasks;
 mod versions;

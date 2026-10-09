@@ -56,6 +56,12 @@ start.
   NAME… [--url KEY=NAME]…` moves the ports named in an env file to a free
   block picked from the run id (`NAME` gets block + its position, `NAME+` is
   added when missing, and `--url` follows the port inside another value).
+- **A fresh checkout does not rebuild Cargo.** Cargo calls a crate fresh when
+  its sources are older than its outputs, and a new worktree stamps every file
+  "now". The agent keeps a ledger per repository (git object and time of every
+  tracked file as first seen) and gives a new tree the old time of each file
+  whose content is unchanged; a changed file keeps its new time, so Cargo
+  rebuilds exactly what changed. No wrapper or per-project script is needed.
 - **The executor is the requester's Citrus version.** Agents keep a cache of
   Citrus binaries by commit (built or downloaded as `bin/citrus` does) and run
   the job with the matching one; for a container, the Linux build of it.
