@@ -67,10 +67,30 @@ at most 6 CPUs, only on mains, and stops taking work while its owner is
 active. A production host can join with `--share 4 --quiet-hours 01-07` or not
 at all: heavy builds next to production workloads have hurt before.
 
+### Sharing a machine with production
+
+On Linux an agent adapts by itself (`--fixed` turns it off). Every two seconds
+its governor measures what everything *except* the pool is using, and the
+kernel's pressure counters (PSI) for CPU, disk and memory:
+
+- the pool may use `target × cores − foreign load` CPUs, never more than
+  `--share` and never less than `--min-cpus` (defaults: target 0.8, floor 1);
+- CPU or disk pressure, or low free memory, cuts the budget to 60 % per tick
+  until the machine recovers; with room the budget grows by half a CPU a tick;
+- the budget sets how many checks run at once (a slot is `share / slots` CPUs)
+  and is written to the pool's cgroup (`cpu.max` of `CITRUS_AGENT_CGROUP_PARENT`),
+  so checks already running slow down too, and the agent restores the full
+  share when it stops;
+- `citrus pool` shows `limited to N CPUs (reason)` while an agent holds back.
+
+A production node can therefore offer a generous `--share` and still get out of
+the way when the node's own workloads need the CPUs.
+
 ## Commands
 
 ```
 citrus agent [--share N] [--labels a,b] [--name NAME]   # join the pool
+             [--min-cpus N] [--target-util F] [--fixed]  # adapt to the machine's own load
 citrus pool                     # agents, their load, queued and running checks
 citrus pool drain NAME          # finish current checks, take no more
 citrus run --remote             # through the pool when one is configured

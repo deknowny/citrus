@@ -13,6 +13,7 @@ mod deploy;
 mod dockerfile;
 mod doctor;
 mod exec;
+mod governor;
 mod integrate;
 mod lang;
 mod manifest;
@@ -281,6 +282,15 @@ enum Command {
         /// (repeatable), e.g. a release build that owns the machine.
         #[arg(long, value_name = "FILE")]
         pause_while_locked: Vec<std::path::PathBuf>,
+        /// Keep the share fixed instead of adapting to the machine's other load
+        #[arg(long)]
+        fixed: bool,
+        /// The least CPUs the pool keeps when production needs the machine
+        #[arg(long, value_name = "CPUS", default_value_t = 1.0)]
+        min_cpus: f64,
+        /// Share of the machine the pool and everything else may use together
+        #[arg(long, value_name = "FRACTION", default_value_t = 0.8)]
+        target_util: f64,
     },
     /// The pool: its agents, their load, and the checks queued and running.
     Pool {
@@ -528,13 +538,26 @@ fn pool_command(action: Option<&PoolAction>, json: bool) -> Result<i32> {
             agent.state.clone()
         };
         println!(
-            "  {:<20} {:<12} {:>2}/{:<2} CPUs · {} at once · load {:.1} · {}",
+            "  {:<20} {:<12} {:>2}/{:<2} CPUs · {} at once · load {:.1}{} · {}",
             agent.name,
             state,
             agent.share,
             agent.cpus,
             agent.slots,
             agent.load,
+            if agent.budget > 0.0 && agent.budget + 0.05 < agent.share as f32 {
+                format!(
+                    " · limited to {:.1} CPUs{}",
+                    agent.budget,
+                    if agent.throttle.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", agent.throttle)
+                    }
+                )
+            } else {
+                String::new()
+            },
             agent.labels.join(",")
         );
     }
@@ -626,6 +649,9 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             native,
             idle_exit,
             pause_while_locked,
+            fixed,
+            min_cpus,
+            target_util,
         }) => {
             return pool::agent(&pool::AgentOptions {
                 name: name.clone(),
@@ -635,6 +661,9 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
                 native: *native,
                 idle_exit: *idle_exit,
                 pause_while_locked: pause_while_locked.clone(),
+                fixed: *fixed,
+                min_cpus: Some(*min_cpus),
+                target_util: Some(*target_util),
             });
         }
         Some(Command::Pool { action }) => return pool_command(action.as_ref(), json),

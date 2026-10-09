@@ -96,7 +96,7 @@ pub fn connect(url: &str) -> Result<Client> {
 
 /// The pool's tables; any client creates them on first use.
 /// The schema version this build writes; bump with every change below.
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 /// The pool's tables. DDL takes exclusive table locks even when it changes
 /// nothing, so it runs only when the recorded version is behind; every other
@@ -166,6 +166,9 @@ fn migrate(client: &mut Client) -> Result<()> {
         -- Readers follow by transaction, not by id: an id taken by a
         -- transaction that commits later would otherwise be skipped.
         alter table citrus.runs add column if not exists prepare text[] not null default '{}';
+        -- What the agent's governor lets the pool use now (CPUs) and why it is below the share.
+        alter table citrus.agents add column if not exists budget real not null default 0;
+        alter table citrus.agents add column if not exists throttle text not null default '';
         alter table citrus.events add column if not exists tx xid8 not null default pg_current_xact_id();
         create index if not exists events_by_run on citrus.events (run, id);
         create index if not exists jobs_queued on citrus.jobs (state) where state = 'queued';
@@ -614,6 +617,8 @@ pub struct AgentRow {
     pub state: String,
     pub running: i32,
     pub load: f32,
+    pub budget: f32,
+    pub throttle: String,
     pub version: String,
     pub seen_seconds: f64,
 }
@@ -632,7 +637,7 @@ pub fn overview() -> Result<Overview> {
     let agents = client
         .query(
             "select name, labels, container, cpus, share, slots, state, running, load, version,
-                    extract(epoch from now() - seen)::float8
+                    extract(epoch from now() - seen)::float8, budget, throttle
              from citrus.agents order by name",
             &[],
         )?
@@ -649,6 +654,8 @@ pub fn overview() -> Result<Overview> {
             load: row.get(8),
             version: row.get(9),
             seen_seconds: row.get(10),
+            budget: row.get(11),
+            throttle: row.get(12),
         })
         .collect();
     let queued: i64 = client
@@ -703,6 +710,12 @@ pub struct AgentOptions {
     /// Take no new checks while another process holds a lock on one of
     /// these files (a release build owning this machine).
     pub pause_while_locked: Vec<PathBuf>,
+    /// Keep the share fixed instead of adapting to the machine's other load.
+    pub fixed: bool,
+    /// The least CPUs the pool keeps under pressure (default 1).
+    pub min_cpus: Option<f64>,
+    /// Fraction of the machine the pool and the rest may use together (default 0.8).
+    pub target_util: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -904,19 +917,87 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
         .get(0);
     let draining = Arc::new(AtomicBool::new(state == "draining"));
     let running = Arc::new(AtomicUsize::new(0));
+    // The governor: how many CPUs the pool may use beside production right now.
+    let allowed = Arc::new(AtomicUsize::new(machine.slots));
+    let budget = Arc::new(AtomicUsize::new(share * 1000));
+    let throttle: Arc<Mutex<&'static str>> = Arc::new(Mutex::new(""));
+    let governor = if options.fixed || !cfg!(target_os = "linux") {
+        None
+    } else {
+        let config = crate::governor::Config {
+            cores: cpus as f64,
+            share: share as f64,
+            floor: options.min_cpus.unwrap_or(1.0).clamp(0.1, share as f64),
+            target: options.target_util.unwrap_or(0.8).clamp(0.1, 1.0),
+            cgroup: std::env::var("CITRUS_AGENT_CGROUP_PARENT")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .and_then(|slice| crate::governor::slice_dir(&slice)),
+        };
+        let (stop, allowed, budget, throttle) = (
+            stop.clone(),
+            allowed.clone(),
+            budget.clone(),
+            throttle.clone(),
+        );
+        let (name, slots) = (machine.name.clone(), machine.slots);
+        Some(std::thread::spawn(move || {
+            let mut sampler = crate::governor::Sampler::new(config.cores, config.cgroup.clone());
+            let mut current = config.share;
+            let mut announced = current;
+            while !stop.load(Ordering::SeqCst) {
+                if let Some(sample) = sampler.sample() {
+                    let decision = crate::governor::decide(&config, current, &sample);
+                    current = decision.budget;
+                    allowed.store(
+                        crate::governor::allowed_slots(current, config.share, slots),
+                        Ordering::SeqCst,
+                    );
+                    budget.store((current * 1000.0) as usize, Ordering::SeqCst);
+                    *throttle.lock().unwrap() = decision.reason;
+                    if let Some(dir) = &config.cgroup {
+                        crate::governor::limit_cgroup(dir, current);
+                    }
+                    if (current - announced).abs() >= 1.0 {
+                        eprintln!(
+                            "citrus agent {name}: {current:.1} of {:.0} CPUs for the pool{}",
+                            config.share,
+                            if decision.reason.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", decision.reason)
+                            }
+                        );
+                        announced = current;
+                    }
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            if let Some(dir) = &config.cgroup {
+                crate::governor::limit_cgroup(dir, config.share);
+            }
+        }))
+    };
     let heartbeat = {
         let (url, name) = (url.clone(), machine.name.clone());
         let (stop, draining, running) = (stop.clone(), draining.clone(), running.clone());
+        let (budget, throttle) = (budget.clone(), throttle.clone());
         std::thread::spawn(move || -> Result<()> {
             let mut client = connect(&url)?;
             while !stop.load(Ordering::SeqCst) {
                 let rows = client.query(
-                    "update citrus.agents set seen = now(), load = $2, running = $3
+                    "update citrus.agents set seen = now(), load = $2, running = $3,
+                            budget = $4, throttle = $5
                      where name = $1 returning state",
                     &[
                         &name,
                         &load_average(),
                         &(running.load(Ordering::SeqCst) as i32),
+                        &(budget.load(Ordering::SeqCst) as f32 / 1000.0),
+                        &throttle.lock().unwrap().to_string(),
                     ],
                 )?;
                 let state: String = rows.first().map(|row| row.get(0)).unwrap_or_default();
@@ -929,9 +1010,20 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
             Ok(())
         })
     };
-    let result = serve(&mut client, &url, &machine, options, &draining, &running);
+    let result = serve(
+        &mut client,
+        &url,
+        &machine,
+        options,
+        &draining,
+        &running,
+        &allowed,
+    );
     stop.store(true, Ordering::SeqCst);
     let _ = heartbeat.join();
+    if let Some(governor) = governor {
+        let _ = governor.join();
+    }
     let _ = client.execute(
         "update citrus.agents set seen = now() - interval '1 hour', running = 0 where name = $1",
         &[&machine.name],
@@ -949,6 +1041,7 @@ fn serve(
     options: &AgentOptions,
     draining: &AtomicBool,
     running: &AtomicUsize,
+    allowed: &AtomicUsize,
 ) -> Result<i32> {
     client.batch_execute("listen citrus_jobs")?;
     let free = Arc::new(AtomicUsize::new(machine.slots));
@@ -996,9 +1089,12 @@ fn serve(
             continue;
         }
         paused = false;
-        let limit = free.load(Ordering::SeqCst);
+        let free_now = free.load(Ordering::SeqCst);
+        // The governor lowers how many checks run at once beside production.
+        let in_use = machine.slots - free_now;
+        let limit = free_now.min(allowed.load(Ordering::SeqCst).saturating_sub(in_use));
         // The last free slot waits for a release's checks.
-        let reserved = machine.slots > 1 && limit == 1;
+        let reserved = machine.slots > 1 && free_now == 1;
         let claimed = if limit > 0 {
             claim(client, machine, limit, if reserved { 1 } else { i32::MIN })?
         } else {

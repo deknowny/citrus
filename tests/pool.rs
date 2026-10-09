@@ -102,6 +102,7 @@ fn agent(dir: &Path, pool: &str, cache: &Path, name: &str, labels: &str) -> Chil
             name,
             "--slots",
             "2",
+            "--fixed",
             "--labels",
             labels,
             "--idle-exit",
