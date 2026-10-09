@@ -55,7 +55,7 @@ check build_linux {
     if std::env::platform() != "linux-x86_64" {
         let musl = "x86_64-unknown-linux-musl";
         run!("cargo zigbuild --quiet --locked --profile fast --target {musl} --target-dir target/cross")?;
-        run!("target/cross/{musl}/fast/citrus pool publish --platform linux-x86_64 target/cross/{musl}/fast/citrus")?;
+        run!("citrus pool publish --platform linux-x86_64 target/cross/{musl}/fast/citrus")?;
     };
 }
 
