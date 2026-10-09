@@ -559,6 +559,7 @@ const NAMING: &[(&str, &[&str])] = &[
 /// lists, commands, item names), checked as constants.
 const CONFIG: &[&str] = &[
     "env",
+    "env_file",
     "meta",
     "limit",
     "inputs",

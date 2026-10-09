@@ -4020,3 +4020,26 @@ fn a_run_plans_for_given_paths_and_tells_the_runner() {
         "other/x\n"
     );
 }
+
+/// `#[env_file]` adds a file's `KEY=VALUE` lines to a check's environment and
+/// `${{NAME}}` in `#[env]` (`${NAME}` once read) names a variable set before it.
+#[test]
+fn a_check_takes_variables_from_an_env_file_and_refers_to_them() {
+    let project = Project::new(
+        r#"
+#[paths("config/**")]
+#[env_file("config/test.env")]
+#[env(DATABASE_URL = "${{TEST_URL}}/db")]
+check env {
+    run!("sh -c 'test \"$DATABASE_URL\" = postgres://h:5432/db && test \"$PORT\" = 5432'")?;
+}
+"#,
+    );
+    project.write(
+        "config/test.env",
+        "# test stack\nTEST_URL=postgres://h:5432\nexport PORT=\"5432\"\n",
+    );
+    let (run, code) = project.json(&["run", "env"]);
+    assert_eq!(code, 0, "{run}");
+    assert_eq!(target(&run, "env")["result"], "passed", "{run}");
+}

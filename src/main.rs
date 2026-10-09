@@ -1867,6 +1867,10 @@ fn integrate_command(
             }
             return Ok(1);
         }
+        // The merge may have moved the pin: the checks run with that Citrus.
+        if result.outcome != "up_to_date" {
+            pin::follow()?;
+        }
         let mut run_value = Value::Null;
         if run_checks {
             let run = context.start(&Request {

@@ -94,6 +94,32 @@ pub fn handover() -> Result<()> {
     bail!("run {}: {error}", binary.display())
 }
 
+/// After a merge moved the pin: hand the rest of the command to the newly
+/// pinned build, so the checks run with the Citrus the merged tree names.
+pub fn follow() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os("CITRUS_NO_PIN").is_some_and(|value| !value.is_empty()) {
+        return Ok(());
+    }
+    let Some(root) = root() else { return Ok(()) };
+    let Some(commit) = pinned_in(&root) else {
+        return Ok(());
+    };
+    if crate::pool::VERSION == commit {
+        return Ok(());
+    }
+    let binary = prepare(&root, &commit)?;
+    eprintln!(
+        "citrus: the merge pins Citrus {}; continuing with it",
+        &commit[..12]
+    );
+    let error = Command::new(&binary)
+        .args(std::env::args_os().skip(1))
+        .env("CITRUS_BIN", &binary)
+        .exec();
+    bail!("run {}: {error}", binary.display())
+}
+
 /// The pinned build on this machine: cached, fetched from the pool, or
 /// compiled once.
 fn prepare(root: &Path, commit: &str) -> Result<PathBuf> {

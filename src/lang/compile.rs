@@ -175,6 +175,11 @@ impl<'a> Compiler<'a> {
     /// `#[env(KEY = "value", …)]`, in order.
     fn env(&mut self, attrs: &[Attr]) -> Compiled<Vec<(String, String)>> {
         let mut out = Vec::new();
+        for attr in attrs.iter().filter(|attr| attr.name == "env_file") {
+            for (_, arg) in &attr.args {
+                out.push(("@env_file".to_owned(), self.value(arg)?.as_text()));
+            }
+        }
         for attr in attrs.iter().filter(|attr| attr.name == "env") {
             for (key, arg) in &attr.args {
                 let Some(key) = key else {

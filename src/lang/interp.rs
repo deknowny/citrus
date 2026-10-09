@@ -856,8 +856,15 @@ impl<'a> Interp<'a> {
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
-            .envs(self.env.iter().cloned())
-            .envs(spec.env.iter().cloned())
+            .envs(crate::model::resolve_env(
+                &self
+                    .env
+                    .iter()
+                    .chain(spec.env.iter())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                self.root,
+            ))
             .current_dir(
                 spec.dir
                     .as_ref()

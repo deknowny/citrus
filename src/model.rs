@@ -380,6 +380,67 @@ pub fn execute(step: &Step, root: &Path, stdout_to_stderr: bool) -> anyhow::Resu
     execute_env(step, root, stdout_to_stderr, &[])
 }
 
+/// The environment a step's programs get: `#[env_file]` entries (key
+/// `@env_file`) read `KEY=VALUE` lines from that file under `root` (a missing
+/// file adds nothing), and `${NAME}` in a value is the variable as set by the
+/// entries before it or the process environment.
+pub fn resolve_env(pairs: &[(String, String)], root: &Path) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let lookup = |out: &Vec<(String, String)>, name: &str| {
+        out.iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var(name).ok())
+            .unwrap_or_default()
+    };
+    for (key, value) in pairs {
+        if key == "@env_file" {
+            let Ok(text) = std::fs::read_to_string(root.join(value)) else {
+                continue;
+            };
+            for line in text.lines() {
+                let line = line.trim();
+                let line = line.strip_prefix("export ").unwrap_or(line);
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((name, raw)) = line.split_once('=') {
+                    let raw = raw.trim();
+                    let unquoted = raw
+                        .strip_prefix('"')
+                        .and_then(|rest| rest.strip_suffix('"'))
+                        .or_else(|| {
+                            raw.strip_prefix('\'')
+                                .and_then(|rest| rest.strip_suffix('\''))
+                        })
+                        .unwrap_or(raw);
+                    out.push((name.trim().to_owned(), unquoted.to_owned()));
+                }
+            }
+            continue;
+        }
+        let mut expanded = String::new();
+        let mut rest = value.as_str();
+        while let Some(start) = rest.find("${") {
+            expanded.push_str(&rest[..start]);
+            match rest[start + 2..].find('}') {
+                Some(end) => {
+                    expanded.push_str(&lookup(&out, &rest[start + 2..start + 2 + end]));
+                    rest = &rest[start + 3 + end..];
+                }
+                None => {
+                    expanded.push_str(&rest[start..]);
+                    rest = "";
+                }
+            }
+        }
+        expanded.push_str(rest);
+        out.push((key.clone(), expanded));
+    }
+    out
+}
+
 /// `execute` with more environment for the programs the step starts.
 pub fn execute_env(
     step: &Step,
@@ -396,7 +457,7 @@ pub fn execute_env(
             let mut command = std::process::Command::new(program);
             command
                 .args(args)
-                .envs(env.iter().cloned())
+                .envs(resolve_env(env, root))
                 .envs(extra.iter().cloned())
                 .current_dir(root)
                 .stdin(std::process::Stdio::null());
