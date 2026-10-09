@@ -13,6 +13,8 @@ environment web_production;
 #[environment(web_production)]
 // The version after the last passed (or running) release, or the first free
 // one after it; held for this commit and the names it publishes.
+// `citrus release start web --bump minor` (or `major`) raises that part
+// instead of the patch; `--version x.y.z` names it by hand.
 #[version(initial = "1.4.0", scope = ["web-image"])]     // scope default: the unit's name
 release web {
     step build(r: Release) {

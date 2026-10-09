@@ -353,6 +353,10 @@ enum ReleaseAction {
         /// step is skipped), e.g. for a project that names versions by hand.
         #[arg(long = "version", value_name = "VERSION")]
         version: Option<String>,
+        /// What the reserved version raises: a fix (patch), a visible
+        /// feature (minor) or a breaking change (major).
+        #[arg(long, value_enum, default_value_t, conflicts_with = "version")]
+        bump: release::Level,
     },
     /// Wait for a release (id, prefix or `last`) and print its result.
     Wait {
@@ -2279,9 +2283,10 @@ fn release_command(context: &mut Context, action: ReleaseAction, json: bool) -> 
             detach,
             dry_run,
             version,
+            bump,
         } => {
             if dry_run {
-                let plan = release::dry_run(&mut *context, &unit, version.as_deref())?;
+                let plan = release::dry_run(&mut *context, &unit, version.as_deref(), bump)?;
                 if json {
                     println!(
                         "{}",
@@ -2355,6 +2360,7 @@ fn release_command(context: &mut Context, action: ReleaseAction, json: bool) -> 
                     unchecked,
                     rollback: false,
                     version,
+                    bump,
                 },
             )?;
             if detach {
@@ -2376,6 +2382,7 @@ fn release_command(context: &mut Context, action: ReleaseAction, json: bool) -> 
                     unchecked: true,
                     rollback: true,
                     version: None,
+                    bump: release::Level::Patch,
                 },
             )?;
             let finished = wait_release(context, &started.id, json)?;

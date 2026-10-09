@@ -139,8 +139,23 @@ impl Releases {
     }
 }
 
+/// Which part of a version a release raises: a fix, a visible feature, a
+/// breaking change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Level {
+    #[default]
+    Patch,
+    Minor,
+    Major,
+}
+
 /// `1.2.3-suffix` → `1.2.4-suffix`.
 pub fn bump(version: &str) -> Option<String> {
+    bump_at(version, Level::Patch)
+}
+
+/// `1.2.3-suffix` → `1.2.4-suffix` / `1.3.0-suffix` / `2.0.0-suffix`.
+pub fn bump_at(version: &str, level: Level) -> Option<String> {
     let (core, suffix) = match version.split_once('-') {
         Some((core, suffix)) => (core, format!("-{suffix}")),
         None => (version, String::new()),
@@ -152,18 +167,22 @@ pub fn bump(version: &str) -> Option<String> {
     if parts.len() != 3 {
         return None;
     }
-    parts[2] += 1;
+    match level {
+        Level::Patch => parts[2] += 1,
+        Level::Minor => parts = vec![parts[0], parts[1] + 1, 0],
+        Level::Major => parts = vec![parts[0] + 1, 0, 0],
+    }
     Some(format!("{}.{}.{}{suffix}", parts[0], parts[1], parts[2]))
 }
 
 /// The version a release of a unit starts reserving from: the one after
 /// `previous`, but never below `initial`, which also opens a new line
 /// (`initial = "1.0.0"` moves a unit off an older numbering for good).
-pub fn next_version(previous: &str, initial: &str) -> Option<String> {
+pub fn next_version(previous: &str, initial: &str, level: Level) -> Option<String> {
     if previous.is_empty() {
         return Some(initial.to_owned());
     }
-    let next = bump(previous)?;
+    let next = bump_at(previous, level)?;
     Some(match (core(&next), core(initial)) {
         (Some(next_core), Some(floor)) if next_core < floor => initial.to_owned(),
         _ => next,
@@ -217,6 +236,8 @@ pub struct Start {
     pub rollback: bool,
     /// Given by hand: no `version` step.
     pub version: Option<String>,
+    /// What the reserved version raises (the `version` step).
+    pub bump: Level,
 }
 
 /// What `start` would do, without doing it: gates, version and exact commands.
@@ -224,6 +245,7 @@ pub fn dry_run(
     context: &mut Context,
     unit_name: &str,
     given: Option<&str>,
+    level: Level,
 ) -> Result<serde_json::Value> {
     let releases = Releases::load(context)?;
     let unit = releases.unit(unit_name)?;
@@ -234,7 +256,7 @@ pub fn dry_run(
     let previous = previous_version(context, unit_name, unit)?;
     let next = match (given, &unit.version) {
         (Some(version), _) => version.to_owned(),
-        (None, Some(spec)) => next_version(&previous, &spec.initial).unwrap_or_default(),
+        (None, Some(spec)) => next_version(&previous, &spec.initial, level).unwrap_or_default(),
         (None, None) => String::new(),
     };
     let plan = crate::plan::compute(repo, &context.manifest, None)?;
@@ -377,10 +399,17 @@ pub fn start(context: &mut Context, request: &Start) -> Result<Release> {
             .context("no earlier passed release to roll back to")?;
         (target, current)
     } else {
-        (
-            request.version.clone().unwrap_or_default(),
-            previous_version(context, &request.unit, unit)?,
-        )
+        let previous = previous_version(context, &request.unit, unit)?;
+        // A minor or major bump is where the `version` step starts reserving.
+        let version = match (&request.version, &unit.version) {
+            (Some(given), _) => given.clone(),
+            (None, Some(spec)) if request.bump != Level::Patch => {
+                next_version(&previous, &spec.initial, request.bump)
+                    .with_context(|| format!("cannot bump version {previous}"))?
+            }
+            _ => String::new(),
+        };
+        (version, previous)
     };
     if request.version.is_none() && unit.version.is_none() && !request.rollback {
         bail!(
@@ -575,6 +604,9 @@ pub fn finish_gate(context: &Context, gate: &Gate) -> Result<()> {
                 gate.needed.join(", ")
             );
         }
+        // The run's evidence was written by other processes after this one
+        // read (and cached) what proves what.
+        context.store.forget();
         let plan = gate_plan(context, profile, &gate.paths, &gate.base)?;
         let needed = unproven_in(context, &plan)?;
         if !needed.is_empty() {
@@ -758,8 +790,12 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
                 .version
                 .as_ref()
                 .context("version step without `version`")?;
-            let start = next_version(&release.previous, &spec.initial)
-                .with_context(|| format!("cannot bump version {}", release.previous))?;
+            let start = if release.version.is_empty() {
+                next_version(&release.previous, &spec.initial, Level::Patch)
+                    .with_context(|| format!("cannot bump version {}", release.previous))?
+            } else {
+                release.version.clone()
+            };
             let free_version = context
                 .project
                 .as_ref()
@@ -858,17 +894,42 @@ mod tests {
 
     #[test]
     fn initial_is_the_floor_of_the_next_version() {
-        assert_eq!(next_version("", "1.0.0").as_deref(), Some("1.0.0"));
-        assert_eq!(next_version("0.49.302", "1.0.0").as_deref(), Some("1.0.0"));
         assert_eq!(
-            next_version("0.49.258-clyer", "1.0.0").as_deref(),
+            next_version("", "1.0.0", Level::Patch).as_deref(),
             Some("1.0.0")
         );
-        assert_eq!(next_version("1.0.0", "1.0.0").as_deref(), Some("1.0.1"));
-        assert_eq!(next_version("1.2.9", "1.0.0").as_deref(), Some("1.2.10"));
         assert_eq!(
-            next_version("0.49.258-clyer", "0.49.265-clyer").as_deref(),
+            next_version("0.49.302", "1.0.0", Level::Patch).as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            next_version("0.49.258-clyer", "1.0.0", Level::Patch).as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            next_version("1.0.0", "1.0.0", Level::Patch).as_deref(),
+            Some("1.0.1")
+        );
+        assert_eq!(
+            next_version("1.2.9", "1.0.0", Level::Patch).as_deref(),
+            Some("1.2.10")
+        );
+        assert_eq!(
+            next_version("0.49.258-clyer", "0.49.265-clyer", Level::Patch).as_deref(),
             Some("0.49.265-clyer")
+        );
+    }
+
+    #[test]
+    fn bumps_minor_and_major() {
+        assert_eq!(bump_at("1.0.5", Level::Minor).as_deref(), Some("1.1.0"));
+        assert_eq!(
+            bump_at("1.4.5-clyer", Level::Major).as_deref(),
+            Some("2.0.0-clyer")
+        );
+        assert_eq!(
+            next_version("1.0.5", "1.0.0", Level::Minor).as_deref(),
+            Some("1.1.0")
         );
     }
 
