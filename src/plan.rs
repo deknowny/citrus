@@ -181,6 +181,24 @@ pub fn for_change(repo: &Repo, manifest: &Manifest, change: &Change, before: &st
     Ok(plan)
 }
 
+/// Tells the lock-aware globs which `Cargo.lock` packages this change touches:
+/// those whose entries differ between `fork` and the working tree.
+fn lock_scope(repo: &Repo, fork: &str, paths: &[String]) {
+    use std::collections::BTreeSet;
+    if !paths.iter().any(|path| path == "Cargo.lock") {
+        crate::lock::set_changed(Some(BTreeSet::new()));
+        return;
+    }
+    let old = (!fork.is_empty())
+        .then(|| repo.git(&["show", &format!("{fork}:Cargo.lock")]).ok())
+        .flatten();
+    let new = std::fs::read_to_string(repo.root.join("Cargo.lock")).ok();
+    crate::lock::set_changed(match (old, new) {
+        (Some(old), Some(new)) => crate::lock::changed(&old, &new),
+        _ => None,
+    });
+}
+
 /// Declared targets owning `paths`; new or edited declarations since `before` too.
 /// `explicit`: the paths were given (`--paths-file`, integrate), not diffed from the base.
 fn select(
@@ -195,6 +213,7 @@ fn select(
         files: paths.len(),
         ..Plan::default()
     };
+    lock_scope(repo, fork, &paths);
     let mut edited_surfaces = String::new();
     let edited: Vec<String> = paths
         .iter()

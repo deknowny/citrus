@@ -226,6 +226,26 @@ pub fn closure(files: &dyn Files, package: &str) -> Result<Vec<String>, String> 
             globs.insert(format!("{dir}/**"));
         }
     }
+    // The lock packages these crates reach: a check built from the closure is
+    // affected by a change of the lock only through them (see `lock`).
+    if let Some(lock) = files.read("Cargo.lock") {
+        let members: Vec<String> = dirs
+            .iter()
+            .filter_map(|dir| {
+                crates
+                    .iter()
+                    .find(|(_, candidate)| *candidate == dir)
+                    .map(|(name, _)| name.clone())
+            })
+            .collect();
+        if let Some(reach) = crate::lock::reach(&lock, &members) {
+            globs.insert(format!(
+                "{}{}",
+                crate::lock::MARKER,
+                reach.into_iter().collect::<Vec<_>>().join(",")
+            ));
+        }
+    }
     let root_list = crate::manifest::GlobList::new(&root_globs).ok();
     let covered = |path: &str| {
         dirs.iter().any(|dir| !dir.is_empty() && within(path, dir))

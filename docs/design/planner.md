@@ -115,3 +115,22 @@ selects the group's checks that do not narrow its paths.
 
 `citrus plan --paths-file FILE` plans an explicit list of paths; the plan
 lists the touched groups, signals and labels.
+
+## `Cargo.lock` by package
+
+`std::paths::cargo("a", …)` (and the closure a Cargo command infers) no longer
+makes the whole `Cargo.lock` an input of a check. The closure carries the names
+of every lock package its crates reach, following the lock file's dependency
+graph, and:
+
+- a change to `Cargo.lock` selects the check only if an entry of one of those
+  packages differs between the commit the change is measured from and the
+  working tree (a new dependency of crate `clyer` does not select `userbot`'s
+  checks; a new version of `tokio` selects everything that reaches `tokio`);
+- the check's fingerprint hashes those entries, not the file, so a result stays
+  reused while only other packages change;
+- a lock file that cannot be read counts as changed for everyone;
+- artifacts (images) keep the whole file as an input: a build is a build.
+
+A literal `"Cargo.lock"` in the same glob list is replaced by this rule; keep it
+only in lists without a Cargo closure.

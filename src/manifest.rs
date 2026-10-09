@@ -58,27 +58,74 @@ pub struct Target {
 /// Globs in order; `!glob` removes matches of the globs before it, and the
 /// last glob that matches a path decides (like `.gitignore`).
 #[derive(Debug, Clone, Default)]
-pub struct GlobList(Vec<(bool, Glob)>);
+pub struct GlobList {
+    globs: Vec<(bool, Glob)>,
+    /// The lock packages the Cargo closures in the list reach (see `lock`);
+    /// when set, `Cargo.lock` selects by them instead of as a plain file.
+    lock_reach: Option<std::collections::BTreeSet<String>>,
+}
 
 impl GlobList {
     pub fn new(patterns: &[String]) -> Result<GlobList> {
-        patterns
-            .iter()
+        let mut reach: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut found = false;
+        let mut plain: Vec<&String> = Vec::new();
+        for pattern in patterns {
+            if let Some(names) = pattern.strip_prefix(crate::lock::MARKER) {
+                found = true;
+                reach.extend(
+                    names
+                        .split(',')
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned),
+                );
+            } else {
+                plain.push(pattern);
+            }
+        }
+        let globs = plain
+            .into_iter()
+            // The whole lock file is replaced by the packages that matter.
+            .filter(|pattern| !(found && pattern.as_str() == "Cargo.lock"))
             .map(|pattern| match pattern.strip_prefix('!') {
                 Some(rest) => Ok((false, Glob::new(rest)?)),
                 None => Ok((true, Glob::new(pattern)?)),
             })
-            .collect::<Result<Vec<_>>>()
-            .map(GlobList)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(GlobList {
+            globs,
+            lock_reach: found.then_some(reach),
+        })
     }
 
+    /// Files by name only: what a fingerprint hashes.
     pub fn matches(&self, path: &str) -> bool {
-        self.0
+        self.globs
             .iter()
             .rev()
             .find(|(_, glob)| glob.matches(path))
             .is_some_and(|(include, _)| *include)
     }
+
+    /// What a change selects by: the files, and `Cargo.lock` when a package
+    /// this list's crates reach changed in it.
+    pub fn selects(&self, path: &str) -> bool {
+        self.matches(path)
+            || (path == "Cargo.lock" && self.lock_reach.as_ref().is_some_and(crate::lock::relevant))
+    }
+
+    pub fn lock_reach(&self) -> Option<&std::collections::BTreeSet<String>> {
+        self.lock_reach.as_ref()
+    }
+}
+
+/// The globs without the lock markers (those are derived, not declared).
+fn without_markers(globs: &[String]) -> Vec<String> {
+    globs
+        .iter()
+        .filter(|glob| !glob.starts_with(crate::lock::MARKER))
+        .cloned()
+        .collect()
 }
 
 impl Target {
@@ -90,8 +137,8 @@ impl Target {
             name: check.name.clone(),
             replaces: check.replaces.clone(),
             description: check.description.clone(),
-            inputs: check.owns.clone(),
-            extra_inputs: check.reads.clone(),
+            inputs: without_markers(&check.owns),
+            extra_inputs: without_markers(&check.reads),
             outputs: check.outputs.clone(),
             cache: check.cache,
             resources: check.resources.clone(),
@@ -115,7 +162,7 @@ impl Target {
 
     /// A change to `path` selects it because its recipes read the path.
     pub fn follows(&self, path: &str) -> bool {
-        self.followed.matches(path)
+        self.followed.selects(path)
     }
 
     /// Same inputs, cache and resources: a reformatted entry is not a new check.
@@ -139,7 +186,20 @@ impl Target {
     }
 
     pub fn owns(&self, path: &str) -> bool {
-        self.owned.matches(path)
+        self.owned.selects(path)
+    }
+
+    /// The lock packages this check's crates reach, when it follows them.
+    pub fn lock_reach(&self) -> Option<std::collections::BTreeSet<String>> {
+        let mut reach = std::collections::BTreeSet::new();
+        let mut any = false;
+        for list in [&self.owned, &self.extra, &self.followed] {
+            if let Some(names) = list.lock_reach() {
+                any = true;
+                reach.extend(names.iter().cloned());
+            }
+        }
+        any.then_some(reach)
     }
 
     pub fn reads(&self, path: &str) -> bool {
@@ -169,7 +229,7 @@ pub struct PathGroup {
 
 impl PathGroup {
     pub fn owns(&self, path: &str) -> bool {
-        self.globs.matches(path)
+        self.globs.selects(path)
     }
 }
 
@@ -434,6 +494,15 @@ pub fn fingerprint(
             path.to_owned(),
             format!("{executable}{}", hex::encode(content)),
         ));
+    }
+    // Of the lock file only the packages this check's crates reach.
+    if let Some(reach) = target.lock_reach() {
+        let slice = std::fs::read_to_string(root.join("Cargo.lock")).map_or_else(
+            |_| "missing".to_owned(),
+            |text| crate::lock::slice_digest(&text, &reach),
+        );
+        digest.update(format!("Cargo.lock#reach\0{slice}\0").as_bytes());
+        covered.push(("Cargo.lock#reach".to_owned(), slice));
     }
     Ok(Fingerprint {
         value: hex::encode(digest.finalize()),

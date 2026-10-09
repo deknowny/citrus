@@ -17,6 +17,7 @@ mod governor;
 mod hygiene;
 mod integrate;
 mod lang;
+mod lock;
 mod manifest;
 mod model;
 mod observe;

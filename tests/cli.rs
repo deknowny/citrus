@@ -2522,6 +2522,69 @@ check test_app {
 }
 
 #[test]
+fn a_lock_change_selects_only_the_checks_whose_crates_reach_the_changed_package() {
+    let project = Project::new(
+        r#"#[paths(std::paths::cargo("app"))]
+check test_app {
+    run!("make ok")?;
+}
+
+#[paths(std::paths::cargo("tool"))]
+check test_tool {
+    run!("make ok")?;
+}
+
+"#,
+    );
+    let lock = |tool_dependencies: &str| {
+        format!(
+            "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"serde\"]\n\n\
+             [[package]]\nname = \"tool\"\nversion = \"0.1.0\"\ndependencies = [{tool_dependencies}]\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"extra\"\nversion = \"1.0.0\"\n"
+        )
+    };
+    project.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+    project.write("crates/app/Cargo.toml", "[package]\nname = \"app\"\n");
+    project.write("crates/app/src/main.rs", "fn main() {}\n");
+    project.write("crates/tool/Cargo.toml", "[package]\nname = \"tool\"\n");
+    project.write("crates/tool/src/main.rs", "fn main() {}\n");
+    project.write("Cargo.lock", &lock("\"serde\""));
+    project.commit("workspace");
+    let (first, _) = project.json(&["run", "test-app", "test-tool"]);
+    assert_eq!(target(&first, "test-app")["result"], "passed", "{first}");
+    assert_eq!(target(&first, "test-tool")["result"], "passed", "{first}");
+
+    // The tool gains a dependency: only its check has anything to prove.
+    project.write("Cargo.lock", &lock("\"serde\", \"extra\""));
+    project.commit("tool depends on extra");
+    let (plan, _) = project.json(&["plan", "--base", "HEAD~1"]);
+    assert_eq!(
+        plan["plan"]["targets"],
+        serde_json::json!(["test-tool"]),
+        "{plan}"
+    );
+    let (again, _) = project.json(&["run", "test-app", "test-tool"]);
+    assert_eq!(target(&again, "test-app")["result"], "reused", "{again}");
+    assert_eq!(target(&again, "test-tool")["result"], "passed", "{again}");
+
+    // A package both reach changes: both run again.
+    project.write(
+        "Cargo.lock",
+        &lock("\"serde\", \"extra\"").replace(
+            "name = \"serde\"\nversion = \"1.0.0\"",
+            "name = \"serde\"\nversion = \"1.0.1\"",
+        ),
+    );
+    project.commit("serde bumped");
+    let (plan, _) = project.json(&["plan", "--base", "HEAD~1"]);
+    assert_eq!(
+        plan["plan"]["targets"],
+        serde_json::json!(["test-app", "test-tool"]),
+        "{plan}"
+    );
+}
+
+#[test]
 fn checks_that_passed_quickly_run_locally_others_in_the_pool() {
     let project = Project::new(
         r#"#![runner(cmd!("sh remote.sh"))]
