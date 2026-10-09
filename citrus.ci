@@ -17,7 +17,7 @@ check test {
     let run = std::env::var("CITRUS_POOL_RUN").unwrap_or("local");
     let name = "citrus-test-pg-{run}";
     run!("docker rm -f {name}")?;
-    run!("docker run -d --name {name} -e POSTGRES_PASSWORD=t -p 127.0.0.1::5432 postgres:17-alpine")?;
+    run!("docker run -d --name {name} -e POSTGRES_PASSWORD=t -p 127.0.0.1::5432 postgres:17-alpine -c max_connections=1000")?;
     run!("docker exec {name} sh -c 'until pg_isready -U postgres -h 127.0.0.1 -q; do sleep 0.2; done'")?;
     let port = cmd!("docker port {name} 5432").output()?.stdout.trim().split(":").last().unwrap_or("");
     let url = "postgres://postgres:t@127.0.0.1:{port}/postgres?sslmode=disable";
@@ -37,7 +37,7 @@ check pool {
     let run = std::env::var("CITRUS_POOL_RUN").unwrap_or("local");
     let name = "citrus-pool-pg-{run}";
     run!("docker rm -f {name}")?;
-    run!("docker run -d --name {name} -e POSTGRES_PASSWORD=t -p 127.0.0.1::5432 postgres:17-alpine")?;
+    run!("docker run -d --name {name} -e POSTGRES_PASSWORD=t -p 127.0.0.1::5432 postgres:17-alpine -c max_connections=1000")?;
     run!("docker exec {name} sh -c 'until pg_isready -U postgres -h 127.0.0.1 -q; do sleep 0.2; done'")?;
     let port = cmd!("docker port {name} 5432").output()?.stdout.trim().split(":").last().unwrap_or("");
     let url = "postgres://postgres:t@127.0.0.1:{port}/postgres?sslmode=disable";

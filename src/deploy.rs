@@ -644,6 +644,37 @@ pub fn diff(context: &Context, name: &str) -> Result<Diff> {
             desired_key,
         });
     }
+    if let Some(migrations) = &environment.migrations {
+        let artifact = &artifacts[&migrations.artifact];
+        let paths = command_paths(context, artifact)?;
+        let (key, _) = key_at(
+            context,
+            &migrations.artifact,
+            artifact,
+            &head,
+            paths.as_deref(),
+        )?;
+        let running = match &running_commit {
+            Some(commit) => Some(
+                key_at(
+                    context,
+                    &migrations.artifact,
+                    artifact,
+                    commit,
+                    paths.as_deref(),
+                )?
+                .0,
+            ),
+            None => None,
+        };
+        if running.as_deref() != Some(key.as_str()) {
+            actions.push(format!(
+                "build and publish {} ({}) and run the migration job",
+                migrations.artifact,
+                &key[..12]
+            ));
+        }
+    }
     let plan_hash = hex::encode(Sha256::digest(
         serde_json::to_string(&(name, &head, &actions, &running_commit))?.as_bytes(),
     ));
