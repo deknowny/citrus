@@ -63,6 +63,10 @@ pub struct Environment {
     /// `proven` (default): checks the plan selects must be proven for HEAD.
     #[serde(default = "proven_checks")]
     pub checks: String,
+    /// Profiles whose checks a release proves (`#[gate(profiles = [...])]`);
+    /// empty: the current one.
+    #[serde(default)]
+    pub gate_profiles: Vec<String>,
     /// Name recorded for a release; `{short}`, `{commit}` substituted.
     #[serde(default = "short_name")]
     pub release_name: String,

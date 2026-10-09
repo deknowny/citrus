@@ -897,6 +897,13 @@ fn environment(
                     .ok_or_else(|| Error::at(attr.span, "`#[prepare(cmd!(\"…\"))]`"))?;
                 object.insert("prepare".into(), json!(compiler.argv(arg)?));
             }
+            "gate" => {
+                let fields = compiler.attr_object(attr)?;
+                object.insert(
+                    "gate_profiles".into(),
+                    fields.get("profiles").cloned().unwrap_or(json!([])),
+                );
+            }
             "manifests" => {
                 let fields = compiler.attr_object(attr)?;
                 object.insert(

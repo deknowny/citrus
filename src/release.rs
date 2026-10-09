@@ -446,20 +446,36 @@ fn unproven_in(context: &Context, plan: &crate::plan::Plan) -> Result<Vec<String
         .collect())
 }
 
-/// The checks a release's shipped change needs, and the pool run proving
-/// those not proven yet (started, not awaited).
+/// The checks a release's shipped change needs, and the pool runs proving
+/// those not proven yet (started, not awaited), one per gated profile.
 #[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
 pub struct Gate {
-    pub run: String,
+    /// (profile, run) — the profile empty for the current one.
+    pub runs: Vec<(String, String)>,
     pub base: String,
     pub paths: Vec<String>,
     pub needed: Vec<String>,
 }
 
+/// The plan of `paths` since `base` in `profile` (empty: the current one).
+fn gate_plan(
+    context: &Context,
+    profile: &str,
+    paths: &[String],
+    base: &str,
+) -> Result<crate::plan::Plan> {
+    let mut repo = context.repo.clone();
+    if !profile.is_empty() {
+        repo.config.plan.profile = Some(profile.to_owned());
+    }
+    crate::plan::for_paths(&repo, &context.manifest, paths, base)
+}
+
 /// Prove what a release ships: the checks selected by the files that change
 /// between the commit `environment` runs and HEAD and that its changing
-/// artifacts are built from (another product's change needs nothing). Those
-/// not proven yet start now in the pool (warm caches) and are awaited by
+/// artifacts are built from (another product's change needs nothing), in
+/// each profile the environment gates on. Those not proven yet start now in
+/// the pool (warm caches, ahead of other runs) and are awaited by
 /// `finish_gate`, so builds go on meanwhile. Without a recorded running
 /// commit, the plan against the base branch must already be proven.
 pub fn start_gate(context: &mut Context, environment: &str) -> Result<Option<Gate>> {
@@ -486,71 +502,84 @@ pub fn start_gate(context: &mut Context, environment: &str) -> Result<Option<Gat
     if paths.is_empty() {
         return Ok(None);
     }
-    let plan = crate::plan::for_paths(&context.repo, &context.manifest, &paths, &running)?;
-    let needed = unproven_in(context, &plan)?;
-    if needed.is_empty() {
-        return Ok(None);
+    let mut profiles = crate::deploy::environments(context)?
+        .get(environment)
+        .map(|environment| environment.gate_profiles.clone())
+        .unwrap_or_default();
+    if profiles.is_empty() {
+        profiles.push(String::new());
     }
-    eprintln!(
-        "{environment}: the shipped change needs {}; running them in the pool while the release builds",
-        needed.join(", ")
-    );
     let list = context
         .repo
         .log_dir()
         .join(format!("shipped-{environment}-{}.paths", &diff.head[..12]));
     crate::repo::private_dir(&context.repo.log_dir())?;
     std::fs::write(&list, paths.join("\n") + "\n")?;
-    // In the pool when there is one: its caches are warm.
-    let mut run = std::process::Command::new(std::env::current_exe()?);
-    run.arg("run");
-    if crate::pool::url().is_some() {
-        run.arg("--remote");
-    }
-    let output = run
-        .args(["--detach", "--json", "--base", &running, "--paths-file"])
-        .arg(&list)
-        .stderr(std::process::Stdio::inherit())
-        .output()?;
-    let started: serde_json::Value = serde_json::from_slice(&output.stdout).with_context(|| {
-        format!(
-            "starting the checks: {}",
-            String::from_utf8_lossy(&output.stdout)
-        )
-    })?;
-    let id = started["run"]["id"]
-        .as_str()
-        .with_context(|| format!("no run started: {started}"))?
-        .to_owned();
-    Ok(Some(Gate {
-        run: id,
-        base: running,
-        paths,
-        needed,
-    }))
-}
-
-/// Wait for a gate's run; an error unless every needed check is proven.
-pub fn finish_gate(context: &Context, gate: &Gate) -> Result<()> {
-    let status = std::process::Command::new(std::env::current_exe()?)
-        .args(["wait", &gate.run, "--text"])
-        .stdout(std::process::Stdio::from(std::io::stderr()))
-        .status()?;
-    if !status.success() {
-        bail!(
-            "the checks this release needs failed ({}): {}",
-            gate.run,
-            gate.needed.join(", ")
-        );
-    }
-    let plan = crate::plan::for_paths(&context.repo, &context.manifest, &gate.paths, &gate.base)?;
-    let needed = unproven_in(context, &plan)?;
-    if !needed.is_empty() {
-        bail!(
-            "checks still not proven after {}: {}",
-            gate.run,
+    let mut gate = Gate {
+        base: running.clone(),
+        paths: paths.clone(),
+        ..Gate::default()
+    };
+    for profile in profiles {
+        let plan = gate_plan(context, &profile, &paths, &running)?;
+        let needed = unproven_in(context, &plan)?;
+        if needed.is_empty() {
+            continue;
+        }
+        eprintln!(
+            "{environment}: the shipped change needs {}; running them in the pool while the release builds",
             needed.join(", ")
         );
+        // In the pool when there is one: its caches are warm.
+        let mut run = std::process::Command::new(std::env::current_exe()?);
+        run.arg("run");
+        if crate::pool::url().is_some() {
+            run.arg("--remote");
+        }
+        if !profile.is_empty() {
+            run.args(["--profile", &profile]);
+        }
+        let output = run
+            .args(["--detach", "--json", "--base", &running, "--paths-file"])
+            .arg(&list)
+            .env("CITRUS_RUN_PRIORITY", "10")
+            .stderr(std::process::Stdio::inherit())
+            .output()?;
+        let started: serde_json::Value =
+            serde_json::from_slice(&output.stdout).with_context(|| {
+                format!(
+                    "starting the checks: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            })?;
+        let id = started["run"]["id"]
+            .as_str()
+            .with_context(|| format!("no run started: {started}"))?
+            .to_owned();
+        gate.runs.push((profile, id));
+        gate.needed.extend(needed);
+    }
+    Ok((!gate.runs.is_empty()).then_some(gate))
+}
+
+/// Wait for a gate's runs; an error unless every needed check is proven.
+pub fn finish_gate(context: &Context, gate: &Gate) -> Result<()> {
+    for (profile, run) in &gate.runs {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["wait", run, "--text"])
+            .stdout(std::process::Stdio::from(std::io::stderr()))
+            .status()?;
+        if !status.success() {
+            bail!(
+                "the checks this release needs failed ({run}): {}",
+                gate.needed.join(", ")
+            );
+        }
+        let plan = gate_plan(context, profile, &gate.paths, &gate.base)?;
+        let needed = unproven_in(context, &plan)?;
+        if !needed.is_empty() {
+            bail!("checks still not proven after {run}: {}", needed.join(", "));
+        }
     }
     Ok(())
 }

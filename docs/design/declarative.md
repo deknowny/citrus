@@ -53,6 +53,9 @@ artifact api-migrations {
 environment shop-production = kubernetes(context: "prod", namespace: "shop") {
   approval = required             # apply needs --approve
   checks = proven                 # planned checks must be proven for the commit
+  # The shipped change's checks of these profiles run (in the pool, ahead of
+  # other runs) while the images build; nothing changes before they pass.
+  gate = { profiles: ["fast", "e2e"] }
   # Runs to completion before workloads change.
   migrations = { artifact: "api-migrations", job: "deploy/migrate.yaml", timeout: 5m }
   record = { annotation: "example.com/release" }

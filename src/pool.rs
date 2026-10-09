@@ -96,7 +96,7 @@ pub fn connect(url: &str) -> Result<Client> {
 
 /// The pool's tables; any client creates them on first use.
 /// The schema version this build writes; bump with every change below.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// The pool's tables. DDL takes exclusive table locks even when it changes
 /// nothing, so it runs only when the recorded version is behind; every other
@@ -172,6 +172,8 @@ fn migrate(client: &mut Client) -> Result<()> {
         -- A check's #[outputs]: the files its passing run brings back (a tar).
         alter table citrus.jobs add column if not exists outputs text[] not null default '{}';
         alter table citrus.jobs add column if not exists output bytea;
+        -- Release gates go first, and one slot per agent waits for them.
+        alter table citrus.runs add column if not exists priority integer not null default 0;
         -- Citrus builds by commit and platform (`citrus pool publish`): agents
         -- and launchers take them instead of compiling a version each.
         create table if not exists citrus.binaries (
@@ -411,12 +413,17 @@ pub fn run(
         .transpose()?;
     let profile = context.repo.config.plan.profile.clone().unwrap_or_default();
     let prepare = context.repo.config.run.prepare.clone();
+    // CITRUS_RUN_PRIORITY: a release's gate (above 0) goes before other runs.
+    let priority: i32 = std::env::var("CITRUS_RUN_PRIORITY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     {
         let mut tx = client.transaction()?;
         tx.execute(
-            "insert into citrus.runs (id, repo, commit_sha, ref_name, version, profile, image, requester, prepare)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-            &[&id, &repo, &commit, &refname, &VERSION, &profile, &image, &crate::exec::agent(), &prepare],
+            "insert into citrus.runs (id, repo, commit_sha, ref_name, version, profile, image, requester, prepare, priority)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[&id, &repo, &commit, &refname, &VERSION, &profile, &image, &crate::exec::agent(), &prepare, &priority],
         )?;
         for check in checks {
             let needs = context
@@ -985,8 +992,10 @@ fn serve(
         }
         paused = false;
         let limit = free.load(Ordering::SeqCst);
+        // The last free slot waits for a release's checks.
+        let reserved = machine.slots > 1 && limit == 1;
         let claimed = if limit > 0 {
-            claim(client, machine, limit)?
+            claim(client, machine, limit, if reserved { 1 } else { i32::MIN })?
         } else {
             None
         };
@@ -1142,14 +1151,15 @@ fn claim(
     client: &mut Client,
     machine: &Machine,
     limit: usize,
+    min_priority: i32,
 ) -> Result<Option<(RunRow, Vec<String>)>> {
     let fits = "case when r.image is null then j.requires <@ $1::text[]
                      else ($3 and j.requires <@ $2::text[]) or ($4 and j.requires <@ $1::text[]) end";
     let query = format!(
         "with oldest as (
              select j.run from citrus.jobs j join citrus.runs r on r.id = j.run
-             where j.state = 'queued' and r.state = 'open' and ({fits})
-             order by r.created limit 1),
+             where j.state = 'queued' and r.state = 'open' and r.priority >= $7 and ({fits})
+             order by r.priority desc, r.created limit 1),
          picked as (
              select j.run, j.check_name from citrus.jobs j join citrus.runs r on r.id = j.run
              where j.run = (select run from oldest) and j.state = 'queued' and ({fits})
@@ -1170,6 +1180,7 @@ fn claim(
                 &native,
                 &slots,
                 &machine.name,
+                &min_priority,
             ],
         )
     })?;
