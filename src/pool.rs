@@ -871,7 +871,8 @@ fn serve(
     draining: &AtomicBool,
     running: &AtomicUsize,
 ) -> Result<i32> {
-    client.batch_execute("listen citrus_jobs")?;
+    client.batch_execute("listen citrus_jobs; listen citrus_binaries")?;
+    let prebuilding = Arc::new(AtomicBool::new(false));
     let free = Arc::new(AtomicUsize::new(machine.slots));
     let fatal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
@@ -943,11 +944,36 @@ fn serve(
         {
             break Ok(0);
         }
-        let _ = client
+        let mut published = Vec::new();
+        let first = client
             .notifications()
             .timeout_iter(Duration::from_secs(if limit > 0 { 5 } else { 1 }))
             .next()?;
-        while client.notifications().iter().next()?.is_some() {}
+        let mut next = first;
+        while let Some(notification) = next {
+            if notification.channel() == "citrus_binaries" {
+                published.push(notification.payload().to_owned());
+            }
+            next = client.notifications().iter().next()?;
+        }
+        // A new Citrus was published for another platform: build this one's
+        // now, while its pin is being merged, not when the first run asks.
+        if let Some(commit) = published.pop()
+            && commit != VERSION
+            && !prebuilding.swap(true, Ordering::SeqCst)
+        {
+            let (url, machine, prebuilding) =
+                (url.to_owned(), machine.clone(), prebuilding.clone());
+            std::thread::spawn(move || {
+                if let Err(error) = prebuild(&url, &machine, &commit) {
+                    eprintln!(
+                        "citrus agent {}: prebuild {commit}: {error:#}",
+                        machine.name
+                    );
+                }
+                prebuilding.store(false, Ordering::SeqCst);
+            });
+        }
     };
     // STOP kills the executors; their checks go back to the queue.
     for worker in workers {
@@ -955,6 +981,42 @@ fn serve(
     }
     running.store(0, Ordering::SeqCst);
     result
+}
+
+/// Build (or fetch) the executor of a just-published `commit` for the
+/// platform this machine runs checks on. One machine of the pool builds it,
+/// the others take it from the pool when they need it.
+fn prebuild(url: &str, machine: &Machine, commit: &str) -> Result<()> {
+    let platform = if machine.docker {
+        docker_platform()
+    } else {
+        None
+    };
+    let label = platform
+        .as_deref()
+        .map(|platform| platform.replace('/', "-"))
+        .unwrap_or_else(|| format!("{}-{}", os_label(), arch()));
+    let mut client = connect(url)?;
+    let held = client.query(
+        "select 1 from citrus.binaries where commit_sha = $1 and platform = $2",
+        &[&commit, &label],
+    )?;
+    if !held.is_empty() || machine.cache.join("bin").join(commit).join(&label).exists() {
+        return Ok(());
+    }
+    let key = format!("citrus-build:{commit}:{label}");
+    let locked: bool = client
+        .query_one("select pg_try_advisory_lock(hashtext($1))", &[&key])?
+        .get(0);
+    if !locked {
+        return Ok(());
+    }
+    eprintln!(
+        "citrus agent {}: builds Citrus {commit} for {label} ahead of its runs",
+        machine.name
+    );
+    executor(machine, commit, platform.as_deref(), &mut |_| Ok(()))?;
+    Ok(())
 }
 
 /// One claimed batch on its own connection. Its slots come back as its
@@ -1494,6 +1556,8 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
         .context("no pool: set CITRUS_POOL or ~/.config/citrus/pool")?;
     let mut client = connect(&url)?;
     let sha = store_binary(&mut client, &commit, &platform, file)?;
+    // The agents build theirs from it at once (see `prebuild`).
+    notify(&mut client, "citrus_binaries", &commit)?;
     Ok((commit, platform, sha))
 }
 
