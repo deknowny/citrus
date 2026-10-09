@@ -104,7 +104,7 @@ kernel's pressure counters (PSI) for CPU, disk and memory:
   share when it stops;
 - the disk is watched by what production feels: every tick the agent times an
   8 KiB `fdatasync` on the cache disk (the shape of a write-ahead log's sync;
-  the worst of the last three counts). Above 40 ms it cuts the budget like any
+  the worst of the last three counts). Above 60 ms (probed every quarter second) it cuts the budget like any
   pressure (`disk latency`) and halves the pool cgroup's write bandwidth
   (`io.max wbps` of the cache disk, from `--io-mib`, default 200 MiB/s, never
   below a tenth of it); it grows back by a quarter per calm tick. A build's

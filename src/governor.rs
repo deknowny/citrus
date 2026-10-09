@@ -62,8 +62,8 @@ pub struct Decision {
 const CPU_PRESSURE_LIMIT: f64 = 25.0;
 const IO_PRESSURE_LIMIT: f64 = 10.0;
 const MEMORY_FREE_LIMIT: f64 = 0.08;
-/// A healthy NVMe mirror syncs in a few ms; etcd complains at 100 ms.
-pub const FSYNC_LIMIT_MS: f64 = 40.0;
+/// A healthy NVMe mirror syncs in a few ms (tens now and then); etcd's heartbeat is 100 ms.
+pub const FSYNC_LIMIT_MS: f64 = 60.0;
 /// Added per tick while there is room (CPUs).
 const GROW: f64 = 0.5;
 /// The pool is blamed for pressure only when it uses at least this many CPUs.
@@ -295,6 +295,8 @@ pub fn slice_dir(slice: &str) -> Option<PathBuf> {
 pub struct DiskProbe {
     file: std::fs::File,
     path: PathBuf,
+    /// Worst probe since the last tick.
+    window: f64,
     recent: std::collections::VecDeque<f64>,
 }
 
@@ -324,11 +326,13 @@ impl DiskProbe {
         Some(DiskProbe {
             file,
             path,
+            window: 0.0,
             recent: Default::default(),
         })
     }
 
-    /// One probe; the worst latency of the last few, in milliseconds.
+    /// One probe, milliseconds; call it often (a stall is short, and a probe every
+    /// couple of seconds would miss most of them).
     pub fn probe(&mut self) -> f64 {
         use std::io::{Seek, SeekFrom, Write};
         let started = Instant::now();
@@ -340,10 +344,16 @@ impl DiskProbe {
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         // A failed write says nothing about latency.
         if synced.is_ok() {
-            self.recent.push_back(ms);
-            if self.recent.len() > Self::KEEP {
-                self.recent.pop_front();
-            }
+            self.window = self.window.max(ms);
+        }
+        ms
+    }
+
+    /// Closes a governor tick: the worst latency of this tick and the last few.
+    pub fn tick(&mut self) -> f64 {
+        self.recent.push_back(std::mem::take(&mut self.window));
+        if self.recent.len() > Self::KEEP {
+            self.recent.pop_front();
         }
         self.recent.iter().copied().fold(0.0, f64::max)
     }
@@ -571,6 +581,7 @@ mod tests {
         let mut probe = DiskProbe::new(&dir).unwrap();
         let ms = probe.probe();
         assert!(ms > 0.0 && ms < 5000.0, "{ms}");
+        assert!(probe.tick() > 0.0);
         drop(probe);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -971,7 +971,7 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
             let mut announced_at = Instant::now() - Duration::from_secs(60);
             let mut smoother = crate::governor::Smoother::default();
             while !stop.load(Ordering::SeqCst) {
-                let fsync_ms = probe.as_mut().map_or(0.0, |probe| probe.probe());
+                let fsync_ms = probe.as_mut().map_or(0.0, |probe| probe.tick());
                 if let Some(mut sample) = sampler.sample() {
                     sample.fsync_ms = fsync_ms;
                     let sample = smoother.smooth(sample);
@@ -1009,7 +1009,11 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
                 }
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(200));
+                    // A sync every quarter second: stalls are short.
+                    if let Some(probe) = probe.as_mut() {
+                        probe.probe();
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
                 }
             }
             if let Some(dir) = config.slice.as_deref().and_then(crate::governor::slice_dir) {
