@@ -38,7 +38,9 @@ start.
   machine. When it finishes, it claims more. A run of 11 checks on four
   machines takes about the time of its slowest check.
 - **The configuration says what checks need, not where they run.**
-  `#[meta(linux = true)]` (and `#[requires("docker")]`) match agent labels.
+  `#[meta(linux = true)]` and `#[meta(requires = ["web"])]` match agent labels; the same
+  `requires` on a `service` applies to every check that `#[needs]` it (an agent without the
+  label never takes them, e.g. a node whose disk must stay quiet).
   `#![image(dockerfile = "...", target = "...", context = "...")]` names the
   image the checks run in; an agent with Docker builds it (Docker's cache makes
   that cheap) and runs the executor inside, with the snapshot mounted at its

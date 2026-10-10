@@ -265,8 +265,21 @@ fn notify(client: &mut Client, channel: &str, payload: &str) -> Result<()> {
 
 /// What one check needs from an agent: `#[meta(linux = true)]` and
 /// `#[meta(requires = [...])]`.
-pub fn requirements(target: &crate::manifest::Target) -> Vec<String> {
+pub fn requirements(
+    target: &crate::manifest::Target,
+    services: &[crate::model::Service],
+) -> Vec<String> {
     let mut needs = Vec::new();
+    // A service can need a kind of machine (a node's disk, a browser).
+    for service in services {
+        if target
+            .resources
+            .iter()
+            .any(|resource| *resource == service.name)
+        {
+            needs.extend(service.requires.iter().cloned());
+        }
+    }
     if target.extensions.get("linux") == Some(&serde_json::Value::Bool(true)) {
         needs.push("linux".to_owned());
     }
@@ -441,12 +454,16 @@ pub fn run(
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             &[&id, &repo, &commit, &refname, &VERSION, &profile, &image, &crate::exec::agent(), &prepare, &priority],
         )?;
+        let services: &[crate::model::Service] = context
+            .project
+            .as_ref()
+            .map_or(&[], |project| project.services.as_slice());
         for check in checks {
             let needs = context
                 .manifest
                 .targets
                 .get(check)
-                .map(requirements)
+                .map(|target| requirements(target, services))
                 .unwrap_or_default();
             let outputs = context
                 .manifest

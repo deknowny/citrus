@@ -1150,7 +1150,20 @@ pub fn compile(
                         )]
                     })
                     .unwrap_or_default();
+                let mut requires = Vec::new();
+                for attr in item.attrs.iter().filter(|attr| attr.name == "meta") {
+                    for (key, value) in compiler.attr_object(attr)? {
+                        if key != "requires" {
+                            continue;
+                        }
+                        if let serde_json::Value::Array(items) = value {
+                            requires
+                                .extend(items.iter().filter_map(|i| i.as_str().map(str::to_owned)));
+                        }
+                    }
+                }
                 project.services.push(Service {
+                    requires,
                     name: dash(&item.name),
                     description: item.doc.clone(),
                     start,

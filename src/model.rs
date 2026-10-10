@@ -271,6 +271,9 @@ pub struct Service {
     /// Run when the run is over, whatever its result.
     pub stop: Vec<Step>,
     pub limit: Option<i64>,
+    /// Labels an agent needs to run a check that uses this service
+    /// (`#[meta(requires = ["web"])]`).
+    pub requires: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
