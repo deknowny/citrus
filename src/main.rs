@@ -301,6 +301,10 @@ enum Command {
         /// the agent halves it while the disk syncs slowly. 0 = no limit
         #[arg(long, value_name = "MIB", default_value_t = 200.0)]
         io_mib: f64,
+        /// Never take checks whose name matches this SQL `like` pattern (repeatable, or
+        /// comma-separated): a machine whose disk must stay quiet
+        #[arg(long, value_name = "PATTERN", value_delimiter = ',')]
+        decline: Vec<String>,
     },
     /// The pool: its agents, their load, and the checks queued and running.
     Pool {
@@ -664,6 +668,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             target_util,
             cache_gib,
             io_mib,
+            decline,
         }) => {
             return pool::agent(&pool::AgentOptions {
                 name: name.clone(),
@@ -678,6 +683,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
                 target_util: Some(*target_util),
                 cache_gib: Some(*cache_gib),
                 io_mib: Some(*io_mib),
+                decline: decline.clone(),
             });
         }
         Some(Command::Pool { action }) => return pool_command(action.as_ref(), json),

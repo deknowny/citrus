@@ -746,6 +746,8 @@ pub struct AgentOptions {
     pub min_cpus: Option<f64>,
     /// Write bandwidth cap for the pool's cgroup on the cache disk, MiB/s.
     pub io_mib: Option<f64>,
+    /// Checks (SQL `like` patterns) this agent does not take, whatever the requester asked.
+    pub decline: Vec<String>,
     /// Fraction of the machine the pool and the rest may use together (default 0.8).
     pub target_util: Option<f64>,
     /// The most disk the Cargo target directories of the slots may use together (GiB, default 200).
@@ -762,6 +764,8 @@ struct Machine {
     docker: bool,
     native: bool,
     cache: PathBuf,
+    /// SQL `like` patterns of checks this agent never takes.
+    decline: Vec<String>,
 }
 
 fn arch() -> &'static str {
@@ -890,6 +894,7 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
         docker: platform.is_some(),
         native: options.native,
         cache: cache_root(),
+        decline: options.decline.clone(),
     };
     std::fs::create_dir_all(&machine.cache)?;
     // SAFETY: the handler only stores to an atomic.
@@ -1365,11 +1370,13 @@ fn claim(
         "with oldest as (
              select j.run from citrus.jobs j join citrus.runs r on r.id = j.run
              where j.state = 'queued' and r.state = 'open' and r.priority >= $7 and ({fits})
+               and not (j.check_name like any($8::text[]))
              order by r.priority desc, r.created limit 1),
          picked as (
              select j.run, j.check_name from citrus.jobs j join citrus.runs r on r.id = j.run
              left join citrus.durations d on d.repo = r.repo and d.check_name = j.check_name
              where j.run = (select run from oldest) and j.state = 'queued' and ({fits})
+               and not (j.check_name like any($8::text[]))
              order by coalesce(d.seconds, 90) desc, j.check_name limit $5 for update of j skip locked)
          update citrus.jobs j set state = 'claimed', agent = $6, claimed = now()
          from picked where j.run = picked.run and j.check_name = picked.check_name
@@ -1388,6 +1395,7 @@ fn claim(
                 &slots,
                 &machine.name,
                 &min_priority,
+                &machine.decline,
             ],
         )
     })?;
