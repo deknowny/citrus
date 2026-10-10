@@ -764,6 +764,37 @@ fn config_value(arg: &Expr, globals: &Globals) -> Result<(), Error> {
     }
 }
 
+/// `run!` starts a program with arguments; it does not start a shell (`cmd!` is the
+/// explicit argv builder and may pass such words on purpose).
+/// A bare `&&`, `|`, `;`, `>` or a leading `cd` would reach the program as an
+/// argument (`mkdir -p a && cp -R b c` is `mkdir` with a `&&` operand), so it is
+/// refused where it is written.
+fn shell_syntax(words: &[CmdWord], span: Span) -> Result<(), Error> {
+    let literals: Vec<Option<String>> = words.iter().map(CmdWord::literal).collect();
+    // `find … -exec … ;` ends its command with a bare `;`.
+    if literals
+        .iter()
+        .flatten()
+        .any(|word| word == "-exec" || word == "-execdir" || word == "-ok")
+    {
+        return Ok(());
+    }
+    let operators = [
+        "&&", "||", "|", ";", "&", ">", ">>", "<", "2>", "2>&1", "&>", "|&",
+    ];
+    for (index, word) in literals.iter().enumerate() {
+        let Some(word) = word else { continue };
+        if operators.contains(&word.as_str()) || (index == 0 && word == "cd") {
+            return Err(Error::at(
+                span,
+                format!("`{word}` is shell syntax, but `run!` starts a program without a shell"),
+            )
+            .help("wrap the line: run!(\"sh -c '…'\"), or use separate run! calls"));
+        }
+    }
+    Ok(())
+}
+
 fn expect(found: &Ty, wanted: &Ty, span: Span) -> Result<(), Error> {
     if assignable(found, wanted) {
         Ok(())
@@ -1345,6 +1376,9 @@ impl<'a> Checker<'a> {
                 }
                 for word in env.iter().map(|(_, word)| word).chain(words) {
                     self.command_word(word)?;
+                }
+                if *run {
+                    shell_syntax(words, *span)?;
                 }
                 if *run { result_unit() } else { Ty::Command }
             }

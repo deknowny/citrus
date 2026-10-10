@@ -362,7 +362,9 @@ pub fn dead_globs(project: &Project, root: &Path) -> Vec<Error> {
     for check in project.checks.iter().filter(|check| check.cache) {
         let mut reported: Vec<&String> = Vec::new();
         for pattern in check.owns.iter().chain(&check.reads) {
+            // A lock marker names Cargo.lock packages, not files.
             if pattern.starts_with('!')
+                || pattern.starts_with(crate::lock::MARKER)
                 || reported.contains(&pattern)
                 || matcher.any(pattern).unwrap_or(true)
             {

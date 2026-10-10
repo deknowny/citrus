@@ -2250,6 +2250,28 @@ fn a_shell_brace_in_a_string_explains_interpolation() {
 }
 
 #[test]
+fn shell_syntax_in_run_is_refused_where_it_is_written() {
+    // `run!` starts a program: `&&` would be an operand of `mkdir`.
+    let project = ci_project(
+        "#![citrus(2)]\n#[paths(\"src/**\")]\ncheck x {\n    run!(\"mkdir -p a && cp -R b c\")?;\n}\n",
+    );
+    let message = project.json(&["status"]).0["error"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        message.contains("`&&` is shell syntax") && message.contains("sh -c"),
+        "{message}"
+    );
+    // Wrapped in a shell, or only quoted, or a `find -exec` terminator: fine.
+    let fine = ci_project(
+        "#![citrus(2)]\n#[paths(\"src/**\")]\ncheck x {\n    run!(\"sh -c 'mkdir -p a && cp -R b c'\")?;\n    run!(\"grep -E 'a|b' f\")?;\n    run!(\"find . -exec echo x ;\")?;\n}\n",
+    );
+    let (answer, _) = fine.json(&["status"]);
+    assert!(answer.get("error").is_none(), "{answer}");
+}
+
+#[test]
 fn an_error_in_citrus_ci_points_at_the_line() {
     let project = ci_project(
         "#![citrus(2)]\n#[paths(\"src/**\")]\ncheck x {\n    run!(\"make x\")?;\n}\n#[pths(\"src/**\")]\ncheck y {\n    run!(\"make y\")?;\n}\n",
