@@ -970,13 +970,20 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
             let mut announced = current;
             let mut announced_at = Instant::now() - Duration::from_secs(60);
             let mut smoother = crate::governor::Smoother::default();
+            let mut backoff = crate::governor::Backoff::new();
             while !stop.load(Ordering::SeqCst) {
                 let fsync_ms = probe.as_mut().map_or(0.0, |probe| probe.tick());
                 if let Some(mut sample) = sampler.sample() {
                     sample.fsync_ms = fsync_ms;
                     let sample = smoother.smooth(sample);
                     let decision = crate::governor::decide(&config, current, &sample);
-                    current = decision.budget;
+                    // After a disk stall the pool does not climb back at once.
+                    let holding = backoff.holding(decision.reason, Instant::now());
+                    current = if holding {
+                        decision.budget.min(current)
+                    } else {
+                        decision.budget
+                    };
                     allowed.store(
                         crate::governor::allowed_slots(current, config.share, slots),
                         Ordering::SeqCst,
@@ -987,7 +994,7 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
                     {
                         crate::governor::limit_cgroup(&dir, current);
                         if let Some(limit) = write_limit.as_mut() {
-                            limit.adjust(fsync_ms);
+                            limit.adjust(fsync_ms, holding);
                             limit.apply(&dir);
                         }
                     }

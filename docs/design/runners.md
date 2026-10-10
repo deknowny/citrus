@@ -107,7 +107,7 @@ kernel's pressure counters (PSI) for CPU, disk and memory:
   the worst of the last three counts). Above 60 ms (probed every quarter second) it cuts the budget like any
   pressure (`disk latency`) and halves the pool cgroup's write bandwidth
   (`io.max wbps` of the cache disk, from `--io-mib`, default 200 MiB/s, never
-  below a tenth of it); it grows back by a quarter per calm tick. A build's
+  below a tenth of it). After such a stall the budget and the cap are held for a minute, and for twice as long with every stall that follows soon after (up to ten minutes); only then they grow back, the cap by a tenth per calm tick. A build's
   dirty pages are what stalls a database's sync, so the cap acts at the source;
 - `citrus pool` shows `limited to N CPUs (reason)` while an agent holds back.
 

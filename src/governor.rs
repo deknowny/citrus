@@ -14,7 +14,7 @@
 //! Only Linux has the counters; elsewhere the agent keeps its fixed share.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// What the governor may do and how careful it is.
 #[derive(Debug, Clone)]
@@ -290,6 +290,51 @@ pub fn slice_dir(slice: &str) -> Option<PathBuf> {
     dir.join("cpu.stat").is_file().then_some(dir)
 }
 
+/// After the disk stalled, the pool stays where it was cut for a while, and the
+/// wait doubles with every stall that comes soon after the last: without it the
+/// budget climbs back in half a minute and the next burst stalls the disk again.
+#[derive(Debug)]
+pub struct Backoff {
+    until: Option<Instant>,
+    wait: Duration,
+    last: Option<Instant>,
+}
+
+impl Backoff {
+    const FIRST: Duration = Duration::from_secs(60);
+    const MOST: Duration = Duration::from_secs(600);
+
+    pub fn new() -> Backoff {
+        Backoff {
+            until: None,
+            wait: Self::FIRST,
+            last: None,
+        }
+    }
+
+    /// Records this tick; true while the pool must not grow.
+    pub fn holding(&mut self, reason: &str, now: Instant) -> bool {
+        if reason == "disk latency" || reason == "disk pressure" {
+            // A stall soon after the last hold ended doubles the wait; a long calm resets it.
+            self.wait = match self.last {
+                Some(last) if now.duration_since(last) < self.wait * 2 + Self::FIRST => {
+                    (self.wait * 2).min(Self::MOST)
+                }
+                _ => Self::FIRST,
+            };
+            self.until = Some(now + self.wait);
+            self.last = Some(now);
+        }
+        self.until.is_some_and(|until| now < until)
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Times `fdatasync` of a small file the way a write-ahead log does it. The
 /// worst of the last few probes counts: a stall is what hurts, not the mean.
 pub struct DiskProbe {
@@ -399,13 +444,13 @@ impl WriteLimit {
     }
 
     /// The limit after a tick with the disk this slow (MiB/s).
-    pub fn adjust(&mut self, fsync_ms: f64) -> f64 {
+    pub fn adjust(&mut self, fsync_ms: f64, holding: bool) -> f64 {
         self.current = if fsync_ms > FSYNC_LIMIT_MS {
             (self.current * 0.5).max(self.floor)
-        } else if fsync_ms > FSYNC_LIMIT_MS / 2.0 {
+        } else if fsync_ms > FSYNC_LIMIT_MS / 2.0 || holding {
             self.current
         } else {
-            (self.current * 1.25 + 1.0).min(self.cap)
+            (self.current * 1.1 + 1.0).min(self.cap)
         };
         self.current
     }
@@ -559,20 +604,24 @@ mod tests {
             floor: 20.0,
             current: 200.0,
         };
-        assert_eq!(limit.adjust(300.0), 100.0);
-        assert_eq!(limit.adjust(300.0), 50.0);
-        assert_eq!(limit.adjust(300.0), 25.0);
-        assert_eq!(limit.adjust(300.0), 20.0, "never below the floor");
+        assert_eq!(limit.adjust(300.0, false), 100.0);
+        assert_eq!(limit.adjust(300.0, false), 50.0);
+        assert_eq!(limit.adjust(300.0, false), 25.0);
+        assert_eq!(limit.adjust(300.0, false), 20.0, "never below the floor");
         assert_eq!(
-            limit.adjust(40.0),
+            limit.adjust(40.0, false),
             20.0,
             "holds while the disk is not yet calm"
         );
-        assert!(limit.adjust(3.0) > 20.0, "recovers when it is");
-        for _ in 0..40 {
-            limit.adjust(3.0);
+        assert!(limit.adjust(3.0, false) > 20.0, "recovers when it is");
+        for _ in 0..80 {
+            limit.adjust(3.0, false);
         }
-        assert_eq!(limit.adjust(3.0), 200.0, "back to the cap");
+        assert_eq!(limit.adjust(3.0, false), 200.0, "back to the cap");
+        // While the pool is held after a stall, a calm disk does not raise the cap.
+        limit.adjust(300.0, true);
+        let held = limit.adjust(3.0, true);
+        assert_eq!(limit.adjust(3.0, true), held);
     }
 
     #[test]
@@ -584,5 +633,24 @@ mod tests {
         assert!(probe.tick() > 0.0);
         drop(probe);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_disk_stall_holds_the_pool_and_repeated_stalls_hold_it_longer() {
+        let start = Instant::now();
+        let mut backoff = Backoff::new();
+        assert!(!backoff.holding("", start));
+        assert!(backoff.holding("disk latency", start));
+        assert!(backoff.holding("production load", start + Duration::from_secs(59)));
+        assert!(!backoff.holding("", start + Duration::from_secs(61)));
+        // Another stall soon after: the wait doubles (two minutes).
+        let second = start + Duration::from_secs(90);
+        assert!(backoff.holding("disk pressure", second));
+        assert!(backoff.holding("", second + Duration::from_secs(119)));
+        assert!(!backoff.holding("", second + Duration::from_secs(121)));
+        // After a long calm the wait starts over.
+        let later = second + Duration::from_secs(3600);
+        assert!(backoff.holding("disk latency", later));
+        assert!(!backoff.holding("", later + Duration::from_secs(61)));
     }
 }
