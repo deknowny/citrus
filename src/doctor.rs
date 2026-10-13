@@ -31,6 +31,21 @@ pub fn diagnose(context: &mut Context) -> Vec<Finding> {
         },
         format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("CITRUS_COMMIT")),
     );
+    if let Some(free) = crate::disk::free_bytes(&context.repo.root) {
+        let low = free < crate::disk::LOW_FREE;
+        note(
+            "disk",
+            if low { "warn" } else { "ok" },
+            if low {
+                format!(
+                    "{} GiB free: `citrus disk --trim` frees idle build caches",
+                    free >> 30
+                )
+            } else {
+                format!("{} GiB free", free >> 30)
+            },
+        );
+    }
     let config = &context.repo.config;
     match &context.project {
         Some(project) => note(

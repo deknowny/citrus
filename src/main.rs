@@ -10,6 +10,7 @@ mod apply;
 mod config;
 mod depinfo;
 mod deploy;
+mod disk;
 mod dockerfile;
 mod doctor;
 mod exec;
@@ -255,6 +256,15 @@ enum Command {
     Do { task: Option<String> },
     /// Check that this repository is set up so Citrus can be trusted.
     Doctor,
+    /// Free disk space and the Cargo target of every worktree; clean build caches.
+    Disk {
+        /// Drop incremental data idle for hours and artifacts idle for days, in every worktree.
+        #[arg(long)]
+        trim: bool,
+        /// Also remove the whole target of other worktrees idle for this many days.
+        #[arg(long, value_name = "DAYS")]
+        remove_idle: Option<u64>,
+    },
     /// How Citrus has been used: runs, reuse, time saved.
     Stats {
         #[arg(long, default_value_t = 7)]
@@ -717,6 +727,9 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             jobs,
             paths_file,
         } => {
+            if let Some(warning) = disk::low_space_warning(&context.repo.root) {
+                eprintln!("! {warning}");
+            }
             let paths = match &paths_file {
                 Some(file) => {
                     let text = std::fs::read_to_string(file)
@@ -1010,6 +1023,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             release::work(&context, &release)?;
             Ok(0)
         }
+        Command::Disk { trim, remove_idle } => disk::run(&context.repo, trim, remove_idle),
         Command::Doctor => {
             let findings = doctor::diagnose(&mut context);
             let failed = findings.iter().any(|finding| finding.status == "fail");
@@ -1777,6 +1791,10 @@ fn overview(context: &mut Context, json: bool) -> Result<i32> {
         ),
         ("citrus targets", "declared checks and their last result"),
         ("citrus doctor", "is this repository set up correctly"),
+        (
+            "citrus disk [--trim] [--remove-idle DAYS]",
+            "free space and the target of every worktree; clean idle build caches",
+        ),
     ];
     if json {
         let value = json!({

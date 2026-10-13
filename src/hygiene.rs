@@ -71,7 +71,7 @@ pub fn size(path: &Path) -> u64 {
 
 /// Incremental sessions (`<profile>/incremental/<session>`) idle for `INCREMENTAL_IDLE`
 /// and `deps` files idle for `ARTIFACT_IDLE`.
-fn trim_target(target: &Path) -> u64 {
+pub fn trim_target(target: &Path) -> u64 {
     let mut freed = 0;
     let Ok(profiles) = std::fs::read_dir(target) else {
         return 0;
