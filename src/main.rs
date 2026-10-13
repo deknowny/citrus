@@ -2140,6 +2140,7 @@ fn version_command(context: &Context, action: VersionAction, json: bool) -> Resu
                     source: &source,
                     agent: &agent,
                 },
+                &|_| None,
             )?;
             if json {
                 println!(

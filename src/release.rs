@@ -195,6 +195,58 @@ fn core(version: &str) -> Option<Vec<u64>> {
     core.split('.').map(|part| part.parse().ok()).collect()
 }
 
+/// Why `version` cannot be released from `commit`: its tag `<unit>/v<version>` already names
+/// another commit (the version was released from other sources; Citrus never moves a tag).
+pub fn tag_conflict_message(
+    unit: &str,
+    version: &str,
+    existing: &str,
+    commit: &str,
+) -> Option<String> {
+    if existing.is_empty() || existing == commit {
+        return None;
+    }
+    let short = |sha: &str| sha.chars().take(9).collect::<String>();
+    Some(format!(
+        "tag {unit}/v{version} already names {}, not {}: version {version} was released from another \
+         commit. Number from the highest tag (`git tag -l '{unit}/v*' | sort -V | tail -1`): raise the \
+         unit's `#[version(initial = …)]` above it, or run `git fetch --tags` when the tag exists only on \
+         origin, then start the release again.",
+        short(existing),
+        short(commit)
+    ))
+}
+
+/// The commit `<unit>/v<version>` names, locally or on origin; empty when the tag is free.
+fn tag_commit(repo: &crate::repo::Repo, unit: &str, version: &str) -> String {
+    let tag = format!("{unit}/v{version}");
+    let local = repo
+        .git(&["rev-parse", "--verify", "-q", &format!("{tag}^{{commit}}")])
+        .unwrap_or_default();
+    if !local.is_empty() {
+        return local;
+    }
+    // A tag made elsewhere and not fetched yet: the peeled line names the commit of an annotated tag.
+    let listed = repo
+        .git(&[
+            "ls-remote",
+            "--tags",
+            "origin",
+            &format!("refs/tags/{tag}"),
+            &format!("refs/tags/{tag}^{{}}"),
+        ])
+        .unwrap_or_default();
+    let mut found = String::new();
+    for line in listed.lines() {
+        if let Some((sha, name)) = line.split_once('\t') {
+            if name.ends_with("^{}") || found.is_empty() {
+                found = sha.to_owned();
+            }
+        }
+    }
+    found
+}
+
 /// A passed release is tagged `<unit>/v<version>` on its commit, and the tag
 /// is pushed; a missing remote or a failed push leaves the local tag.
 fn tag_release(context: &Context, release: &Release, version: &str) {
@@ -827,6 +879,14 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
                     source: &release.commit,
                     agent: &release.agent,
                 },
+                &|candidate| {
+                    tag_conflict_message(
+                        &release.unit,
+                        candidate,
+                        &tag_commit(&context.repo, &release.unit, candidate),
+                        &release.commit,
+                    )
+                },
             ) {
                 Ok(reserved) => {
                     println!("reserved {reserved}");
@@ -906,6 +966,18 @@ pub fn steps_of(context: &Context, id: &str) -> Result<Vec<ReleaseStep>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tag_on_another_commit_refuses_the_version_with_a_hint() {
+        let existing = "9db065fa0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let commit = "090e3ff24bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let message = tag_conflict_message("kycok", "1.0.0", existing, commit).expect("conflict");
+        assert!(message.contains("tag kycok/v1.0.0 already names 9db065fa0, not 090e3ff24"));
+        assert!(message.contains("initial") && message.contains("git fetch --tags"));
+        // The same commit (a retry of the same release) and a free tag are fine.
+        assert_eq!(tag_conflict_message("kycok", "1.0.0", commit, commit), None);
+        assert_eq!(tag_conflict_message("kycok", "1.0.1", "", commit), None);
+    }
 
     #[test]
     fn initial_is_the_floor_of_the_next_version() {

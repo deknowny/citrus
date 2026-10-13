@@ -66,6 +66,9 @@ pub struct Holder<'a> {
 
 /// The first version at or after `start` that nobody holds for any name of
 /// `scope` and that `free_version` (when declared) reports free.
+///
+/// `veto` sees each candidate before it is held: an answer refuses the release with that
+/// message, and nothing stays reserved, so a retry looks again.
 pub fn reserve(
     store: &Store,
     root: &Path,
@@ -73,6 +76,7 @@ pub fn reserve(
     start: &str,
     scope: &[String],
     holder: &Holder,
+    veto: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String> {
     let (major, minor, _, suffix) = parse(start)
         .with_context(|| format!("not a version: {start} (major.minor.patch[-suffix])"))?;
@@ -111,6 +115,9 @@ pub fn reserve(
                     }
                 ),
             }
+        }
+        if let Some(message) = veto(&candidate) {
+            bail!("{message}");
         }
         let reservation = Reservation {
             version: candidate.clone(),
