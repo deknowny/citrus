@@ -544,13 +544,24 @@ fn gate_plan(
     profile: &str,
     paths: &[String],
     base: &str,
+    environment: &str,
 ) -> Result<crate::plan::Plan> {
     let mut repo = context.repo.clone();
     if !profile.is_empty() {
         repo.config.plan.profile = Some(profile.to_owned());
     }
-    crate::plan::for_paths(&repo, &context.manifest, paths, base)
+    // The gate proves one environment: conditions may ask `env("CITRUS_GATE_ENVIRONMENT=…")`.
+    crate::plan::for_paths_with_env(
+        &repo,
+        &context.manifest,
+        paths,
+        base,
+        &[(GATE_ENVIRONMENT.to_owned(), environment.to_owned())],
+    )
 }
+
+/// What a release gate puts in the environment of the plan and of the checks it starts.
+pub const GATE_ENVIRONMENT: &str = "CITRUS_GATE_ENVIRONMENT";
 
 /// Prove what a release ships: the checks selected by the files that change
 /// between the commit `environment` runs and HEAD and that its changing
@@ -602,7 +613,7 @@ pub fn start_gate(context: &mut Context, environment: &str) -> Result<Option<Gat
         ..Gate::default()
     };
     for profile in profiles {
-        let plan = gate_plan(context, &profile, &paths, &running)?;
+        let plan = gate_plan(context, &profile, &paths, &running, environment)?;
         let needed = unproven_in(context, &plan)?;
         if needed.is_empty() {
             continue;
@@ -629,6 +640,7 @@ pub fn start_gate(context: &mut Context, environment: &str) -> Result<Option<Gat
             .args(["--detach", "--json", "--base", &running, "--paths-file"])
             .arg(&list)
             .env("CITRUS_RUN_PRIORITY", "10")
+            .env(GATE_ENVIRONMENT, environment)
             .stderr(std::process::Stdio::inherit())
             .output()?;
         let started: serde_json::Value =

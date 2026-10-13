@@ -118,13 +118,21 @@ fn edited_checks(repo: &Repo, manifest: &Manifest, before: &str) -> Vec<String> 
 /// The checks that changes to exactly `paths` would select; `before` is the
 /// revision those changes start from (for manifest edits).
 pub fn for_paths(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
-    let mut plan = for_paths_all(repo, manifest, paths, before)?;
-    narrow(&mut plan, repo, manifest);
-    Ok(plan)
+    for_paths_with_env(repo, manifest, paths, before, &[])
 }
 
-fn for_paths_all(repo: &Repo, manifest: &Manifest, paths: &[String], before: &str) -> Result<Plan> {
-    select(repo, manifest, paths.to_vec(), before, true, &[])
+/// As [`for_paths`], with `env` answering the configuration's `env("NAME=value")` conditions
+/// before the process environment does (a release gate names the environment it proves).
+pub fn for_paths_with_env(
+    repo: &Repo,
+    manifest: &Manifest,
+    paths: &[String],
+    before: &str,
+    env: &[(String, String)],
+) -> Result<Plan> {
+    let mut plan = select(repo, manifest, paths.to_vec(), before, true, env)?;
+    narrow(&mut plan, repo, manifest);
+    Ok(plan)
 }
 
 /// A change a `#[test]` asks about: its paths, the profile it is planned
