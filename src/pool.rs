@@ -55,6 +55,26 @@ pub fn url() -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Whether the configured pool can take work now: it answers and an agent has reported in the last
+/// ninety seconds. Anything else (no pool, unreachable, certificate refused, no agents) is false, so
+/// callers fall back to running here instead of failing on a pool nobody serves.
+pub fn has_live_agent() -> bool {
+    let Some(url) = url() else {
+        return false;
+    };
+    let Ok(mut client) = connect(&url) else {
+        return false;
+    };
+    client
+        .query_one(
+            "select count(*) from citrus.agents
+             where state <> 'gone' and seen > now() - make_interval(secs => 90)",
+            &[],
+        )
+        .map(|row| row.get::<_, i64>(0) > 0)
+        .unwrap_or(false)
+}
+
 /// `postgres://user:secret@host/db` without the secret, for messages.
 pub fn redact(url: &str) -> String {
     match (url.find("://"), url.rfind('@')) {

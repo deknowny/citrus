@@ -611,11 +611,16 @@ pub fn start_gate(context: &mut Context, environment: &str) -> Result<Option<Gat
             "{environment}: the shipped change needs {}; running them in the pool while the release builds",
             needed.join(", ")
         );
-        // In the pool when there is one: its caches are warm.
+        // In the pool when it can take the work: its caches are warm. A pool that is unreachable
+        // or has no agent would only fail the gate, so the checks then run on this machine.
         let mut run = std::process::Command::new(std::env::current_exe()?);
         run.arg("run");
-        if crate::pool::url().is_some() {
+        if crate::pool::has_live_agent() {
             run.arg("--remote");
+        } else if crate::pool::url().is_some() {
+            eprintln!(
+                "{environment}: the pool is unreachable or has no agent; running the checks here"
+            );
         }
         if !profile.is_empty() {
             run.args(["--profile", &profile]);
