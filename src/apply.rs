@@ -894,7 +894,23 @@ fn build_artifact(
                 .join(format!("build-{name}-{tag}.json"));
             // A named builder (a remote BuildKit with its caches): created
             // from `endpoint` the first time this machine needs it.
-            let builder = text(&artifact.build, "builder");
+            let mut builder = text(&artifact.build, "builder");
+            // A local builder on a nearly full disk takes Docker down with it: build on the
+            // endpoint's machine instead (`<builder>-remote`, created from `endpoint`).
+            if let Some(local) = &builder
+                && let Some(endpoint) = text(&artifact.build, "endpoint")
+                && endpoint.starts_with("ssh://")
+                && builder_is_local(local)
+                && let Some(free) = crate::disk::free_bytes(&context.repo.root)
+                && free < build_min_free()
+            {
+                eprintln!(
+                    "! {} GiB free on this disk (below {} GiB): building on {endpoint}",
+                    free >> 30,
+                    build_min_free() >> 30
+                );
+                builder = Some(format!("{local}-remote"));
+            }
             if let Some(builder) = &builder {
                 let known = Command::new("docker")
                     .args(["buildx", "inspect", builder])
@@ -1230,4 +1246,43 @@ fn write_private(path: &std::path::Path, text: &str) -> Result<()> {
         .open(path)?;
     std::io::Write::write_all(&mut file, text.as_bytes())?;
     Ok(())
+}
+
+/// Free space below which a build leaves this machine (`CITRUS_BUILD_MIN_FREE_GIB`, default 20).
+fn build_min_free() -> u64 {
+    let gib = std::env::var("CITRUS_BUILD_MIN_FREE_GIB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20);
+    gib << 30
+}
+
+/// The named builder exists here and runs on this machine (not over ssh).
+fn builder_is_local(builder: &str) -> bool {
+    Command::new("docker")
+        .args(["buildx", "inspect", builder])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && !String::from_utf8_lossy(&output.stdout).contains("ssh://")
+        })
+}
+
+#[cfg(test)]
+mod build_disk_tests {
+    use super::*;
+
+    #[test]
+    fn a_build_leaves_the_machine_below_twenty_gib_unless_told_otherwise() {
+        // SAFETY: tests of this module are the only ones reading the variable.
+        unsafe { std::env::remove_var("CITRUS_BUILD_MIN_FREE_GIB") };
+        assert_eq!(build_min_free(), 20 << 30);
+        unsafe { std::env::set_var("CITRUS_BUILD_MIN_FREE_GIB", "5") };
+        assert_eq!(build_min_free(), 5 << 30);
+        unsafe { std::env::remove_var("CITRUS_BUILD_MIN_FREE_GIB") };
+    }
+
+    #[test]
+    fn an_unknown_builder_is_not_local() {
+        assert!(!builder_is_local("citrus-no-such-builder-for-tests"));
+    }
 }
