@@ -355,14 +355,29 @@ pub fn dry_run(
 /// The version the environment runs now when Citrus can see it (releases
 /// may also be made by other means), otherwise the last release Citrus passed.
 fn previous_version(context: &Context, unit_name: &str, unit: &Unit) -> Result<String> {
-    if let Some(running) = crate::deploy::running_release(context, &unit.environment) {
-        return Ok(running);
-    }
-    Ok(context
+    let running = crate::deploy::running_release(context, &unit.environment);
+    let passed = context
         .store
         .last_passed_release(unit_name)?
-        .map(|release| release.version)
-        .unwrap_or_default())
+        .map(|release| release.version);
+    Ok(higher_version(running, passed).unwrap_or_default())
+}
+
+/// The higher of the running and the last passed version. The record workload keeps the
+/// version of the last release that rolled it, so a release that leaves it alone (only the
+/// web changed) must not make the next one number below itself: Garvis 0.51.0 rolled only
+/// the Mini App, the backend still said 0.50.91, and the next fix became 0.50.92.
+fn higher_version(running: Option<String>, passed: Option<String>) -> Option<String> {
+    match (running, passed) {
+        (Some(running), Some(passed)) => {
+            if core(&passed) > core(&running) {
+                Some(passed)
+            } else {
+                Some(running)
+            }
+        }
+        (running, passed) => running.or(passed),
+    }
 }
 
 /// Validate the gates, reserve the version and start the release worker.
@@ -983,6 +998,22 @@ pub fn steps_of(context: &Context, id: &str) -> Result<Vec<ReleaseStep>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_next_version_counts_from_the_higher_of_running_and_released() {
+        let higher = |running: Option<&str>, passed: Option<&str>| {
+            higher_version(running.map(str::to_owned), passed.map(str::to_owned))
+        };
+        assert_eq!(higher(Some("0.50.91"), Some("0.51.0")).as_deref(), Some("0.51.0"));
+        assert_eq!(higher(Some("0.51.2"), Some("0.51.1")).as_deref(), Some("0.51.2"));
+        assert_eq!(higher(None, Some("0.50.9")).as_deref(), Some("0.50.9"));
+        assert_eq!(higher(Some("1.0.0"), None).as_deref(), Some("1.0.0"));
+        assert_eq!(higher(Some("0.50.100"), Some("0.50.99")).as_deref(), Some("0.50.100"));
+        assert_eq!(
+            next_version("0.51.0", "0.50.5", Level::Patch).as_deref(),
+            Some("0.51.1")
+        );
+    }
 
     #[test]
     fn a_tag_on_another_commit_refuses_the_version_with_a_hint() {
