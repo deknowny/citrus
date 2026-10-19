@@ -598,12 +598,27 @@ fn run_step(
             .context("image not built")?;
         // Re-running a step whose change already landed must not wait for a
         // takeover that will not happen: nothing restarts for the same image.
+        // Other containers of the pod running the same repository (a sidecar built into the
+        // same image) take the same build, as a manifest apply gives them.
+        let siblings = if roll.manifest.is_empty() && environment.manifests.is_empty() {
+            sibling_containers(
+                environment,
+                extra_env,
+                &roll.kind,
+                name,
+                &roll.container,
+                &image,
+            )?
+        } else {
+            Vec::new()
+        };
         let already = deploy::observe(environment)?
             .into_iter()
             .find(|item| item.workload == name)
             .and_then(|item| item.image)
             .as_deref()
-            == Some(image.as_str());
+            == Some(image.as_str())
+            && siblings.iter().all(|(_, current)| current == &image);
         let holder_before = match &roll.fence {
             Some(lease) if !already => lease_holder(environment, extra_env, lease)?,
             _ => String::new(),
@@ -705,7 +720,11 @@ fn run_step(
                 container["env"] =
                     serde_json::json!([{"name": roll.version_env, "value": plan.release_name}]);
             }
-            let containers = serde_json::json!([container]);
+            let mut containers = vec![container];
+            for (sibling, _) in &siblings {
+                containers.push(serde_json::json!({"name": sibling, "image": image}));
+            }
+            let containers = serde_json::Value::from(containers);
             let patch = if already {
                 // Same image: record only. Touching the pod template would restart it for nothing.
                 serde_json::json!({"metadata": {"annotations": annotations}})
@@ -1179,6 +1198,46 @@ fn kubectl(environment: &Environment, extra_env: &BTreeMap<String, String>) -> C
     command
 }
 
+/// Containers of a workload's pod, other than `container`, whose image is from the same
+/// repository as `image`: `(name, current image)`.
+fn sibling_containers(
+    environment: &Environment,
+    extra_env: &BTreeMap<String, String>,
+    kind: &str,
+    name: &str,
+    container: &str,
+    image: &str,
+) -> Result<Vec<(String, String)>> {
+    let output = kubectl(environment, extra_env)
+        .args(["get", kind, name, "-o", "json"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let object: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let spec = if kind == "cronjob" {
+        &object["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    } else {
+        &object["spec"]["template"]["spec"]
+    };
+    Ok(siblings_of(spec, container, image))
+}
+
+fn siblings_of(spec: &serde_json::Value, container: &str, image: &str) -> Vec<(String, String)> {
+    let target = repository(image);
+    spec["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["name"] != container)
+        .filter_map(|entry| {
+            let current = entry["image"].as_str()?;
+            let name = entry["name"].as_str()?;
+            (repository(current) == target).then(|| (name.to_owned(), current.to_owned()))
+        })
+        .collect()
+}
+
 fn lease_holder(
     environment: &Environment,
     extra_env: &BTreeMap<String, String>,
@@ -1284,5 +1343,27 @@ mod build_disk_tests {
     #[test]
     fn an_unknown_builder_is_not_local() {
         assert!(!builder_is_local("citrus-no-such-builder-for-tests"));
+    }
+}
+
+#[cfg(test)]
+mod sibling_tests {
+    use super::*;
+
+    #[test]
+    fn sidecars_of_the_same_repository_take_the_build() {
+        let spec = serde_json::json!({"containers": [
+            {"name": "userbot", "image": "registry.example/app@sha256:aaa"},
+            {"name": "mtproxy", "image": "registry.example/app@sha256:old"},
+            {"name": "metrics", "image": "registry.example/exporter:1"},
+        ]});
+        assert_eq!(
+            siblings_of(&spec, "userbot", "registry.example/app@sha256:new"),
+            vec![(
+                "mtproxy".to_owned(),
+                "registry.example/app@sha256:old".to_owned()
+            )]
+        );
+        assert!(siblings_of(&spec, "metrics", "registry.example/exporter:2").is_empty());
     }
 }
