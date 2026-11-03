@@ -199,7 +199,7 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// A short stable name for a path (temporary files of different trees).
-fn short_path_hash(path: &Path) -> String {
+pub fn short_path_hash(path: &Path) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(&Sha256::digest(path.to_string_lossy().as_bytes())[..4])
 }

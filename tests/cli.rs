@@ -2215,6 +2215,36 @@ environment gated;
 }
 
 #[test]
+fn local_runs_of_one_checkout_take_turns() {
+    let project = Project::new(
+        r#"
+#[paths("one/*")]
+check first {
+    run!("sh -c 'echo first-start >> order; sleep 2; echo first-end >> order'")?;
+}
+
+#[paths("two/*")]
+check second {
+    run!("sh -c 'echo second-start >> order; echo second-end >> order'")?;
+}
+"#,
+    );
+    project.write(".gitignore", ".scratch/\norder\n");
+    project.commit("ignore order");
+    let (first, _) = project.json(&["run", "--local", "--detach", "first"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (second, _) = project.json(&["run", "--local", "--detach", "second"]);
+    for run in [&first, &second] {
+        let id = run["run"]["id"].as_str().unwrap();
+        assert_eq!(project.json(&["wait", id]).1, 0, "{run}");
+    }
+    assert_eq!(
+        fs::read_to_string(project.root().join("order")).unwrap(),
+        "first-start\nfirst-end\nsecond-start\nsecond-end\n"
+    );
+}
+
+#[test]
 fn a_failed_apply_resumes_quiesced_work_and_frees_the_environment() {
     let project = apply_project();
     project.write("src/a.txt", "v2\n");

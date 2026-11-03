@@ -514,6 +514,13 @@ impl Context {
     /// Runs inside the detached worker process; stdout and stderr are the run log.
     pub fn work(&mut self, id: &str) -> Result<()> {
         let run = self.store.run(id)?.context("unknown run")?;
+        // Runs on this machine in one checkout take turns: they share its build directory
+        // and its test stack, and two at once slowed each other tenfold (2026-11-03).
+        let _turn = if run.mode == "remote" {
+            None
+        } else {
+            Some(self.checkout_turn()?)
+        };
         self.store.set_state(id, "running")?;
         let targets = self.store.targets(id)?;
         let jobs: usize = self
@@ -561,6 +568,33 @@ impl Context {
             Some(if ok { 0 } else { 1 }),
         )?;
         Ok(())
+    }
+
+    /// Waits until no other local run of this checkout is running; held until dropped.
+    fn checkout_turn(&self) -> Result<fs::File> {
+        use std::os::fd::AsRawFd;
+        let dir = self.repo.state_dir().join("turns");
+        crate::repo::private_dir(&dir)?;
+        let path = dir.join(format!(
+            "{}.lock",
+            crate::repo::short_path_hash(&self.repo.root)
+        ));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        // SAFETY: flock on a descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            println!("CITRUS_NOTE another run of this checkout is running; waiting for its turn");
+            // SAFETY: as above; blocks until the other run ends.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("flock {}", path.display()));
+            }
+        }
+        Ok(file)
     }
 
     fn work_local(&self, run: &Run, targets: &[RunTarget]) -> Result<Vec<String>> {
