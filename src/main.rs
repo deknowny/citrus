@@ -229,6 +229,11 @@ enum Command {
         unchecked: bool,
         #[arg(long)]
         detach: bool,
+        /// Change nothing: prove the checks the shipped change needs and build
+        /// every artifact for HEAD, so an apply or release of this commit only
+        /// reuses them, rolls and verifies. One prepare at a time per machine.
+        #[arg(long, conflicts_with_all = ["approve", "plan", "unchecked", "detach"])]
+        prepare: bool,
     },
     /// Releases: declared units, running them with gates and recorded steps.
     Release {
@@ -978,10 +983,55 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
         }
         Command::Apply {
             environment,
+            prepare: true,
+            ..
+        } => {
+            let Some(prepared) = apply::prepare(&mut context, &environment)? else {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &json!({"schema": SCHEMA, "environment": environment, "state": "unchanged"})
+                        )?
+                    );
+                } else {
+                    println!("{environment} already runs what HEAD builds; nothing to prepare");
+                }
+                return Ok(0);
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema": SCHEMA,
+                        "state": "prepared",
+                        "prepared": prepared,
+                        "next": [format!("citrus apply {environment} --approve")],
+                    }))?
+                );
+            } else {
+                let short = &prepared.commit[..12.min(prepared.commit.len())];
+                println!(
+                    "{environment} · {short} prepared in {}s: {} checks proven, {} of {} artifacts built",
+                    prepared.seconds,
+                    prepared.checks.len(),
+                    prepared.built.len(),
+                    prepared.artifacts.len()
+                );
+                for (name, reference) in &prepared.artifacts {
+                    println!("  {name}  {reference}");
+                }
+                println!("an apply or release of {short} now reuses them: migrate, roll, verify");
+            }
+            Ok(0)
+        }
+        Command::Apply {
+            environment,
             approve,
             plan,
             unchecked,
             detach,
+            prepare: false,
         } => {
             let started = apply::start(
                 &mut context,

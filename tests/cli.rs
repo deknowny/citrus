@@ -2069,6 +2069,99 @@ fn apply_builds_by_key_rolls_by_digest_and_records_the_commit() {
 }
 
 #[test]
+fn prepare_proves_and_builds_without_changing_the_environment_and_apply_reuses_both() {
+    let project = apply_project();
+    project.write("src/a.txt", "v2\n");
+    project.write("migrations/2.sql", "alter table t;\n");
+    project.git(&["add", "-A"]);
+    project.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "feature",
+    ]);
+    let before = kube_state(&project);
+
+    let (prepared, code) = project.json(&["apply", "prod", "--prepare"]);
+    assert_eq!(code, 0, "{prepared}");
+    assert_eq!(prepared["state"], "prepared", "{prepared}");
+    let built: Vec<&str> = prepared["prepared"]["built"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect();
+    assert_eq!(built, ["api", "migrations"], "{prepared}");
+    assert!(
+        !prepared["prepared"]["checks"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the shipped change needed a check: {prepared}"
+    );
+    // Nothing in the environment changed: no roll, no job, no suspended cronjob.
+    assert_eq!(kube_state(&project), before);
+    let calls = fs::read_to_string(project.root().join(".kube/calls")).unwrap_or_default();
+    assert!(!calls.contains("patch"), "{calls}");
+    let builds = fs::read_to_string(project.root().join(".kube/builds"))
+        .unwrap()
+        .lines()
+        .count();
+
+    // Prepared twice: everything is reused.
+    let (again, _) = project.json(&["apply", "prod", "--prepare"]);
+    assert!(
+        again["prepared"]["built"].as_array().unwrap().is_empty(),
+        "{again}"
+    );
+    assert!(
+        again["prepared"]["checks"].as_array().unwrap().is_empty(),
+        "{again}"
+    );
+
+    // The apply of the same commit builds nothing and has no gate left to wait for.
+    let (applied, code) = project.json(&["apply", "prod", "--approve"]);
+    assert_eq!(code, 0, "{applied}");
+    let steps: Vec<&str> = applied["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["name"].as_str().unwrap())
+        .collect();
+    assert!(!steps.contains(&"gate"), "{applied}");
+    assert_eq!(
+        fs::read_to_string(project.root().join(".kube/builds"))
+            .unwrap()
+            .lines()
+            .count(),
+        builds,
+        "the apply reused the prepared builds"
+    );
+    assert!(
+        kube_state(&project)["deployments"]["api"]["image"]
+            .as_str()
+            .unwrap()
+            .starts_with("registry.example/api@sha256:")
+    );
+    assert_eq!(
+        project.json(&["apply", "prod", "--prepare"]).0["state"],
+        "unchanged"
+    );
+
+    // A prepare builds from a commit.
+    project.write("src/a.txt", "v3\n");
+    let (dirty, code) = project.json(&["apply", "prod", "--prepare"]);
+    assert_ne!(code, 0);
+    assert!(
+        dirty["error"].as_str().unwrap().contains("commit"),
+        "{dirty}"
+    );
+}
+
+#[test]
 fn a_failed_apply_resumes_quiesced_work_and_frees_the_environment() {
     let project = apply_project();
     project.write("src/a.txt", "v2\n");

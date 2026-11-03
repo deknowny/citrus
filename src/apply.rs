@@ -437,6 +437,178 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Runs the environment's `prepare` command: the values it prints as
+/// `KEY=value` lines join `extra_env`; other lines go to the log.
+fn environment_prepare(
+    context: &Context,
+    environment: &Environment,
+    extra_env: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let output = command(&environment.prepare, extra_env, context)?
+        .stdout(Stdio::piped())
+        .spawn()?
+        .wait_with_output()?;
+    if !output.status.success() {
+        bail!("prepare failed");
+    }
+    let mut values = extra_env.clone();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some((key, value)) = line.split_once('=')
+            && !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            values.insert(key.to_owned(), value.to_owned());
+        } else {
+            println!("{line}");
+        }
+    }
+    Ok(values)
+}
+
+/// What `citrus apply <environment> --prepare` made ready for a release of HEAD.
+#[derive(Debug, Serialize)]
+pub struct Prepared {
+    pub environment: String,
+    pub commit: String,
+    /// The checks the shipped change needs that were not proven before.
+    pub checks: Vec<String>,
+    /// Every artifact the release rolls or migrates with: (name, reference).
+    pub artifacts: Vec<(String, String)>,
+    /// The artifacts built now (the rest were built before from the same inputs).
+    pub built: Vec<String>,
+    pub seconds: u64,
+}
+
+/// `citrus apply <environment> --prepare`: everything an apply of HEAD needs
+/// before it changes the environment — the gate's checks proven and every
+/// artifact built and published by its input key — so that the apply (or the
+/// release whose step runs it) from the same commit reuses both and only
+/// migrates, rolls and verifies. Nothing in the environment changes: no
+/// approval, no environment lock, no release record. The checks run first and
+/// the builds one after another, and one prepare runs at a time on the machine
+/// (`prepare.lock` in the state directory), across worktrees: they are the
+/// heaviest work it does. None when the environment already runs HEAD's build.
+pub fn prepare(context: &mut Context, name: &str) -> Result<Option<Prepared>> {
+    let environments = deploy::environments(context)?;
+    let environment = environments
+        .get(name)
+        .with_context(|| format!("no environment {name}"))?
+        .clone();
+    if !context
+        .repo
+        .git(&["status", "--porcelain", "--untracked-files=no"])?
+        .is_empty()
+    {
+        bail!("commit the source first: a release builds from a commit");
+    }
+    let _lock = prepare_lock(&context.repo.state_dir())?;
+    let started = now();
+    let diff = deploy::diff(context, name)?;
+    let artifacts = deploy::artifacts(context)?;
+    let migration = migration_change(context, &environment, &artifacts, &diff)?;
+    if diff.workloads.iter().all(|item| item.change == "unchanged") && migration.is_none() {
+        return Ok(None);
+    }
+    let mut builds: Vec<Build> = Vec::new();
+    for item in diff
+        .workloads
+        .iter()
+        .filter(|item| item.change != "unchanged")
+    {
+        let artifact = &environment.workloads[&item.workload].artifact;
+        if !builds.iter().any(|build| &build.artifact == artifact) {
+            builds.push(Build {
+                artifact: artifact.clone(),
+                key: item.desired_key.clone(),
+            });
+        }
+    }
+    if let Some((artifact, key)) = migration
+        && !builds.iter().any(|build| build.artifact == artifact)
+    {
+        builds.push(Build { artifact, key });
+    }
+    // The checks first: a change that fails them is not worth a build.
+    let mut checks = Vec::new();
+    if environment.checks == "proven"
+        && let Some(gate) = crate::release::start_gate(&mut *context, name)?
+    {
+        crate::release::finish_gate(context, &gate)?;
+        checks = gate.needed;
+    }
+    let extra_env = if environment.prepare.is_empty() {
+        BTreeMap::new()
+    } else {
+        environment_prepare(context, &environment, &BTreeMap::new())?
+    };
+    let mut prepared = Prepared {
+        environment: name.to_owned(),
+        commit: diff.head.clone(),
+        checks,
+        artifacts: Vec::new(),
+        built: Vec::new(),
+        seconds: 0,
+    };
+    for build in builds {
+        let reference = match context
+            .store
+            .artifact_reference(&build.artifact, &build.key)?
+        {
+            Some(reference) => reference,
+            None => {
+                let artifact = artifacts
+                    .get(&build.artifact)
+                    .context("artifact no longer declared")?;
+                eprintln!("{name}: building {} ({})", build.artifact, &build.key[..12]);
+                let reference = build_artifact(
+                    context,
+                    &build.artifact,
+                    artifact,
+                    &build.key,
+                    &diff.head,
+                    &extra_env,
+                )?;
+                context
+                    .store
+                    .put_artifact_reference(&build.artifact, &build.key, &reference)?;
+                prepared.built.push(build.artifact.clone());
+                reference
+            }
+        };
+        prepared.artifacts.push((build.artifact, reference));
+    }
+    prepared.seconds = now().saturating_sub(started);
+    Ok(Some(prepared))
+}
+
+/// One prepare at a time on this machine: waits for the one that holds it.
+fn prepare_lock(dir: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    crate::repo::private_dir(dir)?;
+    let path = dir.join("prepare.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        eprintln!(
+            "citrus: another prepare holds {}; waiting for it",
+            path.display()
+        );
+        // SAFETY: as above; blocks until the holder exits or unlocks.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("flock {}", path.display()));
+        }
+    }
+    Ok(file)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_step(
     context: &Context,
@@ -449,26 +621,7 @@ fn run_step(
     quiesced_file: &std::path::Path,
 ) -> Result<()> {
     if step == "prepare" {
-        let output = command(&environment.prepare, extra_env, context)?
-            .stdout(Stdio::piped())
-            .spawn()?
-            .wait_with_output()?;
-        if !output.status.success() {
-            bail!("prepare failed");
-        }
-        let mut values = extra_env.clone();
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if let Some((key, value)) = line.split_once('=')
-                && !key.is_empty()
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-            {
-                values.insert(key.to_owned(), value.to_owned());
-            } else {
-                println!("{line}");
-            }
-        }
+        let values = environment_prepare(context, environment, extra_env)?;
         write_private(
             env_file,
             &values
