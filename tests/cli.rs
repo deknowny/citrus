@@ -1532,7 +1532,10 @@ environment prod;
 }
 
 const FAKE_KUBECTL: &str = r#"#!/usr/bin/env python3
-import json, os, sys
+import fcntl, json, os, sys, time
+# Rolls run side by side: one kubectl at a time reads and writes the state.
+lock = open(".kube/lock", "w")
+fcntl.flock(lock, fcntl.LOCK_EX)
 state_path = ".kube/state.json"
 state = json.load(open(state_path))
 args = [a for a in sys.argv[1:]]
@@ -1570,6 +1573,11 @@ elif verb == "patch":
             state["lease"] = name + "-new-" + target["image"][-6:]
     save()
 elif verb == "rollout":
+    if os.environ.get("FAKE_ROLLOUT_SECONDS"):
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        open(".kube/rollouts", "a").write("start\n")
+        time.sleep(float(os.environ["FAKE_ROLLOUT_SECONDS"]))
+        open(".kube/rollouts", "a").write("end\n")
     sys.exit(1 if os.path.exists(".kube/fail-rollout") else 0)
 elif verb == "create" and "--dry-run=client" in args:
     if "-k" in args:
@@ -2242,6 +2250,62 @@ check second {
         fs::read_to_string(project.root().join("order")).unwrap(),
         "first-start\nfirst-end\nsecond-start\nsecond-end\n"
     );
+}
+
+#[test]
+fn apply_rolls_its_workloads_side_by_side() {
+    let project = apply_project();
+    project.declare(
+        r#"
+/// The web image.
+#[inputs("web/**")]
+#[build(provider = "command", run = cmd!("sh -c 'echo IMAGE=registry.example/{{artifact}}@sha256:{{key}}'"))]
+artifact web;
+
+#[kubernetes(kubectl = "./kubectl.py", namespace = "shop")]
+#[record(annotation = "example.com/release", tag_prefix = "v")]
+#[deploy("api", api, timeout = 10s)]
+#[deploy("web", web, timeout = 10s)]
+#[checks(none)]
+environment two;
+"#,
+    );
+    let mut state = kube_state(&project);
+    state["deployments"]["web"] = serde_json::json!({"image": "registry.example/web@sha256:old", "annotations": {"example.com/release": "1.0.0"}});
+    project.write(".kube/state.json", &state.to_string());
+    project.write("src/a.txt", "v2\n");
+    project.write("web/index.html", "v2\n");
+    project.commit("both change");
+    let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+        .args(["apply", "two", "--approve", "--json"])
+        .current_dir(project.root())
+        .env("CITRUS_POOL", "")
+        .env("CITRUS_STATE", test_state())
+        .env("FAKE_ROLLOUT_SECONDS", "1")
+        .output()
+        .unwrap();
+    let applied: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.status.success(), "{applied}");
+    // Both rollouts were waited for at once.
+    assert_eq!(
+        fs::read_to_string(project.root().join(".kube/rollouts")).unwrap(),
+        "start\nstart\nend\nend\n"
+    );
+    let state = kube_state(&project);
+    for workload in ["api", "web"] {
+        assert!(
+            state["deployments"][workload]["image"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("registry.example/{workload}@sha256:")),
+            "{state}"
+        );
+        assert_ne!(
+            state["deployments"][workload]["image"],
+            format!("registry.example/{workload}@sha256:old")
+        );
+    }
+    assert_eq!(applied["release"]["state"], "passed", "{applied}");
 }
 
 #[test]

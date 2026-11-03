@@ -351,6 +351,9 @@ enum Command {
     ReleaseWorker { release: String },
     #[command(hide = true)]
     ApplyWorker { release: String },
+    /// Runs one step of an apply (a roll beside the others).
+    #[command(hide = true)]
+    ApplyStep { release: String, step: String },
     #[command(hide = true)]
     RefreshResources,
 }
@@ -1067,6 +1070,10 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
         }
         Command::ApplyWorker { release } => {
             apply::work(&context, &release)?;
+            Ok(0)
+        }
+        Command::ApplyStep { release, step } => {
+            apply::one_step(&context, &release, &step)?;
             Ok(0)
         }
         Command::ReleaseWorker { release } => {

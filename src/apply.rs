@@ -373,9 +373,37 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
             return Ok(());
         }
     }
+    let mut rolled = false;
     for mut step in context.store.release_steps(id)? {
-        if matches!(step.state.as_str(), "passed" | "recovered") {
+        if matches!(step.state.as_str(), "passed" | "recovered")
+            || (rolled && step.name.starts_with("roll:"))
+        {
             continue;
+        }
+        // The rolls go side by side once everything before them passed: each waits only for its
+        // own workload (one after another they added up to a minute, 2026-11-03).
+        if step.name.starts_with("roll:") {
+            let rolls: Vec<ReleaseStep> = context
+                .store
+                .release_steps(id)?
+                .into_iter()
+                .filter(|step| step.name.starts_with("roll:"))
+                .filter(|step| !matches!(step.state.as_str(), "passed" | "recovered"))
+                .collect();
+            if rolls.len() > 1 {
+                if let Some(failed) = roll_side_by_side(context, id, rolls)? {
+                    if quiesced_file.exists() {
+                        let _ = resume_cronjobs(&environment, &quiesced_file, &read_env(&env_file));
+                    }
+                    context
+                        .store
+                        .finish_release(id, "failed", &format!("step {failed} failed"))?;
+                    context.store.unlock_environment(&release.environment, id)?;
+                    return Ok(());
+                }
+                rolled = true;
+                continue;
+            }
         }
         println!("CITRUS_STEP target={} status=START", step.name);
         step.state = "running".into();
@@ -606,6 +634,77 @@ fn prepare_lock(dir: &std::path::Path) -> Result<std::fs::File> {
         }
     }
     Ok(file)
+}
+
+/// Runs the rolls in child processes (`citrus apply-step`), all at once; the name of a
+/// failed one, if any.
+fn roll_side_by_side(
+    context: &Context,
+    id: &str,
+    rolls: Vec<ReleaseStep>,
+) -> Result<Option<String>> {
+    let started = now();
+    let mut children = Vec::new();
+    for mut step in rolls {
+        println!("CITRUS_STEP target={} status=START", step.name);
+        step.state = "running".into();
+        context.store.update_step(id, &step)?;
+        let child = Command::new(std::env::current_exe()?)
+            .args(["apply-step", id, &step.name])
+            .current_dir(&context.repo.root)
+            .spawn()?;
+        children.push((step, child));
+    }
+    let mut failed = None;
+    for (mut step, mut child) in children {
+        let ok = child.wait()?.success();
+        step.seconds = Some((now() - started) as i64);
+        step.exit = Some(if ok { 0 } else { 1 });
+        step.state = if ok { "passed" } else { "failed" }.into();
+        println!(
+            "CITRUS_STEP target={} status={} exit={} seconds={}",
+            step.name,
+            if ok { "PASS" } else { "FAIL" },
+            if ok { 0 } else { 1 },
+            step.seconds.unwrap_or_default()
+        );
+        if !ok {
+            step.first_error = Some(format!("{} failed", step.name));
+            failed.get_or_insert(step.name.clone());
+        }
+        context.store.update_step(id, &step)?;
+    }
+    Ok(failed)
+}
+
+/// One step of apply `id` in this process (`citrus apply-step`): a roll beside the others.
+pub fn one_step(context: &Context, id: &str, name: &str) -> Result<()> {
+    let release = context.store.release(id)?.context("unknown apply")?;
+    let plan: Plan = serde_json::from_str(&fs::read_to_string(
+        std::path::Path::new(&release.log).with_extension("plan.json"),
+    )?)?;
+    let environments = deploy::environments(context)?;
+    let environment = environments
+        .get(&plan.environment)
+        .context("environment no longer declared")?
+        .clone();
+    let artifacts = deploy::artifacts(context)?;
+    let env_file = std::path::Path::new(&release.log).with_extension("env");
+    let quiesced_file = std::path::Path::new(&release.log).with_extension("quiesced");
+    let outcome = run_step(
+        context,
+        &environment,
+        &artifacts,
+        &plan,
+        name,
+        &read_env(&env_file),
+        &env_file,
+        &quiesced_file,
+    );
+    if let Err(error) = &outcome {
+        println!("{name}: {error:#}");
+    }
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
