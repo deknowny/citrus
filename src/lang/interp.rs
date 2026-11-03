@@ -189,13 +189,7 @@ impl<'a> Interp<'a> {
                     items
                         .iter()
                         .filter(|inner| matches!(inner.kind, ItemKind::Check { .. }))
-                        .map(|inner| {
-                            format!(
-                                "{}.{}",
-                                super::compile::dash(&item.name),
-                                super::compile::dash(&inner.name)
-                            )
-                        }),
+                        .map(|inner| super::compile::member_name(&item.name, &inner.name)),
                 ),
                 _ => {}
             }

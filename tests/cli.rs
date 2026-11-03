@@ -3471,6 +3471,10 @@ check after {
         plan["plan"]["targets"],
         serde_json::json!(["mt3s-rust.clippy", "after"])
     );
+    // The renamed check runs its own body.
+    let (run, code) = project.json(&["run", "--local", "mt3s.unit"]);
+    assert_eq!(code, 0, "{run}");
+    assert_eq!(run["targets"][0]["result"], "passed", "{run}");
 }
 
 #[test]

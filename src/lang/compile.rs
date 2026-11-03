@@ -27,6 +27,26 @@ pub fn dash(name: &str) -> String {
     name.replace('_', "-").replace("::", ".")
 }
 
+/// How the language refers to check `inner` of group `group`: `group::inner`, or
+/// `component::check` for a check declared with its own qualified name.
+pub fn member_path(group: &str, inner: &str) -> String {
+    if inner.contains("::") {
+        inner.to_owned()
+    } else {
+        format!("{group}::{inner}")
+    }
+}
+
+/// The name of check `inner` in group `group`: `group.inner`, or the check's own
+/// `<component>.<check>` when it is declared `check component::check`.
+pub fn member_name(group: &str, inner: &str) -> String {
+    if inner.contains("::") {
+        dash(inner)
+    } else {
+        format!("{}.{}", dash(group), dash(inner))
+    }
+}
+
 fn external(segments: &[String]) -> String {
     segments
         .iter()
@@ -89,7 +109,7 @@ impl<'a> Compiler<'a> {
                 item.name == name
                     || items
                         .iter()
-                        .any(|inner| format!("{}::{}", item.name, inner.name) == name)
+                        .any(|inner| member_path(&item.name, &inner.name) == name)
             }
             ItemKind::Check { .. } => item.name == name,
             _ => false,
@@ -101,7 +121,7 @@ impl<'a> Compiler<'a> {
         let name = segments.join("::");
         self.program.items.iter().any(|item| {
             (item.name == name && !matches!(item.kind, ItemKind::Const { .. } | ItemKind::Fn(_)))
-                || matches!(&item.kind, ItemKind::Group { items } if items.iter().any(|inner| format!("{}::{}", item.name, inner.name) == name))
+                || matches!(&item.kind, ItemKind::Group { items } if items.iter().any(|inner| member_path(&item.name, &inner.name) == name))
         })
     }
 
@@ -1199,11 +1219,7 @@ pub fn compile(
                 for inner in items {
                     // `check mt3s::unit` keeps the group's paths and attributes under a
                     // name of its own: checks are named `<component>.<check>`, groups by paths.
-                    let name = if inner.name.contains("::") {
-                        dash(&inner.name)
-                    } else {
-                        format!("{}.{}", dash(&item.name), dash(&inner.name))
-                    };
+                    let name = member_name(&item.name, &inner.name);
                     let compiled = check(&mut compiler, inner, &name, &inherited)?;
                     project.checks.push(compiled);
                 }
@@ -1256,7 +1272,7 @@ pub fn compile(
         .flat_map(|item| match &item.kind {
             ItemKind::Group { items } => items
                 .iter()
-                .map(|inner| (format!("{}.{}", dash(&item.name), dash(&inner.name)), inner))
+                .map(|inner| (member_name(&item.name, &inner.name), inner))
                 .collect::<Vec<_>>(),
             _ => vec![(dash(&item.name), item)],
         })

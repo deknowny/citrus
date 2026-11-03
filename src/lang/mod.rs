@@ -413,11 +413,7 @@ fn find_body<'a>(
             (ItemKind::Group { items }, "check") => {
                 for inner in items {
                     if let ItemKind::Check { body } = &inner.kind
-                        && format!(
-                            "{}.{}",
-                            compile::dash(&item.name),
-                            compile::dash(&inner.name)
-                        ) == name
+                        && compile::member_name(&item.name, &inner.name) == name
                     {
                         return Some((body, None));
                     }
