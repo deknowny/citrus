@@ -24,7 +24,7 @@ fn failure(failure: super::interp::Failure) -> Error {
 /// An item's name outside the language (command line, plans, JSON): the
 /// identifier with `-` for `_`, as Cargo does for crate names.
 pub fn dash(name: &str) -> String {
-    name.replace('_', "-")
+    name.replace('_', "-").replace("::", ".")
 }
 
 fn external(segments: &[String]) -> String {
@@ -1197,6 +1197,16 @@ pub fn compile(
                     span: item.span,
                 });
                 for inner in items {
+                    if inner.name.contains("::") {
+                        return Err(Error::at(
+                            inner.name_span,
+                            format!(
+                                "check {} is in group {}: name it without `::`",
+                                dash(&inner.name),
+                                dash(&item.name)
+                            ),
+                        ));
+                    }
                     let name = format!("{}.{}", dash(&item.name), dash(&inner.name));
                     let compiled = check(&mut compiler, inner, &name, &inherited)?;
                     project.checks.push(compiled);

@@ -3404,6 +3404,61 @@ check tool {
 }
 
 #[test]
+fn a_check_outside_a_group_takes_a_component_name() {
+    let project = Project::new(
+        r#"#[paths("crates/**")]
+group rust {
+    check unit {
+        run!("make ok")?;
+    }
+}
+
+/// Named like a check of group rust, with none of its paths or attributes.
+#[when(touched(["**/*.rs"]))]
+#[reads(["**/*.rs"])]
+check rust::fmt {
+    run!("make ok")?;
+}
+
+#[when(touched(["**/*.md"]) && selected(rust::fmt))]
+check docs::links {
+    run!("make ok")?;
+}
+
+"#,
+    );
+    let plan_for = |paths: &str| {
+        project.write("paths.txt", paths);
+        project.json(&["plan", "--paths-file", "paths.txt"]).0["plan"]["targets"].clone()
+    };
+    assert_eq!(plan_for("tools/x.rs\n"), serde_json::json!(["rust.fmt"]));
+    assert_eq!(
+        plan_for("crates/a.rs\n"),
+        serde_json::json!(["rust.unit", "rust.fmt"])
+    );
+    assert_eq!(
+        plan_for("tools/x.rs\nREADME.md\n"),
+        serde_json::json!(["rust.fmt", "docs.links"])
+    );
+}
+
+#[test]
+fn a_qualified_name_inside_a_group_is_refused() {
+    let project = Project::new(
+        r#"#[paths("crates/**")]
+group rust {
+    check rust::fmt {
+        run!("make ok")?;
+    }
+}
+
+"#,
+    );
+    let (out, code) = project.json(&["plan"]);
+    assert_ne!(code, 0, "{out}");
+}
+
+#[test]
 fn a_check_runs_for_a_group_it_names_and_its_own_paths() {
     let project = Project::new(
         r#"/// Platform crates every product builds on.

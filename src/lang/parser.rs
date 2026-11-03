@@ -301,7 +301,15 @@ impl Parser {
             }
             "check" | "task" => {
                 self.bump();
-                let (name, name_span) = self.ident(&format!("a {keyword} name"))?;
+                let (mut name, mut name_span) = self.ident(&format!("a {keyword} name"))?;
+                // `check rust::fmt`: a check outside any group named like one in a group,
+                // `<component>.<check>`, without the group's paths or attributes.
+                if keyword == "check" && self.at_sym("::") {
+                    self.bump();
+                    let (inner, inner_span) = self.ident("a check name")?;
+                    name = format!("{name}::{inner}");
+                    name_span.end = inner_span.end;
+                }
                 self.name_span = name_span;
                 let body = self.block()?;
                 let kind = if keyword == "check" {
