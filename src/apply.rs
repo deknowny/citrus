@@ -535,8 +535,7 @@ pub fn prepare(context: &mut Context, name: &str) -> Result<Option<Prepared>> {
     if environment.checks == "proven"
         && let Some(gate) = crate::release::start_gate(&mut *context, name)?
     {
-        crate::release::finish_gate(context, &gate)?;
-        checks = gate.needed;
+        checks = crate::release::finish_gate(context, &gate)?;
     }
     let extra_env = if environment.prepare.is_empty() {
         BTreeMap::new()
@@ -652,7 +651,8 @@ fn run_step(
     }
     if step == "gate" {
         let gate = plan.gate.as_ref().context("no gate in the plan")?;
-        return crate::release::finish_gate(context, gate);
+        crate::release::finish_gate(context, gate)?;
+        return Ok(());
     }
     if step == "quiesce" {
         let mut suspended = Vec::new();

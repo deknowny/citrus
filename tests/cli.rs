@@ -2162,6 +2162,59 @@ fn prepare_proves_and_builds_without_changing_the_environment_and_apply_reuses_b
 }
 
 #[test]
+fn a_gate_proves_its_profiles_one_run_after_another() {
+    let project = apply_project();
+    project.declare(
+        r#"
+profile fast;
+profile e2e;
+
+#[profile(fast)]
+#[paths("src/**")]
+check fast_one {
+    run!("sh -c 'sleep 1; echo fast-end >> .kube/order'")?;
+}
+
+#[profile(e2e)]
+#[paths("src/**")]
+check e2e_one {
+    run!("sh -c 'echo e2e-start >> .kube/order'")?;
+}
+
+#[paths("src/**")]
+check both {
+    run!("sh -c 'echo ran >> .kube/both'")?;
+}
+
+#[gate(profiles = ["fast", "e2e"])]
+#[kubernetes(kubectl = "./kubectl.py", namespace = "shop")]
+#[record(annotation = "example.com/release", tag_prefix = "v")]
+#[deploy("api", api)]
+environment gated;
+"#,
+    );
+    project.write("src/a.txt", "v2\n");
+    project.commit("feature");
+    let (prepared, code) = project.json(&["apply", "gated", "--prepare"]);
+    assert_eq!(code, 0, "{prepared}");
+    // The e2e run started after the fast one was over, not beside it.
+    assert_eq!(
+        fs::read_to_string(project.root().join(".kube/order")).unwrap(),
+        "fast-end\ne2e-start\n"
+    );
+    // A check of both profiles ran once: the second run reused the first's pass.
+    assert_eq!(
+        fs::read_to_string(project.root().join(".kube/both"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    let checks = prepared["prepared"]["checks"].as_array().unwrap();
+    assert!(checks.iter().any(|name| name == "e2e-one"), "{prepared}");
+}
+
+#[test]
 fn a_failed_apply_resumes_quiesced_work_and_frees_the_environment() {
     let project = apply_project();
     project.write("src/a.txt", "v2\n");

@@ -551,6 +551,14 @@ pub struct Gate {
     pub base: String,
     pub paths: Vec<String>,
     pub needed: Vec<String>,
+    /// The environment the gate proves.
+    #[serde(default)]
+    pub environment: String,
+    /// Profiles still to prove once the started run is over: one gate run at a
+    /// time, since runs of one checkout share its build directory and its test
+    /// stack (two at once took 38 minutes for a 3-minute check, 2026-11-03).
+    #[serde(default)]
+    pub pending: Vec<String>,
 }
 
 /// The plan of `paths` since `base` in `profile` (empty: the current one).
@@ -625,72 +633,116 @@ pub fn start_gate(context: &mut Context, environment: &str) -> Result<Option<Gat
     let mut gate = Gate {
         base: running.clone(),
         paths: paths.clone(),
+        environment: environment.to_owned(),
         ..Gate::default()
     };
-    for profile in profiles {
-        let plan = gate_plan(context, &profile, &paths, &running, environment)?;
-        let needed = unproven_in(context, &plan)?;
-        if needed.is_empty() {
-            continue;
+    let mut profiles = profiles.into_iter();
+    for profile in profiles.by_ref() {
+        if let Some((needed, id)) = start_profile_run(context, &gate, &profile, &list, true)? {
+            gate.runs.push((profile, id));
+            gate.needed.extend(needed);
+            break;
         }
-        eprintln!(
-            "{environment}: the shipped change needs {}; running them in the pool while the release builds",
-            needed.join(", ")
-        );
-        // In the pool when it can take the work: its caches are warm. A pool that is unreachable
-        // or has no agent would only fail the gate, so the checks then run on this machine.
-        let mut run = std::process::Command::new(std::env::current_exe()?);
-        run.arg("run");
-        if crate::pool::has_live_agent() {
-            run.arg("--remote");
-        } else if crate::pool::url().is_some() {
-            eprintln!(
-                "{environment}: the pool is unreachable or has no agent; running the checks here"
-            );
-        }
-        if !profile.is_empty() {
-            run.args(["--profile", &profile]);
-        }
-        let output = run
-            .args(["--detach", "--json", "--base", &running, "--paths-file"])
-            .arg(&list)
-            .env("CITRUS_RUN_PRIORITY", "10")
-            .env(GATE_ENVIRONMENT, environment)
-            .stderr(std::process::Stdio::inherit())
-            .output()?;
-        let started: serde_json::Value =
-            serde_json::from_slice(&output.stdout).with_context(|| {
-                format!(
-                    "starting the checks: {}",
-                    String::from_utf8_lossy(&output.stdout)
-                )
-            })?;
-        let id = started["run"]["id"]
-            .as_str()
-            .with_context(|| format!("no run started: {started}"))?
-            .to_owned();
-        gate.runs.push((profile, id));
-        gate.needed.extend(needed);
     }
-    Ok((!gate.runs.is_empty()).then_some(gate))
+    // The other profiles run after this one (`finish_gate`), reusing what it proved.
+    gate.pending = profiles.collect();
+    Ok((!gate.runs.is_empty() || !gate.pending.is_empty()).then_some(gate))
 }
 
-/// Wait for a gate's runs; an error unless every needed check is proven.
-pub fn finish_gate(context: &Context, gate: &Gate) -> Result<()> {
-    let mut rows = Vec::new();
-    for (_, run) in &gate.runs {
-        let status = std::process::Command::new(std::env::current_exe()?)
-            .args(["wait", run, "--text"])
-            .stdout(std::process::Stdio::from(std::io::stderr()))
-            .status()?;
-        if !status.success() {
-            bail!(
-                "the checks this release needs failed ({run}): {}",
-                gate.needed.join(", ")
-            );
-        }
-        rows.extend(context.store.targets(run)?);
+/// Starts the checks of `profile` the gate's shipped change needs and that are not
+/// proven yet (detached); None when every one is proven.
+fn start_profile_run(
+    context: &Context,
+    gate: &Gate,
+    profile: &str,
+    list: &std::path::Path,
+    beside_builds: bool,
+) -> Result<Option<(Vec<String>, String)>> {
+    let environment = gate.environment.as_str();
+    let plan = gate_plan(context, profile, &gate.paths, &gate.base, environment)?;
+    let needed = unproven_in(context, &plan)?;
+    if needed.is_empty() {
+        return Ok(None);
     }
+    eprintln!(
+        "{environment}: the shipped change needs {}{}",
+        needed.join(", "),
+        if beside_builds {
+            "; running them in the pool while the release builds"
+        } else {
+            ""
+        }
+    );
+    // In the pool when it can take the work: its caches are warm. A pool that is unreachable
+    // or has no agent would only fail the gate, so the checks then run on this machine.
+    let mut run = std::process::Command::new(std::env::current_exe()?);
+    run.arg("run");
+    if crate::pool::has_live_agent() {
+        run.arg("--remote");
+    } else if crate::pool::url().is_some() {
+        eprintln!(
+            "{environment}: the pool is unreachable or has no agent; running the checks here"
+        );
+    }
+    if !profile.is_empty() {
+        run.args(["--profile", profile]);
+    }
+    let output = run
+        .args(["--detach", "--json", "--base", &gate.base, "--paths-file"])
+        .arg(list)
+        .env("CITRUS_RUN_PRIORITY", "10")
+        .env(GATE_ENVIRONMENT, environment)
+        .stderr(std::process::Stdio::inherit())
+        .output()?;
+    let started: serde_json::Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "starting the checks: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })?;
+    let id = started["run"]["id"]
+        .as_str()
+        .with_context(|| format!("no run started: {started}"))?
+        .to_owned();
+    Ok(Some((needed, id)))
+}
+
+/// Wait for a gate's runs, starting each pending profile after the one before;
+/// an error unless every needed check is proven. Returns the checks it proved.
+pub fn finish_gate(context: &Context, gate: &Gate) -> Result<Vec<String>> {
+    let mut gate = gate.clone();
+    let mut rows = Vec::new();
+    let mut waited = 0;
+    loop {
+        for (_, run) in &gate.runs[waited..] {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["wait", run, "--text"])
+                .stdout(std::process::Stdio::from(std::io::stderr()))
+                .status()?;
+            if !status.success() {
+                bail!(
+                    "the checks this release needs failed ({run}): {}",
+                    gate.needed.join(", ")
+                );
+            }
+            rows.extend(context.store.targets(run)?);
+        }
+        waited = gate.runs.len();
+        // The next profile, after the one before it: what that one proved is reused.
+        let Some(profile) = (!gate.pending.is_empty()).then(|| gate.pending.remove(0)) else {
+            break;
+        };
+        let list = context
+            .repo
+            .log_dir()
+            .join(format!("shipped-{}-gate.paths", gate.environment));
+        std::fs::write(&list, gate.paths.join("\n") + "\n")?;
+        if let Some((needed, id)) = start_profile_run(context, &gate, &profile, &list, false)? {
+            gate.runs.push((profile, id));
+            gate.needed.extend(needed);
+        }
+    }
+    let gate = &gate;
     // The gate's runs checked the release's own snapshot: what they passed is
     // proven, whatever the worktree holds now (someone may be editing it while
     // the release runs).
@@ -712,7 +764,7 @@ pub fn finish_gate(context: &Context, gate: &Gate) -> Result<()> {
             missing.join(", ")
         );
     }
-    Ok(())
+    Ok(gate.needed.clone())
 }
 
 pub fn unproven_checks(context: &mut Context) -> Result<Vec<String>> {
@@ -1004,11 +1056,20 @@ mod tests {
         let higher = |running: Option<&str>, passed: Option<&str>| {
             higher_version(running.map(str::to_owned), passed.map(str::to_owned))
         };
-        assert_eq!(higher(Some("0.50.91"), Some("0.51.0")).as_deref(), Some("0.51.0"));
-        assert_eq!(higher(Some("0.51.2"), Some("0.51.1")).as_deref(), Some("0.51.2"));
+        assert_eq!(
+            higher(Some("0.50.91"), Some("0.51.0")).as_deref(),
+            Some("0.51.0")
+        );
+        assert_eq!(
+            higher(Some("0.51.2"), Some("0.51.1")).as_deref(),
+            Some("0.51.2")
+        );
         assert_eq!(higher(None, Some("0.50.9")).as_deref(), Some("0.50.9"));
         assert_eq!(higher(Some("1.0.0"), None).as_deref(), Some("1.0.0"));
-        assert_eq!(higher(Some("0.50.100"), Some("0.50.99")).as_deref(), Some("0.50.100"));
+        assert_eq!(
+            higher(Some("0.50.100"), Some("0.50.99")).as_deref(),
+            Some("0.50.100")
+        );
         assert_eq!(
             next_version("0.51.0", "0.50.5", Level::Patch).as_deref(),
             Some("0.51.1")
