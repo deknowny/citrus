@@ -1197,17 +1197,13 @@ pub fn compile(
                     span: item.span,
                 });
                 for inner in items {
-                    if inner.name.contains("::") {
-                        return Err(Error::at(
-                            inner.name_span,
-                            format!(
-                                "check {} is in group {}: name it without `::`",
-                                dash(&inner.name),
-                                dash(&item.name)
-                            ),
-                        ));
-                    }
-                    let name = format!("{}.{}", dash(&item.name), dash(&inner.name));
+                    // `check mt3s::unit` keeps the group's paths and attributes under a
+                    // name of its own: checks are named `<component>.<check>`, groups by paths.
+                    let name = if inner.name.contains("::") {
+                        dash(&inner.name)
+                    } else {
+                        format!("{}.{}", dash(&item.name), dash(&inner.name))
+                    };
                     let compiled = check(&mut compiler, inner, &name, &inherited)?;
                     project.checks.push(compiled);
                 }

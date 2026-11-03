@@ -3443,19 +3443,34 @@ check docs::links {
 }
 
 #[test]
-fn a_qualified_name_inside_a_group_is_refused() {
+fn a_qualified_name_inside_a_group_keeps_the_group_paths() {
     let project = Project::new(
-        r#"#[paths("crates/**")]
-group rust {
-    check rust::fmt {
+        r#"#[paths("crates/mt3s/**")]
+group mt3s_rust {
+    check mt3s::unit {
+        run!("make ok")?;
+    }
+
+    #[covers(mt3s::unit)]
+    check clippy {
         run!("make ok")?;
     }
 }
 
+#[when(selected(mt3s::unit) || selected(mt3s_rust::clippy))]
+check after {
+    run!("make ok")?;
+}
+
 "#,
     );
-    let (out, code) = project.json(&["plan"]);
-    assert_ne!(code, 0, "{out}");
+    project.write("paths.txt", "crates/mt3s/lib.rs\n");
+    let (plan, code) = project.json(&["plan", "--paths-file", "paths.txt"]);
+    assert_eq!(code, 0, "{plan}");
+    assert_eq!(
+        plan["plan"]["targets"],
+        serde_json::json!(["mt3s-rust.clippy", "after"])
+    );
 }
 
 #[test]

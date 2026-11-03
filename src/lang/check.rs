@@ -385,10 +385,14 @@ pub fn check(program: &Program) -> Result<Globals, Error> {
                     return Err(Error::at(inner.span, "a group holds checks")
                         .help("declare functions and constants outside the group"));
                 }
-                declare(&format!("{}::{}", item.name, inner.name), inner.name_span)?;
-                globals
-                    .items
-                    .insert(format!("{}::{}", item.name, inner.name), "check");
+                // `check mt3s::unit` in a group is named by itself.
+                let full = if inner.name.contains("::") {
+                    inner.name.clone()
+                } else {
+                    format!("{}::{}", item.name, inner.name)
+                };
+                declare(&full, inner.name_span)?;
+                globals.items.insert(full, "check");
             }
         }
         globals
