@@ -292,11 +292,7 @@ pub fn requirements(
     let mut needs = Vec::new();
     // A service can need a kind of machine (a node's disk, a browser).
     for service in services {
-        if target
-            .resources
-            .iter()
-            .any(|resource| *resource == service.name)
-        {
+        if target.resources.contains(&service.name) {
             needs.extend(service.requires.iter().cloned());
         }
     }

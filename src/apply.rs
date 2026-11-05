@@ -319,7 +319,8 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
     let env_file = std::path::Path::new(&release.log).with_extension("env");
     let quiesced_file = std::path::Path::new(&release.log).with_extension("quiesced");
     // The builds run side by side (one `citrus artifacts --build` each, after
-    // `prepare` gave them their environment); the other steps one by one.
+    // `prepare` gave them their environment), except those sharing a Dockerfile's
+    // stages (`build_groups`); the other steps one by one.
     let prepared = context.store.release_steps(id)?.iter().all(|step| {
         step.name != "prepare" || matches!(step.state.as_str(), "passed" | "recovered")
     });
@@ -332,39 +333,71 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
         .collect();
     if prepared && builds.len() > 1 {
         let extra_env = read_env(&env_file);
-        let started = now();
-        let mut children = Vec::new();
-        for mut step in builds {
-            println!("CITRUS_STEP target={} status=START", step.name);
-            step.state = "running".into();
-            context.store.update_step(id, &step)?;
-            let name = step.name.trim_start_matches("build:").to_owned();
-            let child = Command::new(std::env::current_exe()?)
-                .args(["artifacts", "--build", &name, "--text"])
-                .envs(&extra_env)
-                .current_dir(&context.repo.root)
-                .spawn()?;
-            children.push((step, child));
-        }
+        let names: Vec<String> = builds
+            .iter()
+            .map(|step| step.name.trim_start_matches("build:").to_owned())
+            .collect();
+        let groups = build_groups(&names, &artifacts);
+        let exe = std::env::current_exe()?;
+        let mut steps = builds;
         let mut failed = None;
-        for (mut step, mut child) in children {
-            let ok = child.wait()?.success();
-            step.seconds = Some((now() - started) as i64);
-            step.exit = Some(if ok { 0 } else { 1 });
-            step.state = if ok { "passed" } else { "failed" }.into();
-            println!(
-                "CITRUS_STEP target={} status={} exit={} seconds={}",
-                step.name,
-                if ok { "PASS" } else { "FAIL" },
-                if ok { 0 } else { 1 },
-                step.seconds.unwrap_or_default()
-            );
-            if !ok {
-                step.first_error = Some(format!("the build of {} failed", step.name));
-                failed.get_or_insert(step.name.clone());
+        // A group's builds go one after another, so the later ones reuse the stages the first
+        // built; the groups go side by side. The workers only run the children: the steps are
+        // recorded here, as their results arrive.
+        std::thread::scope(|scope| -> Result<()> {
+            let (sender, receiver) = std::sync::mpsc::channel::<(usize, Option<bool>)>();
+            for group in &groups {
+                let sender = sender.clone();
+                let (exe, names, extra_env, root) = (&exe, &names, &extra_env, &context.repo.root);
+                scope.spawn(move || {
+                    for &index in group {
+                        let _ = sender.send((index, None));
+                        let ok = Command::new(exe)
+                            .args(["artifacts", "--build", &names[index], "--text"])
+                            .envs(extra_env)
+                            .current_dir(root)
+                            .status()
+                            .is_ok_and(|status| status.success());
+                        let _ = sender.send((index, Some(ok)));
+                        // The rest of the group would rebuild the stage that failed: they stay
+                        // for the resume.
+                        if !ok {
+                            break;
+                        }
+                    }
+                });
             }
-            context.store.update_step(id, &step)?;
-        }
+            drop(sender);
+            let mut started = vec![0; steps.len()];
+            for (index, outcome) in receiver {
+                let step = &mut steps[index];
+                match outcome {
+                    None => {
+                        println!("CITRUS_STEP target={} status=START", step.name);
+                        started[index] = now();
+                        step.state = "running".into();
+                    }
+                    Some(ok) => {
+                        step.seconds = Some((now() - started[index]) as i64);
+                        step.exit = Some(if ok { 0 } else { 1 });
+                        step.state = if ok { "passed" } else { "failed" }.into();
+                        println!(
+                            "CITRUS_STEP target={} status={} exit={} seconds={}",
+                            step.name,
+                            if ok { "PASS" } else { "FAIL" },
+                            if ok { 0 } else { 1 },
+                            step.seconds.unwrap_or_default()
+                        );
+                        if !ok {
+                            step.first_error = Some(format!("the build of {} failed", step.name));
+                            failed.get_or_insert(step.name.clone());
+                        }
+                    }
+                }
+                context.store.update_step(id, step)?;
+            }
+            Ok(())
+        })?;
         if let Some(name) = failed {
             context
                 .store
@@ -463,6 +496,40 @@ pub fn work(context: &Context, id: &str) -> Result<()> {
     context.store.finish_release(id, "passed", "")?;
     context.store.unlock_environment(&release.environment, id)?;
     Ok(())
+}
+
+/// The builds that run side by side, as groups of indices into `names` run one after another.
+/// Docker builds that differ in nothing but their target share the Dockerfile's stages: in
+/// separate BuildKit sessions running at once each compiled them again (two 310 s Rust builds of
+/// one `cargo build`, 2026-11-05), one after another the later ones find them cached. Groups keep
+/// the order of their first build, and their builds the plan's order.
+fn build_groups(
+    names: &[String],
+    artifacts: &BTreeMap<String, deploy::Artifact>,
+) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let shared = artifacts.get(name).and_then(shared_stages);
+        match groups
+            .iter_mut()
+            .find(|(key, _)| shared.is_some() && *key == shared)
+        {
+            Some((_, group)) => group.push(index),
+            None => groups.push((shared, vec![index])),
+        }
+    }
+    groups.into_iter().map(|(_, group)| group).collect()
+}
+
+/// What a docker build shares with the builds of other targets of the same Dockerfile: every
+/// build setting but the target (builder, dockerfile, context, platform, args, ...).
+fn shared_stages(artifact: &deploy::Artifact) -> Option<String> {
+    let mut build = artifact.build.clone();
+    if build.get("provider").and_then(|value| value.as_str()) != Some("docker") {
+        return None;
+    }
+    build.remove("target");
+    serde_json::to_string(&build).ok()
 }
 
 /// Runs the environment's `prepare` command: the values it prints as
@@ -1617,5 +1684,70 @@ mod sibling_tests {
             )]
         );
         assert!(siblings_of(&spec, "metrics", "registry.example/exporter:2").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod build_group_tests {
+    use super::*;
+
+    fn artifact(build: serde_json::Value) -> deploy::Artifact {
+        serde_json::from_value(serde_json::json!({ "build": build })).unwrap()
+    }
+
+    #[test]
+    fn targets_of_one_dockerfile_build_one_after_another_and_the_rest_side_by_side() {
+        let rust = |target: &str| {
+            artifact(serde_json::json!({
+                "provider": "docker", "builder": "b", "dockerfile": "Dockerfile",
+                "platform": "linux/amd64", "target": target,
+            }))
+        };
+        let artifacts: BTreeMap<String, deploy::Artifact> = [
+            ("backend".to_owned(), rust("backend_prod")),
+            ("userbot".to_owned(), rust("userbot_prod")),
+            (
+                "webapp".to_owned(),
+                artifact(serde_json::json!({
+                    "provider": "docker", "builder": "b", "dockerfile": "Dockerfile",
+                    "platform": "linux/amd64", "target": "webapp_final", "args": ["A=1"],
+                })),
+            ),
+            (
+                "backuper".to_owned(),
+                artifact(serde_json::json!({
+                    "provider": "docker", "builder": "b", "dockerfile": "backuper/Dockerfile",
+                    "platform": "linux/amd64",
+                })),
+            ),
+            (
+                "script".to_owned(),
+                artifact(serde_json::json!({"provider": "command", "run": ["x"]})),
+            ),
+            (
+                "script2".to_owned(),
+                artifact(serde_json::json!({"run": ["x"]})),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let names: Vec<String> = [
+            "webapp", "userbot", "script", "backuper", "backend", "script2",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(
+            build_groups(&names, &artifacts),
+            vec![vec![0], vec![1, 4], vec![2], vec![3], vec![5]]
+        );
+    }
+
+    #[test]
+    fn an_undeclared_artifact_builds_alone() {
+        let names = vec!["a".to_owned(), "b".to_owned()];
+        assert_eq!(
+            build_groups(&names, &BTreeMap::new()),
+            vec![vec![0], vec![1]]
+        );
     }
 }
