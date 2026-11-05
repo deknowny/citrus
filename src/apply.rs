@@ -521,6 +521,23 @@ fn build_groups(
     groups.into_iter().map(|(_, group)| group).collect()
 }
 
+/// Runs one group's builds `(artifact, key)` in order until one fails: the rest would rebuild
+/// the stage that failed. The outcome of each build that ran.
+fn build_in_turn(
+    group: &[(String, String)],
+    mut build: impl FnMut(&str, &str) -> bool,
+) -> Vec<(String, bool)> {
+    let mut outcomes = Vec::new();
+    for (artifact, key) in group {
+        let ok = build(artifact, key);
+        outcomes.push((artifact.clone(), ok));
+        if !ok {
+            break;
+        }
+    }
+    outcomes
+}
+
 /// What a docker build shares with the builds of other targets of the same Dockerfile: every
 /// build setting but the target (builder, dockerfile, context, platform, args, ...).
 fn shared_stages(artifact: &deploy::Artifact) -> Option<String> {
@@ -583,7 +600,8 @@ pub struct Prepared {
 /// migrates, rolls and verifies. Nothing in the environment changes: no
 /// approval, no environment lock, no release record. As in an apply, the checks
 /// start first and the builds run beside them, side by side (one `citrus
-/// artifacts --build` each): waiting for the checks before building cost a
+/// artifacts --build` each; those sharing a Dockerfile's stages one after
+/// another, `build_groups`): waiting for the checks before building cost a
 /// minute per release (2026-11-05). Checks that fail fail the prepare; what was
 /// built meanwhile stays in the cache by its key and is simply not used. One
 /// prepare runs at a time on the machine (`prepare.lock` in the state
@@ -648,7 +666,9 @@ pub fn prepare(context: &mut Context, name: &str) -> Result<Option<Prepared>> {
         built: Vec::new(),
         seconds: 0,
     };
-    let mut children = Vec::new();
+    // The builds sharing a Dockerfile's stages one after another (`build_groups`), the groups
+    // side by side and beside the checks.
+    let mut missing = Vec::new();
     for build in &builds {
         if context
             .store
@@ -660,15 +680,35 @@ pub fn prepare(context: &mut Context, name: &str) -> Result<Option<Prepared>> {
         artifacts
             .get(&build.artifact)
             .context("artifact no longer declared")?;
-        eprintln!("{name}: building {} ({})", build.artifact, &build.key[..12]);
-        // Its output joins the log on stderr: stdout is the prepare's report.
-        let child = Command::new(std::env::current_exe()?)
-            .args(["artifacts", "--build", &build.artifact, "--text"])
-            .envs(&extra_env)
-            .current_dir(&context.repo.root)
-            .stdout(Stdio::from(std::io::stderr()))
-            .spawn()?;
-        children.push((build.artifact.clone(), child));
+        missing.push(build);
+    }
+    let names: Vec<String> = missing.iter().map(|build| build.artifact.clone()).collect();
+    let exe = std::env::current_exe()?;
+    let mut children = Vec::new();
+    for group in build_groups(&names, &artifacts) {
+        let group: Vec<(String, String)> = group
+            .into_iter()
+            .map(|index| (missing[index].artifact.clone(), missing[index].key.clone()))
+            .collect();
+        let (exe, root, extra_env, name) = (
+            exe.clone(),
+            context.repo.root.clone(),
+            extra_env.clone(),
+            name.to_owned(),
+        );
+        children.push(std::thread::spawn(move || {
+            build_in_turn(&group, |artifact, key| {
+                eprintln!("{name}: building {artifact} ({})", &key[..12]);
+                // Its output joins the log on stderr: stdout is the prepare's report.
+                Command::new(&exe)
+                    .args(["artifacts", "--build", artifact, "--text"])
+                    .envs(&extra_env)
+                    .current_dir(&root)
+                    .stdout(Stdio::from(std::io::stderr()))
+                    .status()
+                    .is_ok_and(|status| status.success())
+            })
+        }));
     }
     let checks = match &gate {
         Some(gate) => crate::release::finish_gate(context, gate),
@@ -680,11 +720,16 @@ pub fn prepare(context: &mut Context, name: &str) -> Result<Option<Prepared>> {
         eprintln!("{name}: {error:#}; waiting for the builds already started");
     }
     let mut failed = Vec::new();
-    for (artifact, mut child) in children {
-        if child.wait()?.success() {
-            prepared.built.push(artifact);
-        } else {
-            failed.push(artifact);
+    for child in children {
+        let outcomes = child
+            .join()
+            .map_err(|_| anyhow::anyhow!("a build worker panicked"))?;
+        for (artifact, ok) in outcomes {
+            if ok {
+                prepared.built.push(artifact);
+            } else {
+                failed.push(artifact);
+            }
         }
     }
     prepared.checks = checks?;
@@ -1770,6 +1815,23 @@ mod build_group_tests {
         assert_eq!(
             build_groups(&names, &artifacts),
             vec![vec![0], vec![1, 4], vec![2], vec![3], vec![5]]
+        );
+    }
+
+    #[test]
+    fn a_group_builds_in_order_and_stops_at_its_first_failure() {
+        let group: Vec<(String, String)> = ["a", "b", "c"]
+            .map(|name| (name.to_owned(), format!("{name}-key")))
+            .to_vec();
+        let mut ran = Vec::new();
+        let outcomes = build_in_turn(&group, |artifact, key| {
+            ran.push(key.to_owned());
+            artifact != "b"
+        });
+        assert_eq!(ran, vec!["a-key", "b-key"]);
+        assert_eq!(
+            outcomes,
+            vec![("a".to_owned(), true), ("b".to_owned(), false)]
         );
     }
 
