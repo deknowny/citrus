@@ -581,10 +581,14 @@ pub struct Prepared {
 /// artifact built and published by its input key — so that the apply (or the
 /// release whose step runs it) from the same commit reuses both and only
 /// migrates, rolls and verifies. Nothing in the environment changes: no
-/// approval, no environment lock, no release record. The checks run first and
-/// the builds one after another, and one prepare runs at a time on the machine
-/// (`prepare.lock` in the state directory), across worktrees: they are the
-/// heaviest work it does. None when the environment already runs HEAD's build.
+/// approval, no environment lock, no release record. As in an apply, the checks
+/// start first and the builds run beside them, side by side (one `citrus
+/// artifacts --build` each): waiting for the checks before building cost a
+/// minute per release (2026-11-05). Checks that fail fail the prepare; what was
+/// built meanwhile stays in the cache by its key and is simply not used. One
+/// prepare runs at a time on the machine (`prepare.lock` in the state
+/// directory), across worktrees: they are the heaviest work it does. None when
+/// the environment already runs HEAD's build.
 pub fn prepare(context: &mut Context, name: &str) -> Result<Option<Prepared>> {
     let environments = deploy::environments(context)?;
     let environment = environments
@@ -625,13 +629,12 @@ pub fn prepare(context: &mut Context, name: &str) -> Result<Option<Prepared>> {
     {
         builds.push(Build { artifact, key });
     }
-    // The checks first: a change that fails them is not worth a build.
-    let mut checks = Vec::new();
-    if environment.checks == "proven"
-        && let Some(gate) = crate::release::start_gate(&mut *context, name)?
-    {
-        checks = crate::release::finish_gate(context, &gate)?;
-    }
+    // The checks start first (detached runs) and the builds run while they do.
+    let gate = if environment.checks == "proven" {
+        crate::release::start_gate(&mut *context, name)?
+    } else {
+        None
+    };
     let extra_env = if environment.prepare.is_empty() {
         BTreeMap::new()
     } else {
@@ -640,37 +643,65 @@ pub fn prepare(context: &mut Context, name: &str) -> Result<Option<Prepared>> {
     let mut prepared = Prepared {
         environment: name.to_owned(),
         commit: diff.head.clone(),
-        checks,
+        checks: Vec::new(),
         artifacts: Vec::new(),
         built: Vec::new(),
         seconds: 0,
     };
-    for build in builds {
-        let reference = match context
+    let mut children = Vec::new();
+    for build in &builds {
+        if context
             .store
             .artifact_reference(&build.artifact, &build.key)?
+            .is_some()
         {
-            Some(reference) => reference,
-            None => {
-                let artifact = artifacts
-                    .get(&build.artifact)
-                    .context("artifact no longer declared")?;
-                eprintln!("{name}: building {} ({})", build.artifact, &build.key[..12]);
-                let reference = build_artifact(
-                    context,
-                    &build.artifact,
-                    artifact,
-                    &build.key,
-                    &diff.head,
-                    &extra_env,
-                )?;
-                context
-                    .store
-                    .put_artifact_reference(&build.artifact, &build.key, &reference)?;
-                prepared.built.push(build.artifact.clone());
-                reference
-            }
-        };
+            continue;
+        }
+        artifacts
+            .get(&build.artifact)
+            .context("artifact no longer declared")?;
+        eprintln!("{name}: building {} ({})", build.artifact, &build.key[..12]);
+        // Its output joins the log on stderr: stdout is the prepare's report.
+        let child = Command::new(std::env::current_exe()?)
+            .args(["artifacts", "--build", &build.artifact, "--text"])
+            .envs(&extra_env)
+            .current_dir(&context.repo.root)
+            .stdout(Stdio::from(std::io::stderr()))
+            .spawn()?;
+        children.push((build.artifact.clone(), child));
+    }
+    let checks = match &gate {
+        Some(gate) => crate::release::finish_gate(context, gate),
+        None => Ok(Vec::new()),
+    };
+    if let Err(error) = &checks
+        && !children.is_empty()
+    {
+        eprintln!("{name}: {error:#}; waiting for the builds already started");
+    }
+    let mut failed = Vec::new();
+    for (artifact, mut child) in children {
+        if child.wait()?.success() {
+            prepared.built.push(artifact);
+        } else {
+            failed.push(artifact);
+        }
+    }
+    prepared.checks = checks?;
+    if !failed.is_empty() {
+        bail!("the build of {} failed", failed.join(", "));
+    }
+    for build in builds {
+        let reference = context
+            .store
+            .artifact_reference(&build.artifact, &build.key)?
+            .with_context(|| {
+                format!(
+                    "{} was built under another input key than {}",
+                    build.artifact,
+                    &build.key[..12]
+                )
+            })?;
         prepared.artifacts.push((build.artifact, reference));
     }
     prepared.seconds = now().saturating_sub(started);

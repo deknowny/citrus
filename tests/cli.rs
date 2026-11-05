@@ -2222,6 +2222,91 @@ environment gated;
     assert!(checks.iter().any(|name| name == "e2e-one"), "{prepared}");
 }
 
+/// Two images and a slow check of the same change, for `apply --prepare`.
+fn prepare_side_by_side_project(check: &str) -> Project {
+    let project = apply_project();
+    project.declare(&format!(
+        r#"
+/// The web image.
+#[inputs("src/**")]
+#[build(provider = "command", run = cmd!("sh -c 'echo {{{{artifact}}}}-start >> .kube/order; sleep 1; echo {{{{artifact}}}}-end >> .kube/order; echo IMAGE=registry.example/{{{{artifact}}}}@sha256:{{{{key}}}}'"))]
+artifact web;
+
+/// The worker image.
+#[inputs("src/**")]
+#[build(provider = "command", run = cmd!("sh -c 'echo {{{{artifact}}}}-start >> .kube/order; sleep 1; echo {{{{artifact}}}}-end >> .kube/order; echo IMAGE=registry.example/{{{{artifact}}}}@sha256:{{{{key}}}}'"))]
+artifact worker;
+
+#[paths("src/**")]
+check slow_gate {{
+    run!("{check}")?;
+}}
+
+#[kubernetes(kubectl = "./kubectl.py", namespace = "shop")]
+#[record(annotation = "example.com/release", tag_prefix = "v")]
+#[deploy("web", web)]
+#[deploy("worker", worker)]
+environment pair;
+"#
+    ));
+    let mut state = kube_state(&project);
+    for workload in ["web", "worker"] {
+        state["deployments"][workload] = serde_json::json!({"image": format!("registry.example/{workload}@sha256:old"), "annotations": {"example.com/release": "1.0.0"}});
+    }
+    project.write(".kube/state.json", &state.to_string());
+    project.write("src/a.txt", "v2\n");
+    project.commit("feature");
+    project
+}
+
+#[test]
+fn prepare_builds_its_images_side_by_side_while_the_checks_run() {
+    let project = prepare_side_by_side_project("sh -c 'sleep 3; echo checks-end >> .kube/order'");
+    let (prepared, code) = project.json(&["apply", "pair", "--prepare"]);
+    assert_eq!(code, 0, "{prepared}");
+    let order = fs::read_to_string(project.root().join(".kube/order")).unwrap();
+    let lines: Vec<&str> = order.lines().collect();
+    let at = |line: &str| lines.iter().position(|item| *item == line).unwrap();
+    // Both builds started before either was over, and before the checks were.
+    for start in ["web-start", "worker-start"] {
+        for end in ["web-end", "worker-end", "checks-end"] {
+            assert!(at(start) < at(end), "{order}");
+        }
+    }
+    let mut built: Vec<&str> = prepared["prepared"]["built"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect();
+    built.sort();
+    assert_eq!(built, ["web", "worker"], "{prepared}");
+    let checks = prepared["prepared"]["checks"].as_array().unwrap();
+    assert!(checks.iter().any(|name| name == "slow-gate"), "{prepared}");
+    let artifacts = prepared["prepared"]["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 2, "{prepared}");
+}
+
+#[test]
+fn prepare_fails_when_its_checks_fail_though_the_builds_ran() {
+    let project = prepare_side_by_side_project("sh -c 'sleep 1; exit 1'");
+    let (prepared, code) = project.json(&["apply", "pair", "--prepare"]);
+    assert_ne!(code, 0, "{prepared}");
+    // The builds that ran beside the checks finished (and stay cached by their key).
+    let order = fs::read_to_string(project.root().join(".kube/order")).unwrap();
+    assert!(
+        order.contains("web-end") && order.contains("worker-end"),
+        "{order}"
+    );
+    // Nothing in the environment changed.
+    assert!(
+        kube_state(&project)["deployments"]["web"]["image"]
+            .as_str()
+            .unwrap()
+            .ends_with("@sha256:old")
+    );
+}
+
 #[test]
 fn local_runs_of_one_checkout_take_turns() {
     let project = Project::new(
