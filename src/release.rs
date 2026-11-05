@@ -238,10 +238,10 @@ fn tag_commit(repo: &crate::repo::Repo, unit: &str, version: &str) -> String {
         .unwrap_or_default();
     let mut found = String::new();
     for line in listed.lines() {
-        if let Some((sha, name)) = line.split_once('\t') {
-            if name.ends_with("^{}") || found.is_empty() {
-                found = sha.to_owned();
-            }
+        if let Some((sha, name)) = line.split_once('\t')
+            && (name.ends_with("^{}") || found.is_empty())
+        {
+            found = sha.to_owned();
         }
     }
     found
