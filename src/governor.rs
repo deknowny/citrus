@@ -170,6 +170,16 @@ fn parse_stat(text: &str) -> Option<(f64, f64)> {
     Some((total - idle, total))
 }
 
+/// CPU pressure of everything but the pool. The machine's PSI counts tasks the
+/// pool's own `cpu.max` throttles, so a busy pool held to a small budget reads
+/// as pressure and keeps itself at the floor. PSI `some` is the share of time at
+/// least one task waited, so the machine's figure is at least the pool's; what
+/// it has beyond the pool's is pressure someone else feels (a lower bound when
+/// both wait at the same time).
+fn foreign_cpu_pressure(machine: f64, pool: f64) -> f64 {
+    (machine - pool).max(0.0)
+}
+
 /// `avg10` of the `some` or `full` line of a PSI file.
 fn parse_pressure(text: &str, kind: &str) -> Option<f64> {
     let line = text.lines().find(|line| line.starts_with(kind))?;
@@ -219,12 +229,19 @@ impl Sampler {
     pub fn sample(&mut self) -> Option<Sample> {
         let stat = std::fs::read_to_string("/proc/stat").ok()?;
         let (busy, total) = parse_stat(&stat)?;
-        let usage = self
-            .slice
-            .as_deref()
-            .and_then(slice_dir)
+        let dir = self.slice.as_deref().and_then(slice_dir);
+        let usage = dir
+            .as_ref()
             .and_then(|dir| std::fs::read_to_string(dir.join("cpu.stat")).ok())
             .and_then(|text| parse_usage_usec(&text));
+        let pool_cpu_pressure = dir
+            .as_ref()
+            .and_then(|dir| {
+                read(&dir.join("cpu.pressure"), |text| {
+                    parse_pressure(text, "some")
+                })
+            })
+            .unwrap_or(0.0);
         let now = Instant::now();
         let previous = self.last.replace((busy, total, usage, now));
         let (old_busy, old_total, old_usage, then) = previous?;
@@ -240,10 +257,13 @@ impl Sampler {
         Some(Sample {
             busy: (busy - old_busy) / jiffies * self.cores,
             pool,
-            cpu_pressure: read(Path::new("/proc/pressure/cpu"), |text| {
-                parse_pressure(text, "some")
-            })
-            .unwrap_or(0.0),
+            cpu_pressure: foreign_cpu_pressure(
+                read(Path::new("/proc/pressure/cpu"), |text| {
+                    parse_pressure(text, "some")
+                })
+                .unwrap_or(0.0),
+                pool_cpu_pressure,
+            ),
             io_pressure: read(Path::new("/proc/pressure/io"), |text| {
                 parse_pressure(text, "full")
             })
@@ -542,6 +562,21 @@ mod tests {
         let decision = decide(&config(), 5.0, &sample);
         assert_eq!(decision.budget, 5.0);
         assert_eq!(decision.reason, "cpu pressure");
+    }
+
+    #[test]
+    fn the_pool_throttled_by_its_own_budget_is_not_pressure() {
+        // 2026-11-15: the pool held at 2 CPUs by cpu.max read 54 % CPU pressure in its
+        // slice and 55 % on the machine, which was 79 % idle; the budget never grew.
+        let pressure = foreign_cpu_pressure(55.0, 54.0);
+        assert!(pressure < CPU_PRESSURE_LIMIT);
+        let mut sample = calm(3.0, 2.0);
+        sample.cpu_pressure = pressure;
+        let decision = decide(&config(), 2.0, &sample);
+        assert_eq!(decision.budget, 2.5);
+        // Pressure others feel still counts.
+        assert_eq!(foreign_cpu_pressure(70.0, 20.0), 50.0);
+        assert_eq!(foreign_cpu_pressure(10.0, 30.0), 0.0);
     }
 
     #[test]
