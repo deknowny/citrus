@@ -930,8 +930,8 @@ const LIGHT_XCODEBUILD: &[&str] = &[
     "-checkFirstLaunchStatus",
     "-runFirstLaunch",
 ];
+// xc-build.sh takes the lane itself.
 const HEAVY_SCRIPTS: &[&str] = &[
-    "xc-build.sh",
     "ship.sh",
     "perf-sim.sh",
     "perf-device.sh",
@@ -942,22 +942,93 @@ const HEAVY_SCRIPTS: &[&str] = &[
     "testflight.sh",
 ];
 
+/// Whether `citrus lane install` put a shim for `name` in ~/.local/bin.
+fn shimmed(name: &str) -> bool {
+    std::fs::read_to_string(home().join(".local/bin").join(name))
+        .is_ok_and(|text| text.contains("Citrus lane shim"))
+}
+
 /// What in a shell command line needs the Mac's Xcode lane, if anything.
+/// Only words in command position count (after `;`, `|`, `&&`, wrappers such
+/// as `timeout`, `env`, `lockf`, `bash`), so `grep xcodebuild` is not a build.
+/// A bare `xcodebuild` or `xcrun` passes when its shim takes the lane itself.
 pub fn heavy(command: &str) -> Option<String> {
+    heavy_with(command, &shimmed)
+}
+
+fn heavy_with(command: &str, shimmed: &dyn Fn(&str) -> bool) -> Option<String> {
     if command.contains("citrus lane run") || command.contains("citrus-lane") {
         return None;
     }
-    let words: Vec<&str> = command
-        .split(|c: char| {
-            c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`' | '"' | '\'')
-        })
-        .filter(|word| !word.is_empty())
-        .collect();
-    for (index, word) in words.iter().enumerate() {
+    let segments = command.split([';', '|', '&', '(', ')', '`', '\n', '{', '}']);
+    for segment in segments {
+        let words: Vec<String> = segment
+            .split_whitespace()
+            .map(|word| word.trim_matches(|c| c == '"' || c == '\'').to_owned())
+            .filter(|word| !word.is_empty())
+            .collect();
+        let mut index = 0;
+        let mut path_changed = false;
+        // Assignments and wrappers before the command.
+        while let Some(word) = words.get(index) {
+            let base = word.rsplit('/').next().unwrap_or(word);
+            if word.contains('=') && !word.starts_with('-') && !word.starts_with('/') {
+                path_changed |= word.starts_with("PATH=");
+                index += 1;
+                continue;
+            }
+            match base {
+                "env" | "exec" | "time" | "nice" | "nohup" | "caffeinate" | "command" | "sudo" => {
+                    index += 1;
+                    while words.get(index).is_some_and(|word| word.starts_with('-')) {
+                        index += 1;
+                        if base == "nice" {
+                            index += 1;
+                        }
+                    }
+                }
+                "timeout" | "gtimeout" => {
+                    index += 1;
+                    while words.get(index).is_some_and(|word| word.starts_with('-')) {
+                        index += 1;
+                    }
+                    index += 1; // the duration
+                }
+                "lockf" => {
+                    index += 1;
+                    while let Some(word) = words.get(index).filter(|word| word.starts_with('-')) {
+                        index += if word == "-t" { 2 } else { 1 };
+                    }
+                    index += 1; // the lock file
+                }
+                "bash" | "sh" | "zsh" => {
+                    index += 1;
+                    while words.get(index).is_some_and(|word| word.starts_with('-')) {
+                        index += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let Some(word) = words.get(index) else {
+            continue;
+        };
         let base = word.rsplit('/').next().unwrap_or(word);
-        let next = words.get(index + 1).copied().unwrap_or("");
-        if base == "xcodebuild" && !LIGHT_XCODEBUILD.contains(&next) && !next.is_empty() {
+        let next = words.get(index + 1).map_or("", String::as_str);
+        let through_shim = !word.contains('/') && !path_changed;
+        if base == "xcodebuild"
+            && !next.is_empty()
+            && !LIGHT_XCODEBUILD.contains(&next)
+            && !(through_shim && shimmed("xcodebuild"))
+        {
             return Some("xcodebuild".into());
+        }
+        if base == "xcrun" {
+            let after = words.get(index + 2).map_or("", String::as_str);
+            let heavy = next == "xcodebuild" || (next == "simctl" && after == "boot");
+            if heavy && !(through_shim && shimmed("xcrun")) {
+                return Some(format!("xcrun {next}"));
+            }
         }
         if base == "simctl" && next == "boot" {
             return Some("simctl boot".into());
@@ -1196,6 +1267,9 @@ mod tests {
 
     #[test]
     fn heavy_commands_are_found_and_wrapped_ones_pass() {
+        let none = |_: &str| false;
+        let all = |_: &str| true;
+        let heavy = |command: &str| heavy_with(command, &none);
         assert_eq!(
             heavy("cd x && xcodebuild build -scheme T").as_deref(),
             Some("xcodebuild")
@@ -1206,27 +1280,49 @@ mod tests {
         );
         assert_eq!(
             heavy("xcrun simctl boot 655C").as_deref(),
-            Some("simctl boot")
+            Some("xcrun simctl")
         );
         assert_eq!(
             heavy("telenok/scripts/ship.sh --release").as_deref(),
             Some("ship.sh")
         );
         assert_eq!(
-            heavy("~/.claude/garvis-hc/xc-build.sh ~/Code/telenok-wt/x").as_deref(),
-            Some("xc-build.sh")
+            heavy("bash -x scripts/perf-sim.sh").as_deref(),
+            Some("perf-sim.sh")
+        );
+        assert_eq!(
+            heavy("timeout 590 /usr/bin/xcodebuild test").as_deref(),
+            Some("xcodebuild")
+        );
+        assert_eq!(
+            heavy("/usr/bin/lockf -t 3600 /tmp/l xcodebuild build").as_deref(),
+            Some("xcodebuild")
         );
         assert_eq!(heavy("xcodebuild -version"), None);
         assert_eq!(heavy("xcrun simctl list devices"), None);
         assert_eq!(heavy("citrus-lane mac-xcode -- 'xcodebuild build'"), None);
+        assert_eq!(heavy("grep -rn xcodebuild scripts/"), None);
+        assert_eq!(heavy("cat telenok/scripts/ship.sh | head"), None);
         assert_eq!(heavy("git log --oneline"), None);
+        // A bare call goes through the shim, which takes the lane.
+        assert_eq!(heavy_with("timeout 590 xcodebuild test", &all), None);
+        assert_eq!(heavy_with("xcrun simctl boot X", &all), None);
+        assert_eq!(
+            heavy_with("/usr/bin/xcodebuild build", &all).as_deref(),
+            Some("xcodebuild")
+        );
+        assert_eq!(
+            heavy_with("PATH=/usr/bin:/bin xcodebuild build", &all).as_deref(),
+            Some("xcodebuild")
+        );
     }
 
     #[test]
     fn the_hook_denies_with_the_lane_command() {
         isolate();
-        let (code, output) =
-            hook(r#"{"tool_name":"Bash","tool_input":{"command":"xcodebuild build -scheme T"}}"#);
+        let (code, output) = hook(
+            r#"{"tool_name":"Bash","tool_input":{"command":"/usr/bin/xcodebuild build -scheme T"}}"#,
+        );
         assert_eq!(code, 0);
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(value["hookSpecificOutput"]["permissionDecision"], "deny");
@@ -1234,7 +1330,7 @@ mod tests {
             value["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
                 .unwrap()
-                .contains("citrus-lane mac-xcode -- 'xcodebuild build -scheme T'")
+                .contains("citrus-lane mac-xcode -- '/usr/bin/xcodebuild build -scheme T'")
         );
         let (_, output) = hook(r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#);
         assert!(output.is_empty());
