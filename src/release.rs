@@ -690,7 +690,7 @@ fn start_profile_run(
     let output = run
         .args(["--detach", "--json", "--base", &gate.base, "--paths-file"])
         .arg(list)
-        .env("CITRUS_RUN_PRIORITY", "10")
+        .env("CITRUS_RUN_PRIORITY", "20")
         .env(GATE_ENVIRONMENT, environment)
         .stderr(std::process::Stdio::inherit())
         .output()?;

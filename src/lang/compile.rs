@@ -1107,6 +1107,37 @@ pub fn compile(
                 };
                 project.commands.push((text("1"), text("2"), text("0")));
             }
+            "lane" => {
+                let fields = compiler.attr_object(attr)?;
+                let usage = "#![lane(\"mac-xcode\", capacity = 1, ttl = 3600, about = \"…\")]";
+                let Some(name) = fields.get("0").and_then(Json::as_str).map(str::to_owned) else {
+                    return Err(Error::at(attr.span, "`#![lane]` needs a name").help(usage));
+                };
+                if let Some(other) = fields.keys().find(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "0" | "capacity" | "ttl" | "about" | "legacy_lock" | "legacy_priority"
+                    )
+                }) {
+                    return Err(
+                        Error::at(attr.span, format!("`#![lane]` has no `{other}`")).help(usage)
+                    );
+                }
+                let number = |key: &str| fields.get(key).and_then(Json::as_u64);
+                let capacity = number("capacity").unwrap_or(1);
+                if capacity == 0 {
+                    return Err(Error::at(attr.span, "a lane's capacity is at least 1").help(usage));
+                }
+                let text = |key: &str| fields.get(key).and_then(Json::as_str).map(str::to_owned);
+                project.lanes.push(crate::lanes::Policy {
+                    name,
+                    capacity: capacity as usize,
+                    ttl: number("ttl").unwrap_or(0),
+                    about: text("about").unwrap_or_default(),
+                    legacy_lock: text("legacy_lock"),
+                    legacy_priority: text("legacy_priority"),
+                });
+            }
             "label" => {
                 let [(_, name), (_, when)] = attr.args.as_slice() else {
                     return Err(Error::at(attr.span, "`#![label(\"name\", condition)]`"));
@@ -1117,7 +1148,7 @@ pub fn compile(
             }
             other => {
                 return Err(Error::at(attr.span, format!("unknown project attribute `#![{other}]`")).help(
-                    "project attributes: citrus, main, toolchain, logs, receipts, cache, signals, free_version, after_merge, runner, image, private, prepare, tool, command, label",
+                    "project attributes: citrus, main, toolchain, logs, receipts, cache, signals, free_version, after_merge, runner, image, private, prepare, tool, command, label, lane",
                 ));
             }
         }

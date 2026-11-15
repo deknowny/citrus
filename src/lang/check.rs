@@ -595,6 +595,7 @@ const CONFIG: &[&str] = &[
     "private",
     "prepare",
     "command",
+    "lane",
     "citrus",
     "tool",
     "pin",

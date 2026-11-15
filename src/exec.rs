@@ -93,6 +93,7 @@ impl Context {
                     config.status.refresh_seconds = 60;
                 }
                 config.run.image = project.image.clone();
+                crate::lanes::sync_policy(&project.lanes);
                 config.run.private = project.private.clone();
                 config.run.prepare = project.prepare.clone();
                 if !project.after_merge.is_empty() {

@@ -7,7 +7,7 @@
 use anyhow::{Context as _, Result, bail};
 use postgres::Client;
 use postgres::fallible_iterator::FallibleIterator;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -242,8 +242,12 @@ fn requeue_stale(client: &mut Client) -> Result<Vec<(String, String, String)>> {
                      where a.name = j.agent and a.seen > now() - make_interval(secs => $1))
                  order by j.run, j.check_name
                  for update of j skip locked)
-             update citrus.jobs j set state = 'queued', agent = null, claimed = null
-             from stale where j.run = stale.run and j.check_name = stale.check_name
+             update citrus.jobs j set state = case when r.state = 'open' then 'queued' else 'done' end,
+                 result = case when r.state = 'open' then j.result else 'cancelled' end,
+                 finished = case when r.state = 'open' then j.finished else now() end,
+                 agent = null, claimed = null
+             from stale, citrus.runs r
+             where j.run = stale.run and j.check_name = stale.check_name and r.id = j.run
              returning j.run, j.check_name, coalesce(stale.agent, '')",
             &[&(STALE_SECONDS as f64)],
         )
@@ -602,6 +606,27 @@ fn follow(
                 }
             }
         }
+        // A run cancelled or closed in the pool (from any machine) ends here
+        // too: what is still queued for it never starts.
+        let state: Option<String> = client
+            .query_opt("select state from citrus.runs where id = $1", &[&id])?
+            .map(|row| row.get(0));
+        if state.as_deref() != Some("open") {
+            let dropped = client.execute(
+                "update citrus.jobs set state = 'done', result = 'cancelled', finished = now()
+                 where run = $1 and state = 'queued'",
+                &[&id],
+            )?;
+            if dropped > 0 {
+                on_line(format!(
+                    "CITRUS_STAGE the pool run is {}: {dropped} queued checks dropped",
+                    state.as_deref().unwrap_or("gone")
+                ))?;
+            }
+            if state.is_none() {
+                return Ok(3);
+            }
+        }
         let open: i64 = client
             .query_one(
                 "select count(*) from citrus.jobs where run = $1 and state in ('queued', 'claimed')",
@@ -648,6 +673,53 @@ pub fn cancel(id: &str) -> Result<()> {
         &[&id],
     )?;
     notify(&mut client, "citrus_jobs", id)
+}
+
+/// Wait for an agent and run time of pool checks by priority over `days`.
+pub fn queue_times(days: u64) -> Result<Vec<crate::lanes::Times>> {
+    let Some(url) = url() else {
+        return Ok(Vec::new());
+    };
+    let mut client = connect(&url)?;
+    let rows = client.query(
+        "select r.priority, count(*),
+                coalesce(avg(extract(epoch from j.claimed - r.created)), 0)::float8,
+                coalesce(max(extract(epoch from j.claimed - r.created)), 0)::float8,
+                coalesce(avg(j.seconds), 0)::float8, coalesce(max(j.seconds), 0)::float8
+         from citrus.jobs j join citrus.runs r on r.id = j.run
+         where j.claimed is not null and r.created > now() - make_interval(days => $1)
+         group by 1 order by 1 desc",
+        &[&(days as i32)],
+    )?;
+    let mut times: Vec<crate::lanes::Times> = Vec::new();
+    for row in rows {
+        let priority: i32 = row.get(0);
+        let count: i64 = row.get(1);
+        let name = crate::lanes::priority_name(priority);
+        let (wait_avg, wait_max, run_avg, run_max): (f64, f64, f64, f64) =
+            (row.get(2), row.get(3), row.get(4), row.get(5));
+        if let Some(known) = times.iter_mut().find(|known| known.priority == name) {
+            let total = (known.count as f64) + count as f64;
+            known.wait_avg =
+                (known.wait_avg * known.count as f64 + wait_avg * count as f64) / total;
+            known.run_avg = (known.run_avg * known.count as f64 + run_avg * count as f64) / total;
+            known.wait_max = known.wait_max.max(wait_max);
+            known.run_max = known.run_max.max(run_max);
+            known.count += count as usize;
+            continue;
+        }
+        times.push(crate::lanes::Times {
+            lane: "pool".into(),
+            priority: name.to_owned(),
+            count: count as usize,
+            lost: 0,
+            wait_avg,
+            wait_max,
+            run_avg,
+            run_max,
+        });
+    }
+    Ok(times)
 }
 
 // ---------------------------------------------------------------- overview
@@ -950,12 +1022,23 @@ pub fn agent(options: &AgentOptions) -> Result<i32> {
     );
     // The heartbeat keeps the agent in the pool and reads whether to drain.
     let stop = Arc::new(AtomicBool::new(false));
-    // Checks a previous process of this agent claimed died with it.
+    // Checks a previous process of this agent claimed died with it: back in
+    // the queue, or closed when their run is no longer open.
+    client.execute(
+        "update citrus.jobs j set state = 'done', result = 'cancelled', finished = now(),
+             agent = null, claimed = null
+         from citrus.runs r
+         where r.id = j.run and j.agent = $1 and j.state = 'claimed' and r.state <> 'open'",
+        &[&machine.name],
+    )?;
     let orphans = client.execute(
         "update citrus.jobs set state = 'queued', agent = null, claimed = null
          where agent = $1 and state = 'claimed'",
         &[&machine.name],
     )?;
+    // What a previous process of this agent left running (test databases,
+    // executors) belongs to no batch now: it goes before any new one starts.
+    remove_leftovers(&BTreeSet::new());
     if orphans > 0 {
         eprintln!(
             "citrus agent {}: {orphans} checks of a previous run of this agent back in the queue",
@@ -1165,6 +1248,7 @@ fn serve(
     let mut idle_since = Instant::now();
     let mut maintained = Instant::now() - Duration::from_secs(3600);
     let mut paused = false;
+    let mut disk_waiting = false;
     // Batch names must not repeat after a restart of the agent: the state schema
     // and the container of a stopped batch are still being removed while the
     // requeued checks run again under the next process.
@@ -1214,14 +1298,40 @@ fn serve(
             continue;
         }
         paused = false;
+        // A batch never starts on a disk that cannot hold it: a full disk
+        // fails checks with errors that look like their own (an aborted
+        // transaction), so the agent waits, trims and says why instead.
+        if let Some(short) = disk_short(&machine.cache) {
+            if !disk_waiting {
+                eprintln!(
+                    "citrus agent {}: {short}; trimming caches, taking no checks",
+                    machine.name
+                );
+                let _ = client.execute(
+                    "update citrus.agents set throttle = $2 where name = $1",
+                    &[&machine.name, &short],
+                );
+                disk_waiting = true;
+            }
+            if workers.is_empty() {
+                remove_leftovers(&BTreeSet::new());
+            }
+            trim_caches(machine);
+            std::thread::sleep(Duration::from_secs(10));
+            continue;
+        }
+        if disk_waiting {
+            eprintln!("citrus agent {}: disk has room again", machine.name);
+            disk_waiting = false;
+        }
         let free_now = free.load(Ordering::SeqCst);
         // The governor lowers how many checks run at once beside production.
         let in_use = machine.slots - free_now;
         let limit = free_now.min(allowed.load(Ordering::SeqCst).saturating_sub(in_use));
-        // The last free slot waits for a release's checks.
+        // The last free slot waits for a release's (or an owner build's) checks.
         let reserved = machine.slots > 1 && free_now == 1;
         let claimed = if limit > 0 {
-            claim(client, machine, limit, if reserved { 1 } else { i32::MIN })?
+            claim(client, machine, limit, if reserved { 20 } else { i32::MIN })?
         } else {
             None
         };
@@ -1229,10 +1339,19 @@ fn serve(
             free.fetch_sub(checks.len(), Ordering::SeqCst);
             batches += 1;
             let batch = format!("{}-{}-{batches}", run.id, &process[..6]);
+            ACTIVE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(batch.clone());
             let (url, machine) = (url.to_owned(), machine.clone());
             let (free, fatal) = (free.clone(), fatal.clone());
             workers.push(std::thread::spawn(move || {
-                if let Err(error) = work(&url, &machine, &run, &checks, &batch, &free) {
+                let result = work(&url, &machine, &run, &checks, &batch, &free);
+                ACTIVE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&batch);
+                if let Err(error) = result {
                     *fatal.lock().unwrap() = Some(format!("{error:#}"));
                 }
             }));
@@ -1282,6 +1401,19 @@ fn work(
             &mut released,
         );
         let _ = crate::state::Store::drop_schema(url, &batch_schema(batch));
+        // A disk that filled up during the batch is the machine's failure,
+        // not the checks': say so where the run's log shows it.
+        if let Some(short) = disk_short(&machine.cache) {
+            let _ = emit(
+                &mut client,
+                &run.id,
+                &machine.name,
+                &[format!(
+                    "CITRUS_STAGE infrastructure failure on {}: {short} — a failure in this batch (\"No space left on device\", an aborted transaction) is the disk, not the check; the agent takes no checks until it has room",
+                    machine.name
+                )],
+            );
+        }
         let rest: Vec<String> = checks
             .iter()
             .filter(|check| !released.contains(check))
@@ -2013,6 +2145,12 @@ fn execute(
         ("CITRUS_POOL_SHARE".into(), machine.share.to_string()),
         // Names per-run resources (Compose projects, ports) on a shared machine.
         ("CITRUS_POOL_RUN".into(), batch.to_owned()),
+        // Containers a check starts (its test database, S3) go into the
+        // agent's cgroup too: `cgroup_parent: ${CITRUS_CGROUP_PARENT:-}`.
+        (
+            "CITRUS_CGROUP_PARENT".into(),
+            std::env::var("CITRUS_AGENT_CGROUP_PARENT").unwrap_or_default(),
+        ),
         // The executor's own state: a throwaway schema of the pool's database,
         // dropped when the batch ends (the requester keeps the results).
         ("CITRUS_STATE".into(), url().unwrap_or_default()),
@@ -2315,8 +2453,165 @@ fn execute(
 
 /// Housekeeping any agent does: requeue stale checks, close abandoned runs,
 /// drop old records and this machine's finished worktrees.
+/// Batches this agent process runs now; anything of another batch is a leftover.
+static ACTIVE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// The pool run id (`r-YYYYMMDD-HHMMSS-xxxx`) a container or project name
+/// carries, and the batch (`<run>-<process>-<n>`) when it names one.
+fn pool_names(text: &str) -> Option<(String, Option<String>)> {
+    let bytes = text.as_bytes();
+    let shape = |at: usize| -> bool {
+        let id = &bytes[at..];
+        id.len() >= 22
+            && id[0] == b'r'
+            && id[1] == b'-'
+            && id[2..10].iter().all(u8::is_ascii_digit)
+            && id[10] == b'-'
+            && id[11..17].iter().all(u8::is_ascii_digit)
+            && id[17] == b'-'
+            && id[18..22].iter().all(u8::is_ascii_hexdigit)
+    };
+    let start = (0..bytes.len()).find(|at| shape(*at))?;
+    let run = text[start..start + 22].to_owned();
+    let rest = &text[start + 22..];
+    let batch = rest.strip_prefix('-').and_then(|rest| {
+        let (process, number) = rest.split_once('-')?;
+        let digits: String = number.chars().take_while(char::is_ascii_digit).collect();
+        (process.len() == 6 && process.bytes().all(|b| b.is_ascii_hexdigit()) && !digits.is_empty())
+            .then(|| format!("{run}-{process}-{digits}"))
+    });
+    Some((run, batch))
+}
+
+/// Containers, volumes and networks of pool batches that are not running in
+/// this agent process (a killed agent, a batch that did not stop its test
+/// stack) are removed: nothing a batch started outlives it. `keep` adds
+/// batches to keep beside the running ones.
+fn remove_leftovers(keep: &BTreeSet<String>) {
+    // Agents a test starts share the machine's Docker with real batches.
+    if std::env::var_os("CITRUS_TEST_POOL").is_some() {
+        return;
+    }
+    let Ok(output) = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--format",
+            "{{.ID}}\t{{.Names}}\t{{.Label \"com.docker.compose.project\"}}",
+        ])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let active: BTreeSet<String> = ACTIVE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .chain(keep)
+        .cloned()
+        .collect();
+    let mut projects = BTreeSet::new();
+    let mut removed = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split('\t');
+        let (Some(id), Some(name)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let project = fields.next().unwrap_or("");
+        let named = if project.is_empty() { name } else { project };
+        let Some((run, batch)) = pool_names(named) else {
+            continue;
+        };
+        // Only what pool batches start: executors `citrus-<run>-…` and test
+        // stacks named after a batch.
+        let leftover = match &batch {
+            Some(batch) => !active.contains(batch),
+            None if name.starts_with("citrus-r-") => {
+                !active.iter().any(|batch| batch.starts_with(&run))
+            }
+            None => false,
+        };
+        if !leftover {
+            continue;
+        }
+        let _ = Command::new("docker")
+            .args(["rm", "-f", "-v", id])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        removed.push(name.to_owned());
+        if !project.is_empty() {
+            projects.insert(project.to_owned());
+        }
+    }
+    for project in &projects {
+        for kind in ["volume", "network"] {
+            let Ok(output) = Command::new("docker")
+                .args([kind, "ls", "-q", "--filter"])
+                .arg(format!("label=com.docker.compose.project={project}"))
+                .stderr(Stdio::null())
+                .output()
+            else {
+                continue;
+            };
+            for item in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+                let _ = Command::new("docker")
+                    .args([kind, "rm", item])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+    if !removed.is_empty() {
+        eprintln!(
+            "citrus agent: removed {} containers no running batch owns: {}",
+            removed.len(),
+            removed.join(", ")
+        );
+    }
+}
+
+/// Free space the cache disk must keep before a batch starts.
+fn disk_floor_gib() -> f64 {
+    std::env::var("CITRUS_AGENT_MIN_FREE_GIB")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10.0)
+}
+
+/// Why the cache disk cannot take a batch now, if it cannot.
+fn disk_short(dir: &Path) -> Option<String> {
+    let (free, total) = crate::disk::space(dir)?;
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    let floor = disk_floor_gib();
+    let used = 1.0 - free as f64 / total.max(1) as f64;
+    (gib(free) < floor || used > 0.95).then(|| {
+        format!(
+            "disk low: {:.1} GiB free of {:.0} GiB ({:.0}% used; a batch needs {floor:.0} GiB)",
+            gib(free),
+            gib(total),
+            used * 100.0
+        )
+    })
+}
+
+/// Idle slot trees and their caches go first when the disk is short.
+fn trim_caches(machine: &Machine) {
+    if let Ok(repos) = std::fs::read_dir(machine.cache.join("slots")) {
+        for repo in repos.flatten() {
+            crate::slots::remove_idle(&repo.path(), 1);
+        }
+    }
+}
+
 fn maintain(client: &mut Client, machine: &Machine) -> Result<()> {
     requeue_stale(client)?;
+    remove_leftovers(&BTreeSet::new());
     client.execute(
         "update citrus.runs set state = 'closed', closed = now()
          where state = 'open' and created < now() - interval '12 hours'",
@@ -2437,6 +2732,23 @@ mod tests {
         let bytes = format!("\0\0junk (0123)\0tool 0.3.0 ({commit})\0more").into_bytes();
         assert_eq!(embedded_version(&bytes), Some(format!("0.3.0 ({commit})")));
         assert_eq!(embedded_version(b"no version here"), None);
+    }
+
+    #[test]
+    fn finds_the_run_and_batch_a_container_belongs_to() {
+        assert_eq!(
+            pool_names("garvis-r-20261115-194315-cc50-1a2b3c-4"),
+            Some((
+                "r-20261115-194315-cc50".into(),
+                Some("r-20261115-194315-cc50-1a2b3c-4".into())
+            ))
+        );
+        assert_eq!(
+            pool_names("citrus-r-20261115-194315-cc50-9f8e7d6c"),
+            Some(("r-20261115-194315-cc50".into(), None))
+        );
+        assert_eq!(pool_names("garvis-test"), None);
+        assert_eq!(pool_names("postgres"), None);
     }
 
     #[test]

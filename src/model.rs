@@ -332,6 +332,8 @@ pub struct Project {
     pub prepare: Vec<String>,
     pub after_merge: Vec<String>,
     pub commands: Vec<(String, String, String)>,
+    /// Lanes of scarce machine resources (`#![lane(…)]`).
+    pub lanes: Vec<crate::lanes::Policy>,
     pub groups: Vec<Group>,
     /// Named conditions reported with the plan (`label "scope:main" { when = … }`).
     pub labels: Vec<(String, Cond)>,

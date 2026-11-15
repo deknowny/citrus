@@ -17,6 +17,7 @@ mod exec;
 mod governor;
 mod hygiene;
 mod integrate;
+mod lanes;
 mod lang;
 mod lock;
 mod manifest;
@@ -112,6 +113,10 @@ enum Command {
         /// Plan for exactly the changed paths in this file (one per line).
         #[arg(long)]
         paths_file: Option<std::path::PathBuf>,
+        /// Place in the pool queue: owner-build, release, integrate or
+        /// agent-check (default; CITRUS_RUN_PRIORITY overrides).
+        #[arg(long)]
+        priority: Option<String>,
     },
     /// Wait for a run (id, unique prefix or `last`) and print its result.
     Wait { run: String },
@@ -326,6 +331,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<PoolAction>,
     },
+    /// Lanes: queues for a machine's scarce resources (Xcode on the Mac), by priority.
+    Lane {
+        #[command(subcommand)]
+        action: LaneAction,
+    },
     /// The Citrus build this repository runs (`#![pin(…)]`)
     #[command(name = "self")]
     Myself {
@@ -453,6 +463,41 @@ enum ReleaseAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum LaneAction {
+    /// Wait for a place in LANE, run the command, free the place.
+    /// One argument with spaces is a shell command line.
+    Run {
+        lane: String,
+        /// owner-build, release, integrate or agent-check (the default).
+        #[arg(long, default_value = "agent-check")]
+        priority: String,
+        /// What the queue shows for this command.
+        #[arg(long)]
+        label: Option<String>,
+        /// No messages while waiting.
+        #[arg(long)]
+        quiet: bool,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Who holds and waits for each lane, and wait/run times.
+    Status {
+        /// Times over the last N days.
+        #[arg(long, default_value_t = 1.0)]
+        days: f64,
+    },
+    /// Copy this build where the shims call it and write the xcodebuild,
+    /// xcrun and citrus-lane shims into DIR (default ~/.local/bin).
+    Install {
+        #[arg(long)]
+        bin: Option<std::path::PathBuf>,
+    },
+    /// Claude Code PreToolUse hook: refuse heavy Mac commands outside the lane.
+    #[command(hide = true)]
+    Hook,
+}
+
+#[derive(Subcommand, Debug)]
 enum SelfAction {
     /// Pin this repository to a Citrus commit; every `citrus` here runs it
     Pin { commit: String },
@@ -484,6 +529,102 @@ enum PoolAction {
         #[arg(long)]
         platform: Option<String>,
     },
+}
+
+fn lane_command(action: &LaneAction, json: bool) -> Result<i32> {
+    match action {
+        LaneAction::Run {
+            lane,
+            priority,
+            label,
+            quiet,
+            command,
+        } => lanes::run(&lanes::Request {
+            lane,
+            priority: lanes::priority_value(priority)?,
+            label: label.as_deref(),
+            command,
+            quiet: *quiet,
+        }),
+        LaneAction::Status { days } => {
+            let states = lanes::states();
+            let times = lanes::times(manifest::now() as f64 - days * 86400.0);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "lanes": states, "times": times})
+                    )?
+                );
+                return Ok(0);
+            }
+            print_lanes(&states);
+            print_lane_times(&times);
+            Ok(0)
+        }
+        LaneAction::Install { bin } => {
+            let bin = bin.clone().unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                    .join(".local/bin")
+            });
+            for path in lanes::install(&bin)? {
+                println!("{path}");
+            }
+            Ok(0)
+        }
+        LaneAction::Hook => {
+            let input = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
+            let (code, output) = lanes::hook(&input);
+            if !output.is_empty() {
+                println!("{output}");
+            }
+            Ok(code)
+        }
+    }
+}
+
+fn print_lanes(states: &[lanes::LaneState]) {
+    for state in states {
+        println!(
+            "lane {} · {}/{} running · {} waiting{}",
+            state.lane,
+            state.running.len(),
+            state.capacity,
+            state.waiting.len(),
+            if state.about.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", state.about)
+            }
+        );
+        for entry in state.running.iter().chain(&state.waiting) {
+            println!("  {}", lanes::describe_entry(entry));
+        }
+    }
+}
+
+fn print_lane_times(times: &[lanes::Times]) {
+    if times.is_empty() {
+        return;
+    }
+    println!("lane times (wait avg/max · run avg/max):");
+    for row in times {
+        println!(
+            "  {:<12} {:<12} {:>3}× · wait {}/{} · run {}/{}{}",
+            row.lane,
+            row.priority,
+            row.count,
+            age(row.wait_avg as i64),
+            age(row.wait_max as i64),
+            age(row.run_avg as i64),
+            age(row.run_max as i64),
+            if row.lost > 0 {
+                format!(" · {} lost", row.lost)
+            } else {
+                String::new()
+            }
+        );
+    }
 }
 
 fn pool_command(action: Option<&PoolAction>, json: bool) -> Result<i32> {
@@ -705,6 +846,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             });
         }
         Some(Command::Pool { action }) => return pool_command(action.as_ref(), json),
+        Some(Command::Lane { action }) => return lane_command(action, json),
         Some(Command::Myself { action }) => {
             match action {
                 SelfAction::Pin { commit } => println!("{}", pin::pin(commit)?),
@@ -734,7 +876,15 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             force,
             jobs,
             paths_file,
+            priority,
         } => {
+            if let Some(priority) = &priority
+                && std::env::var_os("CITRUS_RUN_PRIORITY").is_none()
+            {
+                let value = lanes::priority_value(priority)?;
+                // SAFETY: set before any thread of this command starts.
+                unsafe { std::env::set_var("CITRUS_RUN_PRIORITY", value.to_string()) };
+            }
             if let Some(warning) = disk::low_space_warning(&context.repo.root) {
                 eprintln!("! {warning}");
             }
@@ -1104,7 +1254,10 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             Ok(if failed { 1 } else { 0 })
         }
         Command::ExecSteps { .. } => unreachable!("handled before the configuration loads"),
-        Command::Agent { .. } | Command::Pool { .. } | Command::Myself { .. } => {
+        Command::Agent { .. }
+        | Command::Pool { .. }
+        | Command::Lane { .. }
+        | Command::Myself { .. } => {
             unreachable!("handled before the configuration")
         }
         Command::Ports { .. } => unreachable!("handled before the configuration is read"),
@@ -1307,6 +1460,21 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
         .collect();
     let mut warnings = Vec::new();
     let mut next = Vec::new();
+    let lane_states: Vec<lanes::LaneState> = lanes::states()
+        .into_iter()
+        .filter(|state| !state.running.is_empty() || !state.waiting.is_empty())
+        .collect();
+    let refused = lanes::violations(manifest::now() as f64 - 3600.0).len();
+    if refused > 0 {
+        warnings.push(format!(
+            "{refused} heavy Mac commands were refused outside the lane in the last hour: run them as `citrus-lane mac-xcode -- '<command>'`"
+        ));
+    }
+    for (pid, command) in lanes::outside() {
+        warnings.push(format!(
+            "xcodebuild outside the lane mac-xcode (pid {pid}): {command} — Mac builds run only as `citrus-lane mac-xcode -- …`"
+        ));
+    }
     let mine = active.iter().find(|run| run.worktree == context.worktree());
     if let Some(run) = mine.filter(|run| run.snapshot != snapshot) {
         warnings.push(format!(
@@ -1333,6 +1501,7 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
             "last_run": last.as_ref().map(run_brief),
             "resources": shared,
             "tasks": others,
+            "lanes": lane_states,
             "warnings": warnings,
             "next": next,
         });
@@ -1417,6 +1586,7 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
             );
         }
     }
+    print_lanes(&lane_states);
     if let Some(shared) = &shared {
         let when = match shared.age {
             Some(age) if shared.refreshing => format!("{} ago, refreshing", report::age(age)),
@@ -1435,10 +1605,14 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
 fn stats(context: &Context, days: u64, json: bool) -> Result<i32> {
     let since = now() as i64 - (days * 86400) as i64;
     let stats = context.store.stats(since)?;
+    let lane_times = lanes::times(since as f64);
+    let pool_times = pool::queue_times(days).unwrap_or_default();
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({"schema": SCHEMA, "days": days, "stats": stats}))?
+            serde_json::to_string_pretty(
+                &json!({"schema": SCHEMA, "days": days, "stats": stats, "lanes": lane_times, "pool": pool_times})
+            )?
         );
         return Ok(0);
     }
@@ -1489,6 +1663,21 @@ fn stats(context: &Context, days: u64, json: bool) -> Result<i32> {
         "  duplicate runs avoided (joined a running one): {}",
         stats.joined_runs
     );
+    print_lane_times(&lane_times);
+    if !pool_times.is_empty() {
+        println!("pool queue (wait for an agent avg/max · run avg/max):");
+        for row in &pool_times {
+            println!(
+                "  {:<12} {:>5}× · wait {}/{} · run {}/{}",
+                row.priority,
+                row.count,
+                age(row.wait_avg as i64),
+                age(row.wait_max as i64),
+                age(row.run_avg as i64),
+                age(row.run_max as i64)
+            );
+        }
+    }
     Ok(0)
 }
 
@@ -2037,6 +2226,11 @@ fn integrate_command(
         }
         let mut run_value = Value::Null;
         if run_checks {
+            // An integration's checks go before agents' checks in the pool.
+            if std::env::var_os("CITRUS_RUN_PRIORITY").is_none() {
+                // SAFETY: set before any thread of this command starts.
+                unsafe { std::env::set_var("CITRUS_RUN_PRIORITY", "10") };
+            }
             let run = context.start(&Request {
                 targets: Vec::new(),
                 base: None,
