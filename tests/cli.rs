@@ -4860,3 +4860,181 @@ fn gated_by_env() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A worktree of `project` on a new branch with one committed change.
+fn branch_with(project: &Project, name: &str, path: &str, content: &str) -> PathBuf {
+    let dir = project.root().with_extension(name);
+    let _ = fs::remove_dir_all(&dir);
+    project.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        name,
+        dir.to_str().unwrap(),
+        "main",
+    ]);
+    let file = dir.join(path);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, content).unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        name,
+    ]);
+    dir
+}
+
+fn citrus_at(dir: &Path, queue_dir: &Path, args: &[&str]) -> (Value, i32) {
+    let output = citrus_command()
+        .args(args)
+        .arg("--json")
+        .current_dir(dir)
+        .env("CITRUS_AGENT", "test")
+        .env("CITRUS_QUEUE_DIR", queue_dir)
+        .env("CITRUS_QUEUE_GATHER_SECONDS", "3")
+        .env_remove("CLAUDECODE")
+        .env_remove("CODEX_THREAD_ID")
+        .output()
+        .unwrap();
+    let value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "not JSON: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (value, output.status.code().unwrap_or(-1))
+}
+
+#[test]
+fn the_queue_lands_a_batch_and_leaves_out_the_branch_that_breaks_it() {
+    let project = Project::new("");
+    let origin = with_origin(&project);
+    let queue_dir = tempfile::tempdir().unwrap();
+    let a = branch_with(&project, "qa", "src/qa.txt", "a\n");
+    let b = branch_with(&project, "qb", "src/qb.txt", "b\n");
+    let broken = branch_with(&project, "qc", "other/qc", "breaks `fail`\n");
+    let mut ids = Vec::new();
+    for dir in [&a, &b, &broken] {
+        let (added, code) = citrus_at(dir, queue_dir.path(), &["queue", "add"]);
+        assert_eq!(code, 0, "{added}");
+        assert_eq!(added["queue"]["state"], "queued", "{added}");
+        ids.push(added["queue"]["id"].as_str().unwrap().to_owned());
+    }
+    // Asking again returns the same entry.
+    let (again, _) = citrus_at(&a, queue_dir.path(), &["queue", "add"]);
+    assert_eq!(again["queue"]["id"], ids[0].as_str());
+
+    let (first, code) = citrus_at(&a, queue_dir.path(), &["queue", "wait", &ids[0]]);
+    assert_eq!(code, 0, "{first}");
+    assert_eq!(first["queue"]["state"], "merged", "{first}");
+    let (second, code) = citrus_at(&b, queue_dir.path(), &["queue", "wait"]);
+    assert_eq!(code, 0, "{second}");
+    assert_eq!(second["queue"]["state"], "merged", "{second}");
+    let (third, code) = citrus_at(&broken, queue_dir.path(), &["queue", "wait"]);
+    assert_eq!(code, 1, "{third}");
+    assert_eq!(third["queue"]["state"], "failed", "{third}");
+    assert!(
+        third["queue"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("fail failed"),
+        "{third}"
+    );
+    // The first batch held all three.
+    let (status, _) = citrus_at(&a, queue_dir.path(), &["queue", "list"]);
+    assert!(status["queue"].as_array().unwrap().len() >= 3, "{status}");
+    let landed = Command::new("git")
+        .args(["log", "--format=%s", "main"])
+        .current_dir(&origin)
+        .output()
+        .unwrap()
+        .stdout;
+    let landed = String::from_utf8_lossy(&landed);
+    assert!(landed.contains("qa\n"), "{landed}\n{status}");
+    assert!(landed.contains("qb\n"), "{landed}\n{status}");
+    assert!(!landed.contains("qc"), "{landed}\n{status}");
+    assert!(landed.contains("Merge qb into main"), "{landed}\n{status}");
+}
+
+#[test]
+fn a_run_waits_for_the_run_already_checking_the_same_inputs() {
+    let project = Project::new(
+        "#[paths(\"src/*.txt\")]\ncheck waits {\n    run!(\"sh -c 'sleep 6'\")?;\n}\n",
+    );
+    let other = project.root().with_extension("same-inputs");
+    let _ = fs::remove_dir_all(&other);
+    project.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        other.to_str().unwrap(),
+        "HEAD",
+    ]);
+    // Another snapshot, the same inputs of `waits`.
+    fs::write(other.join("other/y"), "elsewhere\n").unwrap();
+    let (first, code) = project.json(&["run", "waits", "--detach"]);
+    assert_eq!(code, 0, "{first}");
+    std::thread::sleep(Duration::from_millis(1500));
+    let output = citrus_command()
+        .args(["run", "waits", "--json"])
+        .current_dir(&other)
+        .env("CITRUS_AGENT", "test")
+        .env_remove("CLAUDECODE")
+        .env_remove("CODEX_THREAD_ID")
+        .output()
+        .unwrap();
+    let second: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_ne!(second["run"]["id"], first["run"]["id"], "{second}");
+    let row = target(&second, "waits");
+    assert_eq!(row["result"], "passed", "{second}");
+    assert_eq!(row["reason"], "joined", "{second}");
+    assert_eq!(row["evidence_run"], first["run"]["id"], "{second}");
+}
+
+#[test]
+fn a_queued_branch_marked_for_release_is_released_after_it_lands() {
+    let project = release_project();
+    with_origin(&project);
+    let queue_dir = tempfile::tempdir().unwrap();
+    let branch = branch_with(&project, "qr", "src/qr.txt", "released\n");
+    let (refused, code) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &["queue", "add", "--release", "nope"],
+    );
+    assert_eq!(code, 2, "{refused}");
+    let (done, code) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &["queue", "add", "--release", "app", "--wait-release"],
+    );
+    assert_eq!(code, 0, "{done}");
+    assert_eq!(done["queue"]["state"], "released", "{done}");
+    let started = done["queue"]["started_releases"].as_str().unwrap();
+    let id = started.strip_prefix("app=").unwrap();
+    let (release, _) = project.json(&["release", "show", id]);
+    assert_eq!(release["release"]["state"], "passed", "{release}");
+    assert_eq!(
+        release["release"]["commit"].as_str().unwrap(),
+        done["queue"]["merged"].as_str().unwrap(),
+        "{release}"
+    );
+}

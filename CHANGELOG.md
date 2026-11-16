@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `citrus queue`: a merge queue. `queue add` queues the committed branch and
+  returns; one processor lands waiting branches in batches on the tip of the
+  base, halves a red batch to leave out the branch that breaks it, and starts
+  `--release <unit>` releases after the merge, one per unit at a time.
+  `integrate --push` merges the base here and lands through the queue.
+- A run waits for an earlier run checking a target with the same fingerprint
+  instead of checking it twice; a cached target's PASS is reused wherever the
+  shared state recorded it, not only where its receipt is.
+- A pool check running far past its usual duration is stopped as hung.
+
 Breaking: a new configuration language (docs/design/language.md). Every
 `.ci` file starts with `#![citrus(2)]`; the old language is gone.
 

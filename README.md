@@ -52,7 +52,8 @@ their results shared, reusable and short.
 | `citrus wait <run>` / `show` | Follow a run after a lost terminal or a new agent session; a vanished process becomes `unknown`, not “running forever” |
 | `citrus log <run>` | First error of each failed target; `--target`, `--full` when needed |
 | `citrus why <target>` | Why it is needed, and which inputs changed since its last pass |
-| `citrus integrate [--push]` | Merge the base branch, keep checks the incoming changes do not touch, re-check the rest, and fast-forward the base when green |
+| `citrus integrate [--push]` | Merge the base branch, keep checks the incoming changes do not touch, re-check the rest, and land through the merge queue with `--push` |
+| `citrus queue add [--release <unit>]` | Queue the committed branch: it lands on the base in a checked batch, then releases the unit |
 | `citrus tasks` / `citrus task <title>` / `citrus agree <key>` | Every worktree as a task — branch, unmerged commits, runs, what it does and what blocks it — and the agreements between tasks |
 | `citrus version reserve <start> --scope …` / `check` / `source` / `list` | Release versions held by one committed source; a retry gets the same one, another source the next free one ([docs/releases.md](docs/releases.md#versions)) |
 | `citrus diff <env>` / `citrus apply <env> --approve` | What an environment runs versus what HEAD builds; build what is missing by input key and roll it out by digest ([docs/design/declarative.md](docs/design/declarative.md)) |
