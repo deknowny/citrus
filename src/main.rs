@@ -26,6 +26,7 @@ mod pin;
 mod plan;
 mod pool;
 mod ports;
+mod queue;
 mod release;
 mod repo;
 mod report;
@@ -139,12 +140,20 @@ enum Command {
         /// Base to merge (default: plan.base, e.g. origin/main).
         #[arg(long)]
         base: Option<String>,
-        /// Fast-forward the base branch to the result once checks pass.
+        /// Land the result through the merge queue (`citrus queue add --wait`).
         #[arg(long)]
         push: bool,
         /// Only merge and carry results; do not run checks.
         #[arg(long)]
         no_run: bool,
+        /// With --push: release this unit after landing (`unit[:minor|major]`).
+        #[arg(long = "release", value_name = "UNIT")]
+        release: Vec<String>,
+    },
+    /// The merge queue: committed branches land on the base in checked batches.
+    Queue {
+        #[command(subcommand)]
+        action: Option<QueueAction>,
     },
     /// Every worktree as a task: branch, unmerged commits, runs, notes.
     Tasks {
@@ -450,6 +459,43 @@ enum ReleaseAction {
         #[arg(long, default_value_t = 10)]
         limit: i64,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum QueueAction {
+    /// Queue this worktree's commit to land on the base; asking again returns the same entry.
+    Add {
+        /// Release this unit after landing (`unit[:minor|major]`), repeatable.
+        #[arg(long = "release", value_name = "UNIT")]
+        release: Vec<String>,
+        #[arg(long)]
+        base: Option<String>,
+        /// Wait until it lands or fails (`--wait-release`: and its releases end).
+        #[arg(long)]
+        wait: bool,
+        #[arg(long)]
+        wait_release: bool,
+        /// Queue a failed, conflicting or cancelled commit again.
+        #[arg(long)]
+        retry: bool,
+    },
+    /// What waits, what is checked, what landed (also `citrus queue`).
+    List {
+        /// Entries of the last week, not just the last day.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Wait for an entry (default: this worktree's latest) to land or fail.
+    Wait {
+        entry: Option<String>,
+        #[arg(long)]
+        release: bool,
+    },
+    /// Take a waiting entry (default: this worktree's) out of the queue.
+    Cancel { entry: Option<String> },
+    /// The queue processor (started by `queue add`).
+    #[command(hide = true)]
+    Work,
 }
 
 #[derive(Subcommand, Debug)]
@@ -811,9 +857,13 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
         Command::Fmt { check } => fmt_command(&context, check, json),
         Command::Deps { target_dir } => deps_command(&context, target_dir, json),
         Command::Do { task } => do_command(&context, task, json),
-        Command::Integrate { base, push, no_run } => {
-            integrate_command(&mut context, base, push, !no_run, json)
-        }
+        Command::Integrate {
+            base,
+            push,
+            no_run,
+            release,
+        } => integrate_command(&mut context, base, push, !no_run, &release, json),
+        Command::Queue { action } => queue_command(&mut context, action, json),
         Command::Tasks { all, base } => tasks_command(&context, all, base, json),
         Command::Task {
             title,
@@ -1305,6 +1355,16 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
         .filter(|info| info.worktree != context.worktree() && now() as i64 - info.updated < 86400)
         .take(5)
         .collect();
+    // The merge queue: what waits or is checked, and this worktree's latest entry.
+    let queued: Vec<state::QueueEntry> =
+        context
+            .store
+            .queue_in(&["queued", "checking", "releasing"])?;
+    let own_entry = context.store.queue_of(&context.worktree())?;
+    if queued.iter().any(|entry| entry.state != "merged") && !queue::processing(context) {
+        // A processor that stopped is replaced by whoever looks.
+        queue::ensure_processor(context)?;
+    }
     let mut warnings = Vec::new();
     let mut next = Vec::new();
     let mine = active.iter().find(|run| run.worktree == context.worktree());
@@ -1333,6 +1393,7 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
             "last_run": last.as_ref().map(run_brief),
             "resources": shared,
             "tasks": others,
+            "queue": {"entries": queued, "mine": own_entry, "processing": queue::processing(context)},
             "warnings": warnings,
             "next": next,
         });
@@ -1415,6 +1476,27 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
                 describe_task(info),
                 age(now() as i64 - info.updated)
             );
+        }
+    }
+    if !queued.is_empty() || own_entry.is_some() {
+        println!(
+            "merge queue ({} waiting or checked, processor {}):",
+            queued.len(),
+            if queue::processing(context) {
+                "working"
+            } else {
+                "idle"
+            }
+        );
+        for entry in &queued {
+            println!("  {}", queue::describe(entry));
+        }
+        if let Some(entry) = own_entry
+            .as_ref()
+            .filter(|entry| !queued.iter().any(|item| item.id == entry.id))
+            .filter(|entry| now() as i64 - entry.updated < 86400)
+        {
+            println!("  ▸ yours: {}", queue::describe(entry));
         }
     }
     if let Some(shared) = &shared {
@@ -1741,7 +1823,7 @@ fn symbol(result: &str) -> &'static str {
         "passed" | "recovered" => "✓",
         "reused" => "≡",
         "failed" => "✗",
-        "running" | "queued" | "waiting" => "…",
+        "running" | "queued" | "waiting" | "joined" => "…",
         "pending" => "○",
         "cancelled" | "not_run" => "–",
         _ => "?",
@@ -1831,6 +1913,10 @@ fn overview(context: &mut Context, json: bool) -> Result<i32> {
             "merge the base, keep what is still proven, recheck the rest",
         ),
         (
+            "citrus queue add [--release <unit>]",
+            "land the committed branch through the merge queue, then release",
+        ),
+        (
             "citrus tasks",
             "every worktree: branch, unmerged commits, runs, what it does; agreements",
         ),
@@ -1907,30 +1993,6 @@ fn overview(context: &mut Context, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// The push lost a race: the base has commits this branch lacks.
-fn base_moved(error: &str) -> bool {
-    error.contains("non-fast-forward")
-        || error.contains("fetch first")
-        || error.contains("[rejected]")
-}
-
-/// A failure of the remote itself (GitHub 5xx, a dropped connection), worth retrying.
-fn transient_push_error(error: &str) -> bool {
-    !base_moved(error)
-        && [
-            "Internal Server Error",
-            "502",
-            "503",
-            "504",
-            "Connection reset",
-            "timed out",
-            "RPC failed",
-            "unexpected disconnect",
-        ]
-        .iter()
-        .any(|marker| error.contains(marker))
-}
-
 /// `git push HEAD:<branch>` without force; remote failures are retried after
 /// 2, 4, 8 and 16 seconds.
 fn push_with_retries(
@@ -1954,7 +2016,7 @@ fn push_with_retries(
             ])
             .output()?;
         let error = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() || !transient_push_error(&error) || delay > 16 {
+        if output.status.success() || !integrate::transient_push_error(&error) || delay > 16 {
             return Ok(output);
         }
         eprintln!(
@@ -1975,9 +2037,13 @@ fn integrate_command(
     base: Option<String>,
     push: bool,
     run_checks: bool,
+    releases: &[String],
     json: bool,
 ) -> Result<i32> {
     let base = base.unwrap_or_else(|| context.repo.config.plan.base.clone());
+    if push {
+        return integrate_through_queue(context, &base, releases, json);
+    }
     for attempt in 1..=3 {
         let result = integrate::integrate(context, &base)?;
         if !json {
@@ -2104,7 +2170,7 @@ fn integrate_command(
             return Ok(0);
         }
         let error = String::from_utf8_lossy(&pushed.stderr);
-        if !base_moved(&error) {
+        if !integrate::base_moved(&error) {
             anyhow::bail!("git push failed: {}", error.trim());
         }
         if !json {
@@ -2112,6 +2178,211 @@ fn integrate_command(
         }
     }
     anyhow::bail!("{base} kept moving; run citrus integrate --push again")
+}
+
+/// `integrate --push`: merge the base here (conflicts are resolved where the
+/// work is, and proven checks are carried), then land through the queue.
+fn integrate_through_queue(
+    context: &mut Context,
+    base: &str,
+    releases: &[String],
+    json: bool,
+) -> Result<i32> {
+    let releases = queue::parse_releases(context, releases)?;
+    let result = integrate::integrate(context, base)?;
+    if result.outcome == "conflict" {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({"schema": SCHEMA, "integration": result, "pushed": false, "next": ["resolve the files, git add, git commit", "citrus integrate --push"]})
+                )?
+            );
+        } else {
+            println!(
+                "✗ merging {base} conflicts in {} files:",
+                result.conflicts.len()
+            );
+            for path in &result.conflicts {
+                println!("    {path}");
+            }
+            print_next(&[
+                "resolve the files, git add, git commit".into(),
+                "citrus integrate --push".into(),
+            ]);
+        }
+        return Ok(1);
+    }
+    if result.outcome != "up_to_date" {
+        // The merge may have moved the pin: the queue is driven by that Citrus.
+        pin::follow()?;
+        if !json {
+            println!(
+                "merged {base}: {} commits; carried: {}",
+                result.incoming_commits,
+                preview(&result.carried)
+            );
+        }
+    }
+    let (entry, _) = queue::add(context, base, &releases, false)?;
+    if !json {
+        println!("queued {}", queue::describe(&entry));
+    }
+    let entry = queue::wait(context, &entry.id, false)?;
+    let landed = entry.landed();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": SCHEMA, "integration": result, "queue": entry, "pushed": landed,
+                "next": if landed { Vec::<String>::new() } else { vec![format!("citrus log {}", entry.run), "citrus queue add --retry".into()] },
+            }))?
+        );
+    } else if landed {
+        println!(
+            "✓ {} landed on {base} as {} ({}){}",
+            entry.id,
+            &entry.merged[..12.min(entry.merged.len())],
+            report::compact_utc(entry.ended.unwrap_or(now() as i64) as u64),
+            if entry.releases.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; releasing {} (citrus queue wait --release)",
+                    entry.releases
+                )
+            }
+        );
+    } else {
+        println!("✗ {}", queue::describe(&entry));
+    }
+    Ok(if landed { 0 } else { 1 })
+}
+
+fn queue_command(context: &mut Context, action: Option<QueueAction>, json: bool) -> Result<i32> {
+    let base = context.repo.config.plan.base.clone();
+    let here = context.worktree();
+    let entry_of = |context: &Context, reference: Option<String>| -> Result<state::QueueEntry> {
+        match reference {
+            Some(id) => context
+                .store
+                .queue_entry(&id)?
+                .with_context(|| format!("no queue entry {id}")),
+            None => context
+                .store
+                .queue_of(&here)?
+                .context("this worktree queued nothing yet: citrus queue add"),
+        }
+    };
+    let emit = |entry: &state::QueueEntry, next: Vec<String>| -> Result<()> {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({"schema": SCHEMA, "queue": entry, "next": next})
+                )?
+            );
+        } else {
+            println!("{}", queue::describe(entry));
+            print_next(&next);
+        }
+        Ok(())
+    };
+    let code = |entry: &state::QueueEntry| match entry.state.as_str() {
+        "failed" | "conflict" | "release_failed" => 1,
+        "cancelled" => 3,
+        _ => 0,
+    };
+    match action.unwrap_or(QueueAction::List { all: false }) {
+        QueueAction::Add {
+            release,
+            base: given,
+            wait,
+            wait_release,
+            retry,
+        } => {
+            let releases = queue::parse_releases(context, &release)?;
+            let base = given.unwrap_or(base);
+            let (entry, inserted) = queue::add(context, &base, &releases, retry)?;
+            if !inserted && !json {
+                println!("already queued (the same commit):");
+            }
+            if wait || wait_release {
+                let entry = queue::wait(context, &entry.id, wait_release)?;
+                emit(&entry, Vec::new())?;
+                return Ok(code(&entry));
+            }
+            emit(
+                &entry,
+                vec![
+                    format!("citrus queue wait {}", entry.id),
+                    "citrus status".into(),
+                ],
+            )?;
+            Ok(code(&entry))
+        }
+        QueueAction::List { all } => {
+            let since = now() as i64 - if all { 7 * 86400 } else { 86400 };
+            let entries = context.store.queue_recent(since)?;
+            let processing = queue::processing(context);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "processing": processing, "queue": entries})
+                    )?
+                );
+                return Ok(0);
+            }
+            println!(
+                "queue · {} · processor {}",
+                base,
+                if processing { "working" } else { "idle" }
+            );
+            for entry in &entries {
+                println!(
+                    "  {}{}",
+                    if entry.worktree == here { "▸ " } else { "" },
+                    queue::describe(entry)
+                );
+            }
+            if entries.is_empty() {
+                println!(
+                    "  nothing queued in the last {}",
+                    if all { "week" } else { "day" }
+                );
+            }
+            Ok(0)
+        }
+        QueueAction::Wait { entry, release } => {
+            let entry = entry_of(context, entry)?;
+            let entry = queue::wait(context, &entry.id, release)?;
+            emit(&entry, Vec::new())?;
+            Ok(code(&entry))
+        }
+        QueueAction::Cancel { entry } => {
+            let entry = entry_of(context, entry)?;
+            if !context.store.queue_move(
+                &entry.id,
+                &["queued"],
+                "cancelled",
+                "cancelled by its owner",
+            )? {
+                anyhow::bail!(
+                    "{} is {}: only a waiting entry leaves the queue",
+                    entry.id,
+                    entry.state
+                );
+            }
+            let entry = entry_of(context, Some(entry.id))?;
+            emit(&entry, Vec::new())?;
+            Ok(0)
+        }
+        QueueAction::Work => {
+            queue::work(context)?;
+            Ok(0)
+        }
+    }
 }
 
 fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool) -> Result<i32> {
@@ -2164,6 +2435,9 @@ fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool)
         );
         if let Some(info) = &task.info {
             println!("      {} — {}", describe_task(info), info.agent);
+        }
+        if let Some(entry) = &task.queue {
+            println!("      queue: {entry}");
         }
     }
     let agreements = context.store.agreements()?;
@@ -3030,10 +3304,10 @@ mod tests {
     #[test]
     fn a_server_error_is_not_a_moved_base() {
         let server = "remote: Internal Server Error\n ! [remote rejected]   HEAD -> main (Internal Server Error)";
-        assert!(!base_moved(server));
-        assert!(transient_push_error(server));
+        assert!(!integrate::base_moved(server));
+        assert!(integrate::transient_push_error(server));
         let raced = " ! [rejected]        HEAD -> main (fetch first)";
-        assert!(base_moved(raced));
-        assert!(!transient_push_error(raced));
+        assert!(integrate::base_moved(raced));
+        assert!(!integrate::transient_push_error(raced));
     }
 }

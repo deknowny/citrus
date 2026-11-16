@@ -254,6 +254,43 @@ fn requeue_stale(client: &mut Client) -> Result<Vec<(String, String, String)>> {
         .collect())
 }
 
+/// A check runs this many times its usual duration, and at least this much
+/// longer, before it counts as hung.
+const HUNG_FACTOR: f64 = 4.0;
+const HUNG_MARGIN_SECONDS: f64 = 1200.0;
+
+/// Stop run `id` when one of its claimed checks runs far past its smoothed
+/// duration (citrus.durations): a hung check holds a pool slot for hours
+/// otherwise. Checks without a duration yet are never stopped.
+fn stop_hung(client: &mut Client, id: &str) -> Result<Vec<(String, f64, f64)>> {
+    let rows = client.query(
+        "select j.check_name, extract(epoch from now() - j.claimed)::float8, d.seconds::float8
+         from citrus.jobs j
+         join citrus.runs r on r.id = j.run
+         join citrus.durations d on d.repo = r.repo and d.check_name = j.check_name
+         where j.run = $1 and j.state = 'claimed' and j.claimed is not null and d.seconds > 0
+           and extract(epoch from now() - j.claimed)::float8 > greatest(d.seconds::float8 * $2::float8, d.seconds::float8 + $3::float8)",
+        &[&id, &HUNG_FACTOR, &HUNG_MARGIN_SECONDS],
+    )?;
+    let hung: Vec<(String, f64, f64)> = rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    if !hung.is_empty() {
+        client.execute(
+            "update citrus.runs set state = 'cancelled', closed = now() where id = $1 and state = 'open'",
+            &[&id],
+        )?;
+        client.execute(
+            "update citrus.jobs set state = 'done', result = 'cancelled', finished = now()
+             where run = $1 and state = 'queued'",
+            &[&id],
+        )?;
+        notify(client, "citrus_jobs", id)?;
+    }
+    Ok(hung)
+}
+
 /// Postgres may abort one side of a lock conflict (deadlock, serialization):
 /// that statement is safe to run again.
 fn retry<T>(mut statement: impl FnMut() -> Result<T, postgres::Error>) -> Result<T> {
@@ -580,6 +617,7 @@ fn follow(
     // transactions in [cursor, xmin) are final and read once, in order.
     let mut cursor = "0".to_owned();
     let mut checked = Instant::now() - Duration::from_secs(60);
+    let mut stopped_hung = false;
     loop {
         let horizon: String = client
             .query_one("select pg_snapshot_xmin(pg_current_snapshot())::text", &[])?
@@ -599,6 +637,19 @@ fn follow(
                     on_line(format!(
                         "CITRUS_STAGE {check} back in the queue: agent {agent} stopped answering"
                     ))?;
+                }
+            }
+            if !stopped_hung {
+                let hung = stop_hung(client, id)?;
+                if !hung.is_empty() {
+                    stopped_hung = true;
+                    for (check, seconds, typical) in hung {
+                        on_line(format!(
+                            "error: {check} hung: it ran {:.0} min, its passes take about {:.0} min; the run was stopped",
+                            seconds / 60.0,
+                            typical / 60.0
+                        ))?;
+                    }
                 }
             }
         }

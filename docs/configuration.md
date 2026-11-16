@@ -96,6 +96,37 @@ The agent of a run is taken from `CODEX_THREAD_ID`, `CLAUDECODE` or
 `citrus integrate` merges `main` (fetching it first when it names a remote
 branch). A check that passed on the sources before the merge stays proven
 when the incoming paths do not select it. When any incoming path is claimed
-by no group or check, nothing is carried over. `--push` fast-forwards the
-base after the remaining checks pass, and integrates again if the base moved
-meanwhile.
+by no group or check, nothing is carried over. `--push` lands the result
+through the merge queue (below) and waits for it.
+
+## Merge queue
+
+`citrus queue add [--release <unit>[:minor|major]]` queues the committed
+`HEAD` of a worktree for the base and returns: the owner does not wait. One
+processor per clone (started by `queue add`, gone when the queue is empty)
+merges the waiting branches together onto the tip of the base in its own
+checkout (`<checkout>.citrus-queue/queue`, or `CITRUS_QUEUE_DIR`), runs the
+checks that batch needs once (`citrus run --base <tip>`, in the pool when
+one serves; proven checks are reused) and fast-forwards the base. A red batch
+is halved until the branch that breaks it is found; the others land. A branch
+that conflicts with the base is set aside as `conflict`.
+
+Each entry is one row in the state and moves only through Citrus:
+`queued → checking → merged → releasing → released`, or `failed`,
+`conflict`, `cancelled`, `release_failed`. Asking again with the same commit
+returns the same entry (`--retry` queues a failed one again); a newer commit
+of the worktree replaces the one still waiting. `citrus status`,
+`citrus tasks` and `citrus queue` show the queue; `citrus queue wait` waits
+for this worktree's entry, `--release` also for its releases.
+
+An entry marked `--release <unit>` starts `citrus release start <unit>
+--approve` once merged, from the queue's checkout of that unit at the merged
+commit (prepared by the project's `setup-worktree` task, when it has one).
+One release per unit at a time: the next waits for the running one, and the
+newest merged commit carries the ones before it. Gates, steps and verify are
+the release's own.
+
+A run whose check is already being checked by an earlier unfinished run with
+the same fingerprint waits for that result (`joined`) instead of checking it
+again. A pool check running four times its usual duration and twenty minutes
+past it is stopped as hung.

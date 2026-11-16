@@ -25,6 +25,8 @@ pub struct Task {
     pub info: Option<crate::state::TaskInfo>,
     pub last_run: Option<String>,
     pub last_run_state: Option<String>,
+    /// Its latest merge-queue entry: id, state and note.
+    pub queue: Option<String>,
     pub running: bool,
     pub missing: bool,
     pub current: bool,
@@ -35,6 +37,8 @@ pub fn list(context: &Context, base: &str) -> Result<Vec<Task>> {
     let listing = repo.git(&["worktree", "list", "--porcelain"])?;
     let infos = context.store.task_infos()?;
     let runs = context.store.latest_runs()?;
+    let since = now() as i64 - 3 * 86400;
+    let entries = context.store.queue_recent(since)?;
     let here = context.worktree();
     let base_commit = repo
         .git(&["rev-parse", "--verify", "--quiet", base])
@@ -93,6 +97,10 @@ pub fn list(context: &Context, base: &str) -> Result<Vec<Task>> {
             info,
             last_run: run.map(|run| run.id.clone()),
             last_run_state: run.map(|run| run.state.clone()),
+            queue: entries
+                .iter()
+                .find(|entry| entry.worktree == path)
+                .map(|entry| format!("{} {} {}", entry.id, entry.state, entry.note)),
             running: run.is_some_and(|run| !run.finished()),
             worktree: path,
         });
@@ -114,6 +122,7 @@ pub fn list(context: &Context, base: &str) -> Result<Vec<Task>> {
 pub fn active(task: &Task) -> bool {
     task.current
         || task.running
+        || task.queue.is_some()
         || task.info.is_some()
         || (task.ahead.unwrap_or(0) > 0 && task.idle.unwrap_or(i64::MAX) < 3 * 86400)
 }

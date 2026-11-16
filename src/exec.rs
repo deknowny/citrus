@@ -213,13 +213,23 @@ impl Context {
             if force {
                 return Ok(decision);
             }
-            if self.repo.receipts().valid(target, &current.value) {
+            // A PASS of these inputs proves them wherever it ran: this
+            // checkout, another worktree, another machine sharing the state.
+            let shared = self
+                .store
+                .evidence(target, "inputs", &current.value)?
+                .filter(|evidence| {
+                    evidence.result == "passed"
+                        && now().saturating_sub(evidence.created.max(0) as u64)
+                            < self.repo.receipts().max_age
+                });
+            if self.repo.receipts().valid(target, &current.value) || shared.is_some() {
                 decision.result = "reused".into();
                 decision.reason = "inputs_unchanged".into();
-                decision.evidence_run = self
+                decision.evidence_run = shared.map(|evidence| evidence.run).or(self
                     .store
                     .evidence(target, "inputs", &current.value)?
-                    .map(|evidence| evidence.run);
+                    .map(|evidence| evidence.run));
             } else if self.store.latest_evidence(target, "inputs")?.is_some() {
                 decision.reason = "input_changed".into();
             }
@@ -470,7 +480,7 @@ impl Context {
             )?;
             self.store.finish(&run.id, "unknown", None)?;
             for mut target in self.store.targets(&run.id)? {
-                if matches!(target.result.as_str(), "pending" | "running") {
+                if matches!(target.result.as_str(), "pending" | "running" | "joined") {
                     target.result = "unknown".into();
                     target.reason = "process_lost".into();
                     self.store.update_target(&run.id, &target)?;
@@ -502,7 +512,7 @@ impl Context {
         }
         self.store.finish(&run.id, "cancelled", None)?;
         for mut target in self.store.targets(&run.id)? {
-            if matches!(target.result.as_str(), "pending" | "running") {
+            if matches!(target.result.as_str(), "pending" | "running" | "joined") {
                 target.result = "cancelled".into();
                 target.reason = "cancelled".into();
                 self.store.update_target(&run.id, &target)?;
@@ -522,27 +532,37 @@ impl Context {
             Some(self.checkout_turn()?)
         };
         self.store.set_state(id, "running")?;
+        // Checks another run is already checking with the same inputs: this
+        // run waits for that result instead of checking them a second time.
+        let leaders = self.leaders(&run)?;
         let targets = self.store.targets(id)?;
         let jobs: usize = self
             .store
             .fact(&format!("jobs:{id}"))?
             .and_then(|(value, _)| value.parse().ok())
             .unwrap_or(1);
-        let passed = if run.mode == "remote" {
+        let mut passed = if !targets.iter().any(|target| target.result == "pending") {
+            Vec::new()
+        } else if run.mode == "remote" {
             self.work_remote(&run, &targets)?
         } else if jobs > 1 {
             self.work_parallel(&run, &targets, jobs)?
         } else {
             self.work_local(&run, &targets)?
         };
+        for (target, leader) in &leaders {
+            if self.follow_leader(&run, target, leader)? {
+                passed.push(target.clone());
+            }
+        }
         let finished = self.store.targets(id)?;
-        if run.mode == "remote" {
+        if run.mode == "remote" || !leaders.is_empty() {
             // A check the pool reported passing proves its inputs here too,
             // as long as they are what they were when the run started.
-            for row in finished
-                .iter()
-                .filter(|row| row.result == "passed" && row.reason == "ran")
-            {
+            for row in finished.iter().filter(|row| {
+                row.result == "passed"
+                    && ((row.reason == "ran" && run.mode == "remote") || row.reason == "joined")
+            }) {
                 self.record_inputs(&run, &row.target)?;
             }
         }
@@ -568,6 +588,109 @@ impl Context {
             Some(if ok { 0 } else { 1 }),
         )?;
         Ok(())
+    }
+
+    /// Pending targets of `run` that an earlier unfinished run checks with
+    /// the same fingerprint: marked `joined` to that run, (target, run) back.
+    fn leaders(&self, run: &Run) -> Result<Vec<(String, String)>> {
+        let mut found: Vec<(String, String)> = Vec::new();
+        let mut targets = self.store.targets(&run.id)?;
+        if !targets
+            .iter()
+            .any(|target| target.result == "pending" && target.fingerprint.is_some())
+        {
+            return Ok(found);
+        }
+        for other in self.store.active()? {
+            if (other.started, other.id.as_str()) >= (run.started, run.id.as_str()) {
+                continue;
+            }
+            let other = self.reconcile(other)?;
+            if other.finished() {
+                continue;
+            }
+            let rows = self.store.targets(&other.id)?;
+            for target in targets.iter_mut().filter(|target| {
+                target.result == "pending"
+                    && target.reason != "forced"
+                    && target.fingerprint.is_some()
+            }) {
+                if rows.iter().any(|row| {
+                    row.target == target.target
+                        && row.fingerprint == target.fingerprint
+                        && row.reason != "joined"
+                        && matches!(row.result.as_str(), "pending" | "running")
+                }) {
+                    target.result = "joined".into();
+                    target.reason = "joined".into();
+                    target.evidence_run = Some(other.id.clone());
+                    self.store.update_target(&run.id, target)?;
+                    println!(
+                        "CITRUS_NOTE {}: {} checks the same inputs now; waiting for its result",
+                        target.target, other.id
+                    );
+                    found.push((target.target.clone(), other.id.clone()));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// Wait for `leader` to settle `target` and take its result; true when it passed.
+    fn follow_leader(&self, run: &Run, target: &str, leader: &str) -> Result<bool> {
+        let started = now();
+        loop {
+            let other = self
+                .store
+                .run(leader)?
+                .context("the joined run disappeared")?;
+            let other = self.reconcile(other)?;
+            let row = self
+                .store
+                .targets(leader)?
+                .into_iter()
+                .find(|row| row.target == target);
+            let settled = row.as_ref().is_some_and(|row| {
+                !matches!(row.result.as_str(), "pending" | "running" | "joined")
+            });
+            if settled || other.finished() {
+                let mut mine = self
+                    .store
+                    .targets(&run.id)?
+                    .into_iter()
+                    .find(|row| row.target == target)
+                    .context("target disappeared")?;
+                let (result, error) = match row {
+                    Some(row) if matches!(row.result.as_str(), "passed" | "reused") => {
+                        ("passed", None)
+                    }
+                    Some(row) if row.result == "failed" => ("failed", row.first_error),
+                    Some(row) => (
+                        "failed",
+                        Some(format!(
+                            "the run checking the same inputs ({leader}) ended it {}; run again to check it here",
+                            row.result
+                        )),
+                    ),
+                    None => (
+                        "failed",
+                        Some(format!("{leader} has no result for {target}; run again")),
+                    ),
+                };
+                mine.result = result.into();
+                mine.reason = "joined".into();
+                mine.evidence_run = Some(leader.to_owned());
+                mine.first_error = error;
+                mine.seconds = Some((now() - started) as i64);
+                self.store.update_target(&run.id, &mine)?;
+                println!(
+                    "CITRUS_TARGET target={target} status={} seconds=0",
+                    if result == "passed" { "PASS" } else { "FAIL" }
+                );
+                return Ok(result == "passed");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
     }
 
     /// Waits until no other local run of this checkout is running; held until dropped.

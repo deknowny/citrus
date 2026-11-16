@@ -185,3 +185,27 @@ pub fn carry(
     }
     Ok(())
 }
+
+/// The push lost a race: the base has commits this branch lacks.
+pub fn base_moved(error: &str) -> bool {
+    error.contains("non-fast-forward")
+        || error.contains("fetch first")
+        || error.contains("[rejected]")
+}
+
+/// A failure of the remote itself (GitHub 5xx, a dropped connection), worth retrying.
+pub fn transient_push_error(error: &str) -> bool {
+    !base_moved(error)
+        && [
+            "Internal Server Error",
+            "502",
+            "503",
+            "504",
+            "Connection reset",
+            "timed out",
+            "RPC failed",
+            "unexpected disconnect",
+        ]
+        .iter()
+        .any(|marker| error.contains(marker))
+}

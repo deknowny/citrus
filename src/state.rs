@@ -128,6 +128,27 @@ CREATE TABLE IF NOT EXISTS facts (
 );
 CREATE INDEX IF NOT EXISTS evidence_latest ON evidence (target, created);
 CREATE INDEX IF NOT EXISTS runs_worktree ON runs (worktree, started);
+CREATE TABLE IF NOT EXISTS queue (
+    id TEXT PRIMARY KEY,
+    seq BIGSERIAL,
+    worktree TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    base TEXT NOT NULL,
+    releases TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    batch TEXT NOT NULL DEFAULT '',
+    run TEXT NOT NULL DEFAULT '',
+    merged TEXT NOT NULL DEFAULT '',
+    started_releases TEXT NOT NULL DEFAULT '',
+    added BIGINT NOT NULL,
+    updated BIGINT NOT NULL,
+    ended BIGINT,
+    UNIQUE (worktree, commit_sha, base)
+);
+CREATE INDEX IF NOT EXISTS queue_state ON queue (state, added);
 ";
 
 #[derive(Debug, Clone, Serialize)]
@@ -482,7 +503,7 @@ impl Store {
         let current: bool = client
             .query_one(
                 "select exists (select 1 from information_schema.columns
-                 where table_schema = $1 and table_name = 'runs' and column_name = 'linked_log')",
+                 where table_schema = $1 and table_name = 'queue' and column_name = 'started_releases')",
                 &[&schema],
             )?
             .get(0);
@@ -1328,4 +1349,189 @@ fn run_row(row: &Row) -> Result<Run> {
         log: row.get(14)?,
         linked_log: row.get(15)?,
     })
+}
+
+/// A branch waiting to land on the base (`citrus queue`): one row walks
+/// queued → checking → merged → releasing → released (or failed, conflict,
+/// cancelled, release_failed). Every transition goes through Citrus.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueEntry {
+    pub id: String,
+    pub worktree: String,
+    pub branch: String,
+    pub agent: String,
+    pub commit: String,
+    pub base: String,
+    /// Units released after the merge, `unit[:bump]` separated by commas.
+    pub releases: String,
+    pub state: String,
+    pub note: String,
+    pub batch: String,
+    pub run: String,
+    /// The base commit that carries this entry, once merged.
+    pub merged: String,
+    /// `unit=release-id` separated by commas, for releases started.
+    pub started_releases: String,
+    pub added: i64,
+    pub updated: i64,
+    pub ended: Option<i64>,
+}
+
+impl QueueEntry {
+    /// Nothing more happens to it.
+    pub fn settled(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "failed" | "conflict" | "cancelled" | "released" | "release_failed"
+        ) || (self.state == "merged" && self.releases.is_empty())
+    }
+
+    /// Landed on the base (whatever its releases do).
+    pub fn landed(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "merged" | "releasing" | "released" | "release_failed"
+        )
+    }
+
+    /// (unit, bump) pairs this entry asks to release.
+    pub fn release_units(&self) -> Vec<(String, String)> {
+        self.releases
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(|item| match item.split_once(':') {
+                Some((unit, bump)) => (unit.to_owned(), bump.to_owned()),
+                None => (item.to_owned(), "patch".to_owned()),
+            })
+            .collect()
+    }
+
+    /// (unit, release id) pairs of releases started for this entry.
+    pub fn started(&self) -> Vec<(String, String)> {
+        self.started_releases
+            .split(',')
+            .filter_map(|item| item.split_once('='))
+            .map(|(unit, id)| (unit.to_owned(), id.to_owned()))
+            .collect()
+    }
+}
+
+const QUEUE_SELECT: &str = "SELECT id, worktree, branch, agent, commit_sha, base, releases, state, note, batch, run, merged, started_releases, added, updated, ended FROM queue";
+
+fn queue_row(row: &Row) -> Result<QueueEntry> {
+    Ok(QueueEntry {
+        id: row.get(0)?,
+        worktree: row.get(1)?,
+        branch: row.get(2)?,
+        agent: row.get(3)?,
+        commit: row.get(4)?,
+        base: row.get(5)?,
+        releases: row.get(6)?,
+        state: row.get(7)?,
+        note: row.get(8)?,
+        batch: row.get(9)?,
+        run: row.get(10)?,
+        merged: row.get(11)?,
+        started_releases: row.get(12)?,
+        added: row.get(13)?,
+        updated: row.get(14)?,
+        ended: row.get(15)?,
+    })
+}
+
+impl Store {
+    /// Queue `entry` unless this worktree already queued that commit for that
+    /// base: then the existing entry comes back, so asking twice (after a lost
+    /// terminal or context) never queues a second one. `retry` puts a failed,
+    /// conflicting or cancelled entry of the same commit back in the queue.
+    pub fn queue_add(&self, entry: &QueueEntry, retry: bool) -> Result<(QueueEntry, bool)> {
+        let inserted = self.conn.execute(
+            "INSERT INTO queue (id, worktree, branch, agent, commit_sha, base, releases, state, note, added, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', '', ?8, ?8)
+             ON CONFLICT (worktree, commit_sha, base) DO NOTHING",
+            params![entry.id, entry.worktree, entry.branch, entry.agent, entry.commit, entry.base, entry.releases, entry.added],
+        )? == 1;
+        if !inserted && retry {
+            self.conn.execute(
+                "UPDATE queue SET state = 'queued', note = 'queued again', batch = '', run = '', releases = ?4,
+                     updated = ?5, ended = NULL
+                 WHERE worktree = ?1 AND commit_sha = ?2 AND base = ?3 AND state IN ('failed', 'conflict', 'cancelled')",
+                params![entry.worktree, entry.commit, entry.base, entry.releases, now() as i64],
+            )?;
+        }
+        let stored = self
+            .conn
+            .query_row(
+                &format!("{QUEUE_SELECT} WHERE worktree = ?1 AND commit_sha = ?2 AND base = ?3"),
+                params![entry.worktree, entry.commit, entry.base],
+                queue_row,
+            )?
+            .context("the queue entry disappeared")?;
+        Ok((stored, inserted))
+    }
+
+    pub fn queue_entry(&self, id: &str) -> Result<Option<QueueEntry>> {
+        self.conn.query_row(
+            &format!("{QUEUE_SELECT} WHERE id = ?1"),
+            params![id],
+            queue_row,
+        )
+    }
+
+    /// Entries in `states`, oldest first.
+    pub fn queue_in(&self, states: &[&str]) -> Result<Vec<QueueEntry>> {
+        let states: Vec<String> = states.iter().map(|state| (*state).to_owned()).collect();
+        self.conn.query_map(
+            &format!("{QUEUE_SELECT} WHERE state = ANY(?1) ORDER BY seq"),
+            params![states],
+            queue_row,
+        )
+    }
+
+    /// Entries changed since `since`, newest first.
+    pub fn queue_recent(&self, since: i64) -> Result<Vec<QueueEntry>> {
+        self.conn.query_map(
+            &format!("{QUEUE_SELECT} WHERE updated >= ?1 OR state IN ('queued', 'checking', 'releasing') ORDER BY seq DESC"),
+            params![since],
+            queue_row,
+        )
+    }
+
+    /// The latest entry of a worktree.
+    pub fn queue_of(&self, worktree: &str) -> Result<Option<QueueEntry>> {
+        self.conn.query_row(
+            &format!("{QUEUE_SELECT} WHERE worktree = ?1 ORDER BY seq DESC LIMIT 1"),
+            params![worktree],
+            queue_row,
+        )
+    }
+
+    /// Move an entry from one of `from` to `state`; false when it was not in
+    /// one of them (someone else moved it), so a transition happens once.
+    pub fn queue_move(&self, id: &str, from: &[&str], state: &str, note: &str) -> Result<bool> {
+        let from: Vec<String> = from.iter().map(|state| (*state).to_owned()).collect();
+        let ended = matches!(
+            state,
+            "failed" | "conflict" | "cancelled" | "merged" | "released" | "release_failed"
+        )
+        .then_some(now() as i64);
+        Ok(self.conn.execute(
+            "UPDATE queue SET state = ?3, note = ?4, updated = ?5, ended = COALESCE(?6, ended)
+             WHERE id = ?1 AND state = ANY(?2)",
+            params![id, from, state, note, now() as i64, ended],
+        )? == 1)
+    }
+
+    pub fn queue_set(&self, id: &str, field: &str, value: &str) -> Result<()> {
+        anyhow::ensure!(
+            matches!(field, "batch" | "run" | "merged" | "started_releases"),
+            "not a queue field: {field}"
+        );
+        self.conn.execute(
+            &format!("UPDATE queue SET {field} = ?2, updated = ?3 WHERE id = ?1"),
+            params![id, value, now() as i64],
+        )?;
+        Ok(())
+    }
 }
