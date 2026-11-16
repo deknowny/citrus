@@ -443,6 +443,15 @@ impl Context {
         if run.finished() {
             return Ok(run);
         }
+        if run.ended.is_some() {
+            // Ended, yet "running": a late worker overwrote its state.
+            self.store.repair_ended(&run.id)?;
+            self.store.set_note(
+                &run.id,
+                "ended without a result (its worker was lost); check the log before rerunning",
+            )?;
+            return self.store.run(&run.id)?.context("run disappeared");
+        }
         let lost = match run.pid {
             Some(pid) => !alive(pid),
             None => now() as i64 - run.started > 60,

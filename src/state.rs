@@ -573,10 +573,23 @@ impl Store {
         Ok(())
     }
 
+    /// A finished run keeps its result: a late worker (one that was followed
+    /// again and lost) cannot make it "running" again.
     pub fn set_state(&self, run: &str, state: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE runs SET state = ?2 WHERE id = ?1",
+            "UPDATE runs SET state = ?2 WHERE id = ?1 AND ended IS NULL",
             params![run, state],
+        )?;
+        Ok(())
+    }
+
+    /// A run that ended but still says it runs (written by an older build)
+    /// becomes `unknown`, so it can be closed.
+    pub fn repair_ended(&self, run: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET state = 'unknown' WHERE id = ?1 AND ended IS NOT NULL
+             AND state NOT IN ('passed', 'failed', 'cancelled', 'unknown')",
+            params![run],
         )?;
         Ok(())
     }
