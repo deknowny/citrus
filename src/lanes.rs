@@ -31,6 +31,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
+const OWNER_BUILD: i32 = 30;
+/// The note of a holder that waits for the legacy lock.
+const LEGACY_WAIT: &str = "waits for the legacy lock";
+
 /// Priorities, highest first.
 pub const PRIORITIES: &[(&str, i32)] = &[
     ("owner-build", 30),
@@ -273,15 +277,47 @@ impl Queue {
             entries,
         };
         queue.prune();
-        // An empty lane leaves no "owner build waits" marker behind (a holder
-        // that died would otherwise keep old scripts yielding for 30 minutes).
-        if queue.entries.is_empty()
-            && let Some(marker) = policy(lane).legacy_priority
-            && std::fs::read_to_string(&marker).is_ok_and(|text| text.starts_with("citrus lane"))
-        {
-            let _ = std::fs::remove_file(marker);
-        }
+        queue.sync_marker();
         Ok(queue)
+    }
+
+    /// The legacy priority marker says "an owner build waits" to old scripts
+    /// (they hand the legacy lock back while it is fresh). It exists exactly
+    /// while a live entry needs it: an owner build waiting for its turn, or a
+    /// holder waiting for the legacy lock. Whoever looks at the lane next
+    /// writes or removes it, so a cancelled, killed or timed-out writer never
+    /// leaves it behind (2026-11-16: a stale marker starved old compile checks
+    /// for an hour). A marker another tool wrote is left alone.
+    fn sync_marker(&self) {
+        let Some(marker) = policy(&self.lane).legacy_priority else {
+            return;
+        };
+        let reason = self.entries.iter().find_map(|entry| {
+            if entry.started.is_none() && entry.priority >= OWNER_BUILD {
+                Some(format!("owner build {} waits", entry.label))
+            } else if entry.started.is_some() && entry.note.starts_with(LEGACY_WAIT) {
+                Some(format!("{} waits for the legacy lock", entry.label))
+            } else {
+                None
+            }
+            .map(|why| {
+                format!(
+                    "citrus lane {} pid={} host={}: {why}\n",
+                    self.lane, entry.pid, entry.host
+                )
+            })
+        });
+        let ours =
+            || std::fs::read_to_string(&marker).is_ok_and(|text| text.starts_with("citrus lane"));
+        match reason {
+            Some(text) => {
+                let _ = std::fs::write(&marker, text);
+            }
+            None if ours() => {
+                let _ = std::fs::remove_file(&marker);
+            }
+            None => {}
+        }
     }
 
     /// Entries whose process is gone leave the queue (and are recorded).
@@ -325,6 +361,7 @@ impl Queue {
         let temporary = self.path.with_extension("json.new");
         std::fs::write(&temporary, serde_json::to_string_pretty(&self.entries)?)?;
         std::fs::rename(&temporary, &self.path)?;
+        self.sync_marker();
         Ok(())
     }
 
@@ -631,14 +668,6 @@ pub fn run(request: &Request) -> Result<i32> {
                 outcome: outcome.to_owned(),
                 ended: at,
             });
-            if let Some(marker) = &policy.legacy_priority
-                && !queue.entries.iter().any(|entry| {
-                    entry.started.is_none()
-                        && entry.priority >= priority_value("owner-build").unwrap_or(30)
-                })
-            {
-                let _ = std::fs::remove_file(marker);
-            }
         }
     };
     // Wait for the turn.
@@ -701,11 +730,6 @@ pub fn run(request: &Request) -> Result<i32> {
         if go {
             break at;
         }
-        if request.priority >= priority_value("owner-build")?
-            && let Some(marker) = &policy.legacy_priority
-        {
-            let _ = std::fs::write(marker, "citrus lane: an owner build waits\n");
-        }
         if !said && !request.quiet {
             eprintln!(
                 "citrus lane {}: waiting ({} {}) behind {}",
@@ -739,16 +763,13 @@ pub fn run(request: &Request) -> Result<i32> {
                     );
                     said = true;
                 }
-                // Old scripts yield the legacy lock while this marker is
-                // fresh (they read it as "an owner build waits"): the lane's
-                // holder is not starved by a stream of lockf waiters.
-                if let Some(marker) = &policy.legacy_priority {
-                    let _ = std::fs::write(marker, "citrus lane: the lane's holder waits\n");
-                }
+                // While this holder waits, the marker makes old scripts hand
+                // the legacy lock back (Queue::sync_marker): no starvation
+                // behind a stream of lockf waiters.
                 if let Ok(mut queue) = Queue::open(request.lane) {
                     if let Some(entry) = queue.find(&id) {
                         entry.beat = now();
-                        entry.note = format!("waits for the legacy lock {path}");
+                        entry.note = format!("{LEGACY_WAIT} {path}");
                     }
                     let _ = queue.save();
                 }
@@ -764,6 +785,13 @@ pub fn run(request: &Request) -> Result<i32> {
                     break;
                 }
             }
+        }
+        // Holding it now: the note (and with it the marker) goes at once.
+        if let Ok(mut queue) = Queue::open(request.lane) {
+            if let Some(entry) = queue.find(&id) {
+                entry.note.clear();
+            }
+            let _ = queue.save();
         }
     }
     if !request.quiet && said {
@@ -1508,6 +1536,61 @@ mod tests {
             .filter(|item| item.lane == "x" && item.outcome == "lost")
             .count();
         assert_eq!(lost, 2);
+    }
+
+    #[test]
+    fn the_priority_marker_lives_exactly_while_an_owner_build_needs_it() {
+        let dir = isolate();
+        let marker = dir.join("marker-prio");
+        let foreign = dir.join("foreign-prio");
+        sync_policy(&[
+            Policy {
+                name: "mk".into(),
+                capacity: 1,
+                legacy_priority: Some(marker.to_string_lossy().into_owned()),
+                ..Policy::default()
+            },
+            Policy {
+                name: "mk-foreign".into(),
+                capacity: 1,
+                legacy_priority: Some(foreign.to_string_lossy().into_owned()),
+                ..Policy::default()
+            },
+        ]);
+        let mut queue = Queue::open("mk").unwrap();
+        queue.entries.push(entry("running-check", 0, 1.0, true));
+        queue.entries.push(entry("owner", OWNER_BUILD, 2.0, false));
+        queue.save().unwrap();
+        drop(queue);
+        let text = std::fs::read_to_string(&marker).unwrap();
+        assert!(text.starts_with("citrus lane mk pid="), "{text}");
+
+        // The owner build starts: nobody waits any more, the marker goes.
+        let mut queue = Queue::open("mk").unwrap();
+        queue.entries.retain(|entry| entry.id != "running-check");
+        queue.find("owner").unwrap().started = Some(now());
+        queue.save().unwrap();
+        drop(queue);
+        assert!(!marker.exists(), "no waiting owner build, no marker");
+
+        // A killed waiter (dead pid) leaves the queue and its marker with it.
+        let mut queue = Queue::open("mk").unwrap();
+        queue.entries.clear();
+        let mut dead = entry("killed-owner", OWNER_BUILD, 3.0, false);
+        dead.pid = 999_999;
+        queue.entries.push(dead);
+        queue.save().unwrap();
+        drop(queue);
+        assert!(marker.exists());
+        let queue = Queue::open("mk").unwrap();
+        assert!(queue.entries.is_empty());
+        drop(queue);
+        assert!(!marker.exists(), "a dead writer's marker is removed");
+
+        // A marker some other tool wrote is not ours to remove.
+        std::fs::write(&foreign, "ship.sh\n").unwrap();
+        drop(Queue::open("mk-foreign").unwrap());
+        assert!(foreign.exists());
     }
 
     #[test]
