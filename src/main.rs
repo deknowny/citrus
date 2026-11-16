@@ -1520,20 +1520,31 @@ fn status(context: &mut Context, base: Option<&str>, json: bool) -> Result<i32> 
     }
     let mut warnings = Vec::new();
     let mut next = Vec::new();
-    let lane_states: Vec<lanes::LaneState> = lanes::states()
-        .into_iter()
-        .filter(|state| !state.running.is_empty() || !state.waiting.is_empty())
-        .collect();
-    let refused = lanes::violations(manifest::now() as f64 - 3600.0).len();
-    if refused > 0 {
-        warnings.push(format!(
-            "{refused} heavy Mac commands were refused outside the lane in the last hour: run them as `citrus-lane mac-xcode -- '<command>'`"
-        ));
-    }
-    for (pid, command) in lanes::outside() {
-        warnings.push(format!(
-            "xcodebuild outside the lane mac-xcode (pid {pid}): {command} — Mac builds run only as `citrus-lane mac-xcode -- …`"
-        ));
+    // Lanes are this machine's, shown where the project declares them.
+    let declares_lanes = context
+        .project
+        .as_ref()
+        .is_some_and(|project| !project.lanes.is_empty());
+    let lane_states: Vec<lanes::LaneState> = if declares_lanes {
+        lanes::states()
+            .into_iter()
+            .filter(|state| !state.running.is_empty() || !state.waiting.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if declares_lanes {
+        let refused = lanes::violations(manifest::now() as f64 - 3600.0).len();
+        if refused > 0 {
+            warnings.push(format!(
+                "{refused} heavy Mac commands were refused outside the lane in the last hour: run them as `citrus-lane mac-xcode -- '<command>'`"
+            ));
+        }
+        for (pid, command) in lanes::outside() {
+            warnings.push(format!(
+                "xcodebuild outside the lane mac-xcode (pid {pid}): {command} — Mac builds run only as `citrus-lane mac-xcode -- …`"
+            ));
+        }
     }
     let mine = active.iter().find(|run| run.worktree == context.worktree());
     if let Some(run) = mine.filter(|run| run.snapshot != snapshot) {
