@@ -956,10 +956,75 @@ pub fn heavy(command: &str) -> Option<String> {
     heavy_with(command, &shimmed)
 }
 
+/// The command line without here-document bodies: they are a program's
+/// input (a Python script, a file), not commands of this shell.
+fn without_heredocs(command: &str) -> String {
+    let mut out = String::new();
+    let mut terminator: Option<String> = None;
+    for line in command.lines() {
+        if let Some(end) = &terminator {
+            if line.trim() == end {
+                terminator = None;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        if let Some(at) = line.find("<<") {
+            let rest = line[at + 2..].trim_start_matches('-').trim_start();
+            let word: String = rest
+                .trim_start_matches(['\'', '"'])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !word.is_empty() {
+                terminator = Some(word);
+            }
+        }
+    }
+    out
+}
+
+/// Quoted text is data (an `echo`, a commit message, JSON), except the
+/// script of `sh -c '…'` / `bash -c "…"`, which is a command line itself.
+fn unquote(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        if c != '\'' && c != '"' {
+            out.push(c);
+            continue;
+        }
+        let mut inner = String::new();
+        let mut escaped = false;
+        for next in chars.by_ref() {
+            if c == '"' && next == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if next == c && !escaped {
+                break;
+            }
+            escaped = false;
+            inner.push(next);
+        }
+        let before = out.trim_end();
+        if before.ends_with(" -c") || before.ends_with("\t-c") || before == "-c" {
+            out.push_str(" ;");
+            out.push_str(&unquote(&inner));
+            out.push_str(" ;");
+        } else {
+            out.push_str("QUOTED");
+        }
+    }
+    out
+}
+
 fn heavy_with(command: &str, shimmed: &dyn Fn(&str) -> bool) -> Option<String> {
     if command.contains("citrus lane run") || command.contains("citrus-lane") {
         return None;
     }
+    let command = unquote(&without_heredocs(command));
     let segments = command.split([';', '|', '&', '(', ')', '`', '\n', '{', '}']);
     for segment in segments {
         let words: Vec<String> = segment
@@ -1304,6 +1369,26 @@ mod tests {
         assert_eq!(heavy("grep -rn xcodebuild scripts/"), None);
         assert_eq!(heavy("cat telenok/scripts/ship.sh | head"), None);
         assert_eq!(heavy("git log --oneline"), None);
+        assert_eq!(
+            heavy("echo '{\"command\":\"PATH=/usr/bin xcodebuild test\"}' | jq ."),
+            None
+        );
+        assert_eq!(
+            heavy("git commit -m 'run xcodebuild test via ship.sh'"),
+            None
+        );
+        assert_eq!(
+            heavy("python3 - <<'EOF'\nrun('sh -c \"/usr/bin/xcodebuild build\"')\nEOF\nls"),
+            None
+        );
+        assert_eq!(
+            heavy("sh -c 'cd t && /usr/bin/xcodebuild build'").as_deref(),
+            Some("xcodebuild")
+        );
+        assert_eq!(
+            heavy("bash -c \"scripts/ship.sh --release\"").as_deref(),
+            Some("ship.sh")
+        );
         // A bare call goes through the shim, which takes the lane.
         assert_eq!(heavy_with("timeout 590 xcodebuild test", &all), None);
         assert_eq!(heavy_with("xcrun simctl boot X", &all), None);
