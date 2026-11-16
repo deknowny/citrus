@@ -273,6 +273,14 @@ impl Queue {
             entries,
         };
         queue.prune();
+        // An empty lane leaves no "owner build waits" marker behind (a holder
+        // that died would otherwise keep old scripts yielding for 30 minutes).
+        if queue.entries.is_empty()
+            && let Some(marker) = policy(lane).legacy_priority
+            && std::fs::read_to_string(&marker).is_ok_and(|text| text.starts_with("citrus lane"))
+        {
+            let _ = std::fs::remove_file(marker);
+        }
         Ok(queue)
     }
 
@@ -731,6 +739,12 @@ pub fn run(request: &Request) -> Result<i32> {
                     );
                     said = true;
                 }
+                // Old scripts yield the legacy lock while this marker is
+                // fresh (they read it as "an owner build waits"): the lane's
+                // holder is not starved by a stream of lockf waiters.
+                if let Some(marker) = &policy.legacy_priority {
+                    let _ = std::fs::write(marker, "citrus lane: the lane's holder waits\n");
+                }
                 if let Ok(mut queue) = Queue::open(request.lane) {
                     if let Some(entry) = queue.find(&id) {
                         entry.beat = now();
@@ -738,7 +752,17 @@ pub fn run(request: &Request) -> Result<i32> {
                     }
                     let _ = queue.save();
                 }
-                std::thread::sleep(POLL);
+                // Short polls: a blocked lockf wakes at once when the lock frees.
+                for _ in 0..5 {
+                    if let Some(file) = try_flock(path) {
+                        legacy = Some(file);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if legacy.is_some() {
+                    break;
+                }
             }
         }
     }
