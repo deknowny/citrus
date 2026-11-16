@@ -429,15 +429,34 @@ fn takes_lock(command: &str, path: &str) -> bool {
     command.contains("lockf") && command.contains(path)
 }
 
-/// Whether an ancestor of this process holds or waits for `path` with `lockf`:
-/// an old script that took the lock runs this command inside it.
+/// Processes that have `path` open (a lock holder keeps it open).
+fn holders(path: &str) -> Vec<i64> {
+    Command::new("lsof")
+        .args(["-t", "--", path])
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .filter_map(|pid| pid.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether an ancestor of this process holds `path`: an old script took the
+/// lock (`lockf`, or any process that keeps the file open) and runs this
+/// command inside it. Then the resource is already this command's.
 fn ancestor_takes(table: &BTreeMap<i64, (i64, String)>, path: &str) -> bool {
+    let open = holders(path);
     let mut pid = i64::from(std::process::id());
     for _ in 0..64 {
         let Some((parent, command)) = table.get(&pid) else {
             return false;
         };
-        if pid != i64::from(std::process::id()) && takes_lock(command, path) {
+        if pid != i64::from(std::process::id())
+            && (takes_lock(command, path) || open.contains(&pid))
+        {
             return true;
         }
         if *parent <= 1 {
@@ -537,6 +556,20 @@ pub fn run(request: &Request) -> Result<i32> {
         bail!("run {}: {error}", argv[0]);
     }
     let policy = policy(request.lane);
+    // Inside an old script that holds the legacy lock the resource is already
+    // held: run in place. Waiting for the lane here deadlocks (the lane's
+    // holder waits for that same lock, 2026-11-16).
+    if let Some(path) = &policy.legacy_lock
+        && ancestor_takes(&processes(), path)
+    {
+        let mut lanes = held.clone();
+        lanes.push(request.lane.to_owned());
+        let error = Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("CITRUS_LANE", lanes.join(","))
+            .exec();
+        bail!("run {}: {error}", argv[0]);
+    }
     let label = request.label.map_or_else(
         || {
             argv.iter()
@@ -680,8 +713,7 @@ pub fn run(request: &Request) -> Result<i32> {
     // Older scripts' lock: held beside the lane until they all use lanes.
     let mut legacy: Option<File> = None;
     if let Some(path) = &policy.legacy_lock {
-        let table = processes();
-        if !ancestor_takes(&table, path) {
+        {
             let mut said = false;
             loop {
                 if SIGNAL.load(Ordering::SeqCst) != 0 {
