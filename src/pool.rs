@@ -1818,6 +1818,23 @@ fn executor(
         ))?;
         return Ok(binary);
     }
+    // Batches of one agent build one version one at a time: they share the
+    // process id the staging directory is named by (three at once raced on
+    // its files and all failed, 2026-11-16). The next one takes the build.
+    std::fs::create_dir_all(machine.cache.join("bin"))?;
+    let turn = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(machine.cache.join("bin").join(format!(".{version}-{platform}.lock")))?;
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor this function owns, held until it returns.
+        unsafe { libc::flock(turn.as_raw_fd(), libc::LOCK_EX) };
+    }
+    if binary.exists() {
+        return Ok(binary);
+    }
     let staging = machine
         .cache
         .join("bin")
