@@ -542,7 +542,12 @@ impl Context {
             .fact(&format!("jobs:{id}"))?
             .and_then(|(value, _)| value.parse().ok())
             .unwrap_or(1);
-        let mut passed = if !targets.iter().any(|target| target.result == "pending") {
+        // A reattached worker finds its targets running, not pending: it
+        // follows them again rather than giving up on them.
+        let mut passed = if !targets
+            .iter()
+            .any(|target| matches!(target.result.as_str(), "pending" | "running"))
+        {
             Vec::new()
         } else if run.mode == "remote" {
             self.work_remote(&run, &targets)?
