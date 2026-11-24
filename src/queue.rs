@@ -533,6 +533,12 @@ fn finish_landed(context: &Context, entry: &QueueEntry, commit: &str, note: &str
 fn check(context: &Context, tree: &Path, tip: &str) -> Result<Outcome> {
     let mut command = citrus_in(tree)?;
     command.args(["run", "--base", tip, "--json"]);
+    // A batch's checks go before agents' checks in the pool, as an integration's do: at
+    // agent-check priority a batch waited behind every agent run (2026-11-24: 10 min before its
+    // first check, 36 min in all, while 24 agent checks were queued).
+    if std::env::var_os("CITRUS_RUN_PRIORITY").is_none() {
+        command.env("CITRUS_RUN_PRIORITY", "10");
+    }
     // The queue's checkout has no dependencies installed: checks go to the pool.
     if crate::pool::has_live_agent() {
         command.arg("--remote");
