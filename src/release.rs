@@ -526,6 +526,45 @@ pub fn start(context: &mut Context, request: &Start) -> Result<Release> {
     context.store.release(&id)?.context("release disappeared")
 }
 
+/// `citrus release prebuild <unit>`: the artifacts a release of HEAD would roll, built and
+/// published by input key, while nothing else of the release happens. The queue runs it in a
+/// checkout of a batch while the batch's checks run, so the release that starts once the batch
+/// lands finds every image built and only migrates, rolls and verifies (a Garvis backend image
+/// took 289 s after the merge, 2026-11-24). The unit's steps before its first production step
+/// run first: they give the builds their credentials (`registry-auth.sh login`). No version, no
+/// gate (the batch's own run proves the checks), no environment lock. None when the unit deploys
+/// no environment or the environment already runs what HEAD builds.
+pub fn prebuild(context: &mut Context, unit_name: &str) -> Result<Option<crate::apply::Prepared>> {
+    let releases = Releases::load(context)?;
+    let unit = releases.unit(unit_name)?.clone();
+    if unit.environment.is_empty()
+        || !crate::deploy::environments(context)?.contains_key(&unit.environment)
+    {
+        return Ok(None);
+    }
+    let values = BTreeMap::from([
+        ("version", String::new()),
+        ("previous", String::new()),
+        ("commit", context.repo.git(&["rev-parse", "HEAD"])?),
+        ("unit", unit_name.to_owned()),
+    ]);
+    for step in unit.steps.iter().take_while(|step| !step.production) {
+        for work in substitute_works(&step.run, &values) {
+            let step_label = step.name.clone();
+            let step = crate::model::Step {
+                span: Default::default(),
+                label: work.label(),
+                work,
+            };
+            let code = crate::model::execute_env(&step, &context.repo.root, true, &[])?;
+            if code != 0 {
+                bail!("step {step_label} of {unit_name} failed (exit {code})");
+            }
+        }
+    }
+    crate::apply::prepare(context, &unit.environment, false)
+}
+
 /// Checks the plan selects for HEAD that are not proven yet.
 /// The checks of a plan that are not proven for the working tree.
 fn unproven_in(context: &Context, plan: &crate::plan::Plan) -> Result<Vec<String>> {

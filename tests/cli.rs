@@ -5038,3 +5038,163 @@ fn a_queued_branch_marked_for_release_is_released_after_it_lands() {
         "{release}"
     );
 }
+
+/// A project whose release `app` logs in and applies `prod`, a fake cluster in `kube`; its check of
+/// src/ takes a few seconds and fails on a file that says `broken`. Builds are logged in
+/// `kube/builds` as `<artifact> <key>`.
+fn queue_release_project(kube: &Path) -> Project {
+    let exe = env!("CARGO_BIN_EXE_citrus");
+    let project = Project::new(&format!(
+        r#"#![main("main")]
+#![free_version(cmd!("sh free.sh"))]
+
+#[paths("src/**")]
+check guard {{
+    run!("sh guard.sh")?;
+}}
+
+#[inputs("src/**")]
+#[build(provider = "command", run = cmd!("sh build.sh {{{{artifact}}}} {{{{key}}}}"))]
+artifact api;
+
+#[kubernetes(kubectl = "./kubectl.py", namespace = "shop")]
+#[record(annotation = "example.com/release", tag_prefix = "v")]
+#[deploy("api", api)]
+environment prod;
+
+#[environment(prod)]
+#[version(initial = "1.0.0")]
+release app {{
+    step login(r: Release) {{
+        run!("sh login.sh")?;
+    }}
+
+    #[production]
+    step apply(r: Release) {{
+        run!("{exe} apply prod --approve")?;
+    }}
+}}
+"#
+    ));
+    let kube = kube.display().to_string();
+    project.write("free.sh", "echo RELEASE=$CITRUS_VERSION\n");
+    project.write(
+        "guard.sh",
+        "sleep 5\nif grep -rq broken src; then echo 'AssertionError: broken'; exit 1; fi\n",
+    );
+    project.write(
+        "build.sh",
+        &format!("echo \"$1 $2\" >> {kube}/builds\necho IMAGE=registry.example/$1@sha256:$2\n"),
+    );
+    project.write("login.sh", &format!("echo \"$PWD\" >> {kube}/logins\n"));
+    project.write(
+        "kubectl.py",
+        &FAKE_KUBECTL.replace(".kube/", &format!("{kube}/")),
+    );
+    let mut perms = fs::metadata(project.root().join("kubectl.py"))
+        .unwrap()
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(project.root().join("kubectl.py"), perms).unwrap();
+    project.commit("release config");
+    let state = serde_json::json!({
+        "deployments": {"api": {"image": "registry.example/api@sha256:old", "annotations": {"example.com/release": "1.0.0"}}},
+        "cronjobs": {}, "lease": "api-old", "jobs": []
+    });
+    fs::write(format!("{kube}/state.json"), state.to_string()).unwrap();
+    project
+}
+
+#[test]
+fn a_batch_builds_its_release_images_while_it_is_checked_and_the_release_reuses_them() {
+    let kube = tempfile::tempdir().unwrap();
+    let project = queue_release_project(kube.path());
+    with_origin(&project);
+    let queue_dir = tempfile::tempdir().unwrap();
+    let builds = || -> Vec<(String, String)> {
+        fs::read_to_string(kube.path().join("builds"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let (artifact, key) = line.split_once(' ').unwrap();
+                (artifact.to_owned(), key.to_owned())
+            })
+            .collect()
+    };
+    let image = || {
+        let state: Value =
+            serde_json::from_str(&fs::read_to_string(kube.path().join("state.json")).unwrap())
+                .unwrap();
+        state["deployments"]["api"]["image"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    // A red batch: whatever its prebuild built is not used, nothing is released.
+    let broken = branch_with(&project, "qbroken", "src/bad.txt", "broken\n");
+    let (failed, code) = citrus_at(
+        &broken,
+        queue_dir.path(),
+        &["queue", "add", "--release", "app", "--wait-release"],
+    );
+    assert_eq!(code, 1, "{failed}");
+    assert_eq!(failed["queue"]["state"], "failed", "{failed}");
+    assert!(
+        failed["queue"]["started_releases"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "{failed}"
+    );
+    assert_eq!(image(), "registry.example/api@sha256:old");
+    let red = builds();
+    assert!(red.len() <= 1, "{red:?}");
+
+    // A green batch: its image builds while it is checked; the release only rolls it.
+    let good = branch_with(&project, "qgood", "src/good.txt", "fine\n");
+    let (done, code) = citrus_at(
+        &good,
+        queue_dir.path(),
+        &["queue", "add", "--release", "app", "--wait-release"],
+    );
+    assert_eq!(code, 0, "{done}");
+    assert_eq!(done["queue"]["state"], "released", "{done}");
+    let merged = done["queue"]["merged"].as_str().unwrap();
+    let log = fs::read_to_string(queue_dir.path().join("queue.log")).unwrap();
+    assert!(
+        log.contains(&format!(
+            "prebuild of app at {} beside the checks",
+            &merged[..12]
+        )),
+        "{log}"
+    );
+    // Built before the release started, which waited for it.
+    let prebuilt = log
+        .find(&format!("prebuild of app at {} done", &merged[..12]))
+        .unwrap_or_else(|| panic!("{log}"));
+    let released = log.find("of app from").unwrap_or_else(|| panic!("{log}"));
+    assert!(prebuilt < released, "{log}");
+    let green: Vec<_> = builds().into_iter().skip(red.len()).collect();
+    assert_eq!(
+        green.len(),
+        1,
+        "built once, by the prebuild: {green:?}\n{log}"
+    );
+    assert_eq!(green[0].0, "api");
+    assert_eq!(
+        image(),
+        format!("registry.example/api@sha256:{}", green[0].1),
+        "the release rolled the prebuilt image"
+    );
+    // The prebuild ran the unit's steps before production (its credentials) in its checkout.
+    let logins = fs::read_to_string(kube.path().join("logins")).unwrap();
+    assert!(
+        logins.lines().any(|line| line.ends_with("/prebuild")),
+        "{logins}"
+    );
+    let started = done["queue"]["started_releases"].as_str().unwrap();
+    let id = started.strip_prefix("app=").unwrap();
+    let (release, _) = project.json(&["release", "show", id]);
+    assert_eq!(release["release"]["state"], "passed", "{release}");
+}

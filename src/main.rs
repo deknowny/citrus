@@ -463,6 +463,13 @@ enum ReleaseAction {
         #[arg(long)]
         approve: bool,
     },
+    /// Build and publish the images a release of HEAD would roll, by input key, and nothing else
+    /// (the queue runs it beside a batch's checks; the release then reuses them).
+    #[command(hide = true)]
+    Prebuild {
+        #[arg(required = true)]
+        units: Vec<String>,
+    },
     /// Past releases of a unit.
     History {
         unit: String,
@@ -845,6 +852,9 @@ fn dashed(command: Option<Command>) -> Option<Command> {
                     | ReleaseAction::History { unit, .. },
                 ),
         } => dash(unit),
+        Command::Release {
+            action: Some(ReleaseAction::Prebuild { units }),
+        } => units.iter_mut().for_each(dash),
         _ => {}
     }
     Some(command)
@@ -1189,7 +1199,7 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             prepare: true,
             ..
         } => {
-            let Some(prepared) = apply::prepare(&mut context, &environment)? else {
+            let Some(prepared) = apply::prepare(&mut context, &environment, true)? else {
                 if json {
                     println!(
                         "{}",
@@ -2991,6 +3001,34 @@ fn release_command(context: &mut Context, action: ReleaseAction, json: bool) -> 
             );
             let finished = wait_release(context, &started.id, json)?;
             emit_release(context, &finished, json)
+        }
+        ReleaseAction::Prebuild { units } => {
+            let mut rows = Vec::new();
+            for unit in &units {
+                let prepared = release::prebuild(context, unit)?;
+                if !json {
+                    match &prepared {
+                        Some(prepared) => println!(
+                            "{unit} · {} prebuilt in {}s: {} of {} artifacts built",
+                            prepared.environment,
+                            prepared.seconds,
+                            prepared.built.len(),
+                            prepared.artifacts.len()
+                        ),
+                        None => println!("{unit}: nothing to build"),
+                    }
+                }
+                rows.push(json!({"unit": unit, "prepared": prepared}));
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"schema": SCHEMA, "state": "prebuilt", "units": rows})
+                    )?
+                );
+            }
+            Ok(0)
         }
         ReleaseAction::Rollback { unit, approve } => {
             let started = release::start(

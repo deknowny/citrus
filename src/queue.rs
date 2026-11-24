@@ -15,7 +15,8 @@
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -31,6 +32,12 @@ const BATCH: usize = 8;
 const PUSH_ATTEMPTS: usize = 6;
 /// Release levels, lowest first.
 const BUMPS: [&str; 3] = ["patch", "minor", "major"];
+/// Pool priority of a batch's checks (`citrus integrate`'s): a prebuild waits while any wait.
+const INTEGRATE_PRIORITY: i32 = 10;
+/// Seconds a prebuild waits for its batch's run to show up before it starts anyway.
+const PREBUILD_PATIENCE: i64 = 120;
+/// A prebuild running longer than this is stopped: a release no longer waits for it.
+const PREBUILD_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 /// Where the queue keeps its checkouts: CITRUS_QUEUE_DIR, else beside the
 /// main checkout (`<checkout>.citrus-queue`).
@@ -332,6 +339,7 @@ pub fn work(context: &Context) -> Result<()> {
             }
         }
     }
+    prebuild_cancel(None);
     log("queue processor done");
     drop(_lock);
     // An entry queued while this processor was leaving gets the next one.
@@ -440,21 +448,30 @@ fn land(context: &Context, base: &str, mut entries: Vec<QueueEntry>) -> Result<(
             )?;
             store.queue_set(&entry.id, "batch", &batch)?;
         }
-        let outcome = check(context, &tree, &tip)?;
+        // The release units the batch asks for: their images build while it is checked.
+        let mut units: Vec<String> = Vec::new();
+        for (unit, _) in merged.iter().flat_map(QueueEntry::release_units) {
+            if !units.contains(&unit) {
+                units.push(unit);
+            }
+        }
+        let head = git_in(&tree, &["rev-parse", "HEAD"])?;
+        let outcome = check(context, &tree, &tip, &head, &units)?;
         for entry in &merged {
             store.queue_set(&entry.id, "run", &outcome.run)?;
         }
         log(&format!("{batch}: run {} {}", outcome.run, outcome.state));
         if outcome.state == "passed" {
-            let head = git_in(&tree, &["rev-parse", "HEAD"])?;
             let pushed = push(&tree, &remote, &branch)?;
             if pushed.status.success() {
                 log(&format!("{batch}: pushed {} to {base}", &head[..12]));
                 for entry in &merged {
                     finish_landed(context, entry, &head, &format!("merged as {}", &head[..12]))?;
                 }
+                // Its prebuild goes on: the release of `head` waits for it.
                 return Ok(());
             }
+            prebuild_cancel(Some(&head));
             let error = String::from_utf8_lossy(&pushed.stderr).into_owned();
             if !crate::integrate::base_moved(&error) {
                 bail!("git push failed: {}", error.trim());
@@ -465,6 +482,9 @@ fn land(context: &Context, base: &str, mut entries: Vec<QueueEntry>) -> Result<(
             entries = merged;
             continue;
         }
+        // Not landed: what its prebuild builds is never used (a later batch of the same
+        // inputs finds it by key), so the builder is free for the next one.
+        prebuild_cancel(Some(&head));
         if outcome.state != "failed" && !retried {
             // The run itself broke (lost worker, pool error): once more.
             retried = true;
@@ -529,8 +549,15 @@ fn finish_landed(context: &Context, entry: &QueueEntry, commit: &str, note: &str
     Ok(())
 }
 
-/// Check the merged batch in `tree` against `tip`, reusing what is proven.
-fn check(context: &Context, tree: &Path, tip: &str) -> Result<Outcome> {
+/// Check the merged batch in `tree` against `tip`, reusing what is proven; the images of
+/// `units` at `head` build beside the checks (`prebuild_poll`).
+fn check(
+    context: &Context,
+    tree: &Path,
+    tip: &str,
+    head: &str,
+    units: &[String],
+) -> Result<Outcome> {
     let mut command = citrus_in(tree)?;
     command.args(["run", "--base", tip, "--json"]);
     // A batch's checks go before agents' checks in the pool, as an integration's do: at
@@ -567,15 +594,26 @@ fn check(context: &Context, tree: &Path, tip: &str) -> Result<Outcome> {
         }
         text
     });
-    // Releases move on while the batch is checked.
+    // Releases move on while the batch is checked, and its images build.
+    let mut prebuild_started = units.is_empty() || !prebuild_enabled();
+    let checking_since = now() as i64;
     loop {
+        if !prebuild_started {
+            match prebuild_poll(context, tree, checking_since, head, units) {
+                Ok(started) => prebuild_started = started,
+                Err(error) => {
+                    log(&format!("prebuild of {}: {error:#}", units.join(", ")));
+                    prebuild_started = true;
+                }
+            }
+        }
         if child.try_wait()?.is_some() {
             break;
         }
         if let Err(error) = advance_releases(context) {
             log(&format!("releases: {error:#}"));
         }
-        std::thread::sleep(Duration::from_secs(10));
+        std::thread::sleep(Duration::from_secs(if prebuild_started { 10 } else { 3 }));
     }
     let code = child.wait()?.code().unwrap_or(-1);
     let text = reader.join().unwrap_or_default();
@@ -701,6 +739,22 @@ fn advance_releases(context: &Context) -> Result<bool> {
         }
     }
     for (unit, entries) in wanted {
+        let newest_merged = entries
+            .iter()
+            .max_by_key(|entry| (entry.ended.unwrap_or(0), entry.updated))
+            .map(|entry| entry.merged.clone())
+            .unwrap_or_default();
+        // The images this release rolls are being built for it: the release waits rather than
+        // build them a second time.
+        if prebuilding(&newest_merged, &unit) {
+            for entry in &entries {
+                let note = format!("waiting for the images of {unit}, built while it was checked");
+                if entry.note != note {
+                    store.queue_move(&entry.id, &["releasing"], "releasing", &note)?;
+                }
+            }
+            continue;
+        }
         if let Some(last) = store.releases_of(&unit, 1)?.into_iter().next() {
             let last = crate::release::reconcile(context, last)?;
             if !last.finished() {
@@ -759,25 +813,7 @@ fn advance_releases(context: &Context) -> Result<bool> {
 /// `citrus release start <unit> --approve --detach` from a checkout of the
 /// queue at `commit`, prepared as any new checkout of the project.
 fn start_release(context: &Context, unit: &str, commit: &str, bump: &str) -> Result<String> {
-    let tree = tree_at(context, &format!("release-{unit}"), commit)?;
-    // Prepared once, as any new checkout of the project.
-    let ready = dir(context).join(format!("release-{unit}.ready"));
-    let setup = !ready.exists()
-        && context.project.as_ref().is_some_and(|project| {
-            project
-                .tasks
-                .iter()
-                .any(|task| matches!(task.name.as_str(), "setup-worktree" | "setup_worktree"))
-        });
-    if setup {
-        let status = citrus_in(&tree)?
-            .args(["do", "setup-worktree", "--text"])
-            .status()?;
-        if !status.success() {
-            bail!("citrus do setup-worktree failed in {}", tree.display());
-        }
-        fs::write(&ready, commit)?;
-    }
+    let tree = prepared_tree(context, &format!("release-{unit}"), commit)?;
     let output = citrus_in(&tree)?
         .args([
             "release",
@@ -801,6 +837,185 @@ fn start_release(context: &Context, unit: &str, commit: &str, bump: &str) -> Res
                 .map(str::to_owned)
                 .unwrap_or_else(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         ),
+    }
+}
+
+/// A checkout of the queue at `commit` (`tree_at`), prepared once as any new checkout of the
+/// project (`citrus do setup-worktree`, when the project has one).
+fn prepared_tree(context: &Context, name: &str, commit: &str) -> Result<PathBuf> {
+    let tree = tree_at(context, name, commit)?;
+    let ready = dir(context).join(format!("{name}.ready"));
+    let setup = !ready.exists()
+        && context.project.as_ref().is_some_and(|project| {
+            project
+                .tasks
+                .iter()
+                .any(|task| matches!(task.name.as_str(), "setup-worktree" | "setup_worktree"))
+        });
+    if setup {
+        let status = citrus_in(&tree)?
+            .args(["do", "setup-worktree", "--text"])
+            .status()?;
+        if !status.success() {
+            bail!("citrus do setup-worktree failed in {}", tree.display());
+        }
+        fs::write(&ready, commit)?;
+    }
+    Ok(tree)
+}
+
+// -------------------------------------------------------------- prebuild
+
+/// The prebuild running now: `citrus release prebuild <units>` in the queue's `prebuild`
+/// checkout of a batch's merge commit. One at a time: the images of a batch that landed finish
+/// before the next batch's start, so a release never waits behind a newer batch's build.
+struct Prebuild {
+    commit: String,
+    units: Vec<String>,
+    child: Child,
+    started: std::time::Instant,
+}
+
+static PREBUILD: Mutex<Option<Prebuild>> = Mutex::new(None);
+
+/// CITRUS_QUEUE_PREBUILD=0 turns building beside the checks off.
+fn prebuild_enabled() -> bool {
+    std::env::var("CITRUS_QUEUE_PREBUILD").map_or(true, |value| value != "0")
+}
+
+/// The running prebuild, after forgetting one that ended.
+fn prebuild_reap(slot: &mut Option<Prebuild>) {
+    let ended = match slot.as_mut() {
+        Some(prebuild) => match prebuild.child.try_wait() {
+            Ok(Some(status)) => Some(status.success()),
+            Ok(None) => None,
+            Err(_) => Some(false),
+        },
+        None => None,
+    };
+    if let Some(ok) = ended
+        && let Some(prebuild) = slot.take()
+    {
+        log(&format!(
+            "prebuild of {} at {} {}",
+            prebuild.units.join(", "),
+            &prebuild.commit[..12.min(prebuild.commit.len())],
+            if ok {
+                "done"
+            } else {
+                "failed; the release builds what is missing"
+            }
+        ));
+    }
+}
+
+/// Start the prebuild of `units` at `head` (the batch checked in `tree` since `since`) when the
+/// builder is free, the batch's run has queued its checks and no check of integrate priority
+/// waits for a pool slot: the builds share the machine the pool checks on, and a batch's checks
+/// take their slots first. True once started.
+fn prebuild_poll(
+    context: &Context,
+    tree: &Path,
+    since: i64,
+    head: &str,
+    units: &[String],
+) -> Result<bool> {
+    let mut slot = PREBUILD.lock().unwrap_or_else(|poison| poison.into_inner());
+    prebuild_reap(&mut slot);
+    if slot.is_some() {
+        return Ok(false);
+    }
+    // A run that never shows up (it broke before recording) holds nothing back for long.
+    if now() as i64 - since < PREBUILD_PATIENCE && !batch_run_queued(context, tree, since) {
+        return Ok(false);
+    }
+    match crate::pool::waiting(INTEGRATE_PRIORITY) {
+        Ok(0) => {}
+        Ok(_) => return Ok(false),
+        // An unreachable pool runs no checks to give way to.
+        Err(_) => {}
+    }
+    let tree = prepared_tree(context, "prebuild", head)?;
+    let mut command = citrus_in(&tree)?;
+    command
+        .args(["release", "prebuild"])
+        .args(units)
+        .arg("--text")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // Its own process group: cancelling stops the builds it started too.
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let child = command.spawn().context("start the prebuild")?;
+    log(&format!(
+        "prebuild of {} at {} beside the checks (pid {})",
+        units.join(", "),
+        &head[..12.min(head.len())],
+        child.id()
+    ));
+    *slot = Some(Prebuild {
+        commit: head.to_owned(),
+        units: units.to_vec(),
+        child,
+        started: std::time::Instant::now(),
+    });
+    Ok(true)
+}
+
+/// Whether the batch's run in `tree` (started since `since`) put its checks in the pool, or
+/// ended, or runs without a pool.
+fn batch_run_queued(context: &Context, tree: &Path, since: i64) -> bool {
+    let worktree = fs::canonicalize(tree)
+        .unwrap_or_else(|_| tree.to_path_buf())
+        .display()
+        .to_string();
+    let Ok(runs) = context.store.recent(&worktree, 1) else {
+        return false;
+    };
+    let Some(run) = runs.into_iter().next().filter(|run| run.started >= since) else {
+        return false;
+    };
+    run.finished() || crate::pool::run_known(&run.id).unwrap_or(true)
+}
+
+/// Whether the images of `unit` at `commit` are being built now (a prebuild past
+/// `PREBUILD_LIMIT` is stopped instead: the release builds what is missing).
+fn prebuilding(commit: &str, unit: &str) -> bool {
+    let overdue = {
+        let mut slot = PREBUILD.lock().unwrap_or_else(|poison| poison.into_inner());
+        prebuild_reap(&mut slot);
+        let Some(prebuild) = slot.as_ref().filter(|prebuild| {
+            prebuild.commit == commit && prebuild.units.iter().any(|name| name == unit)
+        }) else {
+            return false;
+        };
+        prebuild.started.elapsed() >= PREBUILD_LIMIT
+    };
+    if overdue {
+        prebuild_cancel(Some(commit));
+    }
+    !overdue
+}
+
+/// Stop the prebuild of `commit` (any, for None): its batch did not land. What it published
+/// stays under its input key and is simply not used.
+fn prebuild_cancel(commit: Option<&str>) {
+    let mut slot = PREBUILD.lock().unwrap_or_else(|poison| poison.into_inner());
+    prebuild_reap(&mut slot);
+    if slot
+        .as_ref()
+        .is_some_and(|prebuild| commit.is_none_or(|commit| prebuild.commit == commit))
+        && let Some(mut prebuild) = slot.take()
+    {
+        // SAFETY: signals the process group this processor started for the prebuild.
+        unsafe {
+            libc::kill(-(prebuild.child.id() as i32), libc::SIGTERM);
+        }
+        let _ = prebuild.child.wait();
+        log(&format!(
+            "prebuild of {} at {} stopped",
+            prebuild.units.join(", "),
+            &prebuild.commit[..12.min(prebuild.commit.len())]
+        ));
     }
 }
 

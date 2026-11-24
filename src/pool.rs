@@ -75,6 +75,32 @@ pub fn has_live_agent() -> bool {
         .unwrap_or(false)
 }
 
+/// Checks of open runs at `min_priority` or above still waiting for a slot; 0 without a pool.
+pub fn waiting(min_priority: i32) -> Result<i64> {
+    let Some(url) = url() else {
+        return Ok(0);
+    };
+    let mut client = connect(&url)?;
+    Ok(client
+        .query_one(
+            "select count(*) from citrus.jobs j join citrus.runs r on r.id = j.run
+             where j.state = 'queued' and r.state = 'open' and r.priority >= $1",
+            &[&min_priority],
+        )?
+        .get(0))
+}
+
+/// Whether the pool has run `id` (its checks are queued or done); true without a pool.
+pub fn run_known(id: &str) -> Result<bool> {
+    let Some(url) = url() else {
+        return Ok(true);
+    };
+    let mut client = connect(&url)?;
+    Ok(client
+        .query_opt("select 1 from citrus.runs where id = $1", &[&id])?
+        .is_some())
+}
+
 /// `postgres://user:secret@host/db` without the secret, for messages.
 pub fn redact(url: &str) -> String {
     match (url.find("://"), url.rfind('@')) {

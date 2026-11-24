@@ -606,8 +606,10 @@ pub struct Prepared {
 /// built meanwhile stays in the cache by its key and is simply not used. One
 /// prepare runs at a time on the machine (`prepare.lock` in the state
 /// directory), across worktrees: they are the heaviest work it does. None when
-/// the environment already runs HEAD's build.
-pub fn prepare(context: &mut Context, name: &str) -> Result<Option<Prepared>> {
+/// the environment already runs HEAD's build. Without `checks` only the
+/// artifacts are built: the queue proves the batch's checks itself and builds
+/// beside them (`citrus release prebuild`).
+pub fn prepare(context: &mut Context, name: &str, checks: bool) -> Result<Option<Prepared>> {
     let environments = deploy::environments(context)?;
     let environment = environments
         .get(name)
@@ -648,7 +650,7 @@ pub fn prepare(context: &mut Context, name: &str) -> Result<Option<Prepared>> {
         builds.push(Build { artifact, key });
     }
     // The checks start first (detached runs) and the builds run while they do.
-    let gate = if environment.checks == "proven" {
+    let gate = if checks && environment.checks == "proven" {
         crate::release::start_gate(&mut *context, name)?
     } else {
         None
