@@ -878,9 +878,14 @@ struct Prebuild {
 
 static PREBUILD: Mutex<Option<Prebuild>> = Mutex::new(None);
 
-/// CITRUS_QUEUE_PREBUILD=0 turns building beside the checks off.
-fn prebuild_enabled() -> bool {
-    std::env::var("CITRUS_QUEUE_PREBUILD").map_or(true, |value| value != "0")
+/// Building beside the checks is off unless CITRUS_QUEUE_PREBUILD=1. A prebuild the queue
+/// stops mid-build (its batch failed) leaves the builder's shared cache mounts half-written
+/// with the dropped branch's sources, and the next build of another commit reused them: garvis
+/// 0.249.28 (2026-11-25) rolled a backend image of d1f3bb8 holding code of a branch that had
+/// left its batch. `citrus release prebuild` checks this too, so a processor started by an
+/// older Citrus builds nothing either once a batch's pin carries this one.
+pub fn prebuild_enabled() -> bool {
+    std::env::var("CITRUS_QUEUE_PREBUILD").is_ok_and(|value| value == "1")
 }
 
 /// The running prebuild, after forgetting one that ended.

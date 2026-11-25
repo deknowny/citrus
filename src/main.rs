@@ -3003,6 +3003,13 @@ fn release_command(context: &mut Context, action: ReleaseAction, json: bool) -> 
             emit_release(context, &finished, json)
         }
         ReleaseAction::Prebuild { units } => {
+            if !queue::prebuild_enabled() {
+                println!(
+                    "prebuild is off (CITRUS_QUEUE_PREBUILD=1 turns it on): the release builds {}",
+                    units.join(", ")
+                );
+                return Ok(0);
+            }
             let mut rows = Vec::new();
             for unit in &units {
                 let prepared = release::prebuild(context, unit)?;

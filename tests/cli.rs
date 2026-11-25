@@ -4901,8 +4901,19 @@ fn branch_with(project: &Project, name: &str, path: &str, content: &str) -> Path
 }
 
 fn citrus_at(dir: &Path, queue_dir: &Path, args: &[&str]) -> (Value, i32) {
+    citrus_at_env(dir, queue_dir, args, &[])
+}
+
+/// `citrus_at` with more environment (the queue processor it starts inherits it).
+fn citrus_at_env(
+    dir: &Path,
+    queue_dir: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (Value, i32) {
     let output = citrus_command()
         .args(args)
+        .envs(env.iter().copied())
         .arg("--json")
         .current_dir(dir)
         .env("CITRUS_AGENT", "test")
@@ -5105,6 +5116,26 @@ release app {{
     project
 }
 
+/// Building beside the checks is opt-in (`queue::prebuild_enabled`).
+const PREBUILD_ON: &[(&str, &str)] = &[("CITRUS_QUEUE_PREBUILD", "1")];
+
+#[test]
+fn prebuild_is_off_unless_turned_on() {
+    let kube = tempfile::tempdir().unwrap();
+    let project = queue_release_project(kube.path());
+    let output = citrus_command()
+        .args(["release", "prebuild", "app", "--text"])
+        .current_dir(project.root())
+        .env_remove("CITRUS_QUEUE_PREBUILD")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("prebuild is off"), "{text}");
+    assert!(!kube.path().join("builds").exists(), "built: {text}");
+    assert!(!kube.path().join("logins").exists(), "logged in: {text}");
+}
+
 #[test]
 fn a_batch_builds_its_release_images_while_it_is_checked_and_the_release_reuses_them() {
     let kube = tempfile::tempdir().unwrap();
@@ -5133,10 +5164,11 @@ fn a_batch_builds_its_release_images_while_it_is_checked_and_the_release_reuses_
 
     // A red batch: whatever its prebuild built is not used, nothing is released.
     let broken = branch_with(&project, "qbroken", "src/bad.txt", "broken\n");
-    let (failed, code) = citrus_at(
+    let (failed, code) = citrus_at_env(
         &broken,
         queue_dir.path(),
         &["queue", "add", "--release", "app", "--wait-release"],
+        PREBUILD_ON,
     );
     assert_eq!(code, 1, "{failed}");
     assert_eq!(failed["queue"]["state"], "failed", "{failed}");
@@ -5153,10 +5185,11 @@ fn a_batch_builds_its_release_images_while_it_is_checked_and_the_release_reuses_
 
     // A green batch: its image builds while it is checked; the release only rolls it.
     let good = branch_with(&project, "qgood", "src/good.txt", "fine\n");
-    let (done, code) = citrus_at(
+    let (done, code) = citrus_at_env(
         &good,
         queue_dir.path(),
         &["queue", "add", "--release", "app", "--wait-release"],
+        PREBUILD_ON,
     );
     assert_eq!(code, 0, "{done}");
     assert_eq!(done["queue"]["state"], "released", "{done}");
