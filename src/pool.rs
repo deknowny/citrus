@@ -2849,14 +2849,24 @@ mod tests {
         assert!(check_binary(b"no version here", commit, "linux-x86_64").is_err());
     }
 
-    /// This very build: its bytes carry its version and platform as the pool
-    /// reads them (a clean build only: elsewhere it has no commit).
+    /// A real executable (this test binary): its header gives this platform
+    /// and its version text is found among its bytes (a clean build only:
+    /// elsewhere it has no commit). The test harness does not link the CLI's
+    /// `--version`, so the text is kept here; the citrus binary itself is
+    /// checked by the CLI test `the_binary_carries_its_version_once`.
     #[test]
     fn this_build_carries_its_own_key() {
         let commit = env!("CITRUS_COMMIT");
         if commit.len() != 40 {
             return;
         }
+        let text = std::hint::black_box(concat!(
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("CITRUS_COMMIT"),
+            ")"
+        ));
+        assert!(text.ends_with(&format!("({commit})")));
         let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let platform = format!("{}-{}", os_label(), arch());
         check_binary(&bytes, commit, &platform).unwrap();

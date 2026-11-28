@@ -1416,6 +1416,32 @@ fn integrate_runs_the_after_merge_hook() {
     );
 }
 
+/// The pool tells a build by the one `X.Y.Z (<commit>)` text in its bytes
+/// (`pool publish` of a cross build, `pool fetch` checking what it took).
+#[test]
+fn the_binary_carries_its_version_once() {
+    let output = citrus_command()
+        .arg("--version")
+        .env("CITRUS_NO_PIN", "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let Some(version) = text.strip_prefix("citrus ") else {
+        panic!("{text}");
+    };
+    let commit = version.split(['(', ')']).nth(1).unwrap_or_default();
+    if commit.len() != 40 {
+        return; // not a clean build: no commit to look for
+    }
+    let bytes = fs::read(env!("CARGO_BIN_EXE_citrus")).unwrap();
+    let needle = version.as_bytes();
+    let found = bytes
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count();
+    assert_eq!(found, 1, "{version}");
+}
+
 #[test]
 fn version_names_the_source_commit() {
     let output = citrus_command()
