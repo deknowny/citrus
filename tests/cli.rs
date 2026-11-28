@@ -3126,6 +3126,152 @@ artifact whole;
     assert_eq!(old["artifacts"][0]["key"], after["app"], "{old}");
 }
 
+/// The lock entries an image is keyed by, as `cargo` writes them: every kind of
+/// dependency a build can compile (normal, build, proc-macro, any target, an
+/// optional one turned on by another package) is an edge of the lock graph, so
+/// a new version of any package an image reaches changes its key, and a new
+/// version of a package only another crate reaches does not. Two images built
+/// in one Cargo run (`cargo_lock` of the other side) share their lock packages.
+#[test]
+fn an_image_key_follows_every_lock_package_its_build_reaches() {
+    let project = Project::new(
+        r#"#[inputs(std::paths::cargo("backend") + std::paths::cargo_lock("userbot") + ["Dockerfile"])]
+artifact backend_image;
+
+#[inputs(std::paths::cargo("userbot") + std::paths::cargo_lock("backend") + ["Dockerfile"])]
+artifact userbot_image;
+
+#[inputs(std::paths::cargo("backend") + ["Dockerfile"])]
+artifact backend_alone;
+
+"#,
+    );
+    project.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+    project.write("Dockerfile", "FROM scratch\n");
+    let member = |name: &str, manifest: &str| {
+        project.write(
+            &format!("crates/{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n{manifest}"),
+        );
+        project.write(&format!("crates/{name}/src/lib.rs"), "\n");
+    };
+    member(
+        "backend",
+        "[dependencies]\nshared = { path = \"../shared\" }\ntokio = \"1\"\nserde = \"1\"\n\
+         [build-dependencies]\ncc = \"1\"\n[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n",
+    );
+    member(
+        "userbot",
+        "[dependencies]\nshared = { path = \"../shared\", features = [\"extra\"] }\ntokio = \"1\"\nonlyuser = \"1\"\n",
+    );
+    member(
+        "shared",
+        "[dependencies]\nzstd = { version = \"0.13\", optional = true }\n[features]\nextra = [\"dep:zstd\"]\n",
+    );
+    member("ffi", "[dev-dependencies]\ned25519 = \"2\"\n");
+    // As cargo writes it: one entry per package, its dependencies whatever their kind.
+    let registry = |name: &str, version: &str, deps: &[&str]| {
+        let deps = if deps.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "dependencies = [\n{}]\n",
+                deps.iter()
+                    .map(|dep| format!(" \"{dep}\",\n"))
+                    .collect::<String>()
+            )
+        };
+        format!(
+            "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"{name}-{version}\"\n{deps}"
+        )
+    };
+    let path = |name: &str, deps: &[&str]| {
+        format!(
+            "\n[[package]]\nname = \"{name}\"\nversion = \"0.1.0\"\ndependencies = [\n{}]\n",
+            deps.iter()
+                .map(|dep| format!(" \"{dep}\",\n"))
+                .collect::<String>()
+        )
+    };
+    let lock = |bumped: &str| {
+        let version = |name: &str, base: &str| {
+            if name == bumped {
+                format!("{base}9")
+            } else {
+                base.to_owned()
+            }
+        };
+        let mut text = "version = 4\n".to_owned();
+        text += &path("backend", &["cc", "libc", "serde", "shared", "tokio"]);
+        text += &registry("cc", &version("cc", "1.0.0"), &[]);
+        text += &registry("ed25519", &version("ed25519", "2.0.0"), &[]);
+        text += &path("ffi", &["ed25519"]);
+        text += &registry("libc", &version("libc", "0.2.0"), &[]);
+        text += &registry("mio", &version("mio", "1.0.0"), &["libc"]);
+        text += &registry("onlyuser", &version("onlyuser", "1.0.0"), &[]);
+        text += &registry("proc-macro2", &version("proc-macro2", "1.0.0"), &[]);
+        text += &registry("serde", &version("serde", "1.0.0"), &["serde_derive"]);
+        text += &registry(
+            "serde_derive",
+            &version("serde_derive", "1.0.0"),
+            &["proc-macro2"],
+        );
+        text += &path("shared", &["zstd"]);
+        text += &registry("tokio", &version("tokio", "1.0.0"), &["libc", "mio"]);
+        text += &path("userbot", &["onlyuser", "shared", "tokio"]);
+        text += &registry("zstd", &version("zstd", "0.13.0"), &[]);
+        text
+    };
+    project.write("Cargo.lock", &lock(""));
+    project.commit("workspace");
+    let keys = |project: &Project| {
+        let (artifacts, _) = project.json(&["artifacts"]);
+        artifacts["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["artifact"].as_str().unwrap().to_owned(),
+                    row["key"].clone(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = keys(&project);
+    let changed = |bumped: &str| {
+        project.write("Cargo.lock", &lock(bumped));
+        project.commit(bumped);
+        let after = keys(&project);
+        project.write("Cargo.lock", &lock(""));
+        project.commit("back");
+        assert_eq!(keys(&project), before, "the same lock, the same keys");
+        after
+            .iter()
+            .filter(|(name, key)| before[*name] != **key)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+    };
+    let all = ["backend-alone", "backend-image", "userbot-image"];
+    let both = ["backend-image", "userbot-image"];
+    // Reached through tokio (a RustSec-style bump of a transitive package).
+    assert_eq!(changed("mio"), all);
+    // A build-dependency, a proc-macro behind serde, a cfg(unix) dependency.
+    assert_eq!(changed("cc"), all);
+    assert_eq!(changed("proc-macro2"), all);
+    assert_eq!(changed("libc"), all);
+    // Optional in `shared`, turned on by userbot's feature: in the lock it is
+    // shared's dependency, so backend reaches it too.
+    assert_eq!(changed("zstd"), all);
+    // Only userbot reaches it: the image built alone keeps its key, the two
+    // built in one Cargo run (features unified) both change.
+    assert_eq!(changed("onlyuser"), both);
+    // A (dev-)dependency of a crate neither image builds.
+    assert_eq!(changed("ed25519"), Vec::<String>::new());
+}
+
 #[test]
 fn tests_assert_which_artifacts_a_change_rebuilds() {
     let project = Project::new(

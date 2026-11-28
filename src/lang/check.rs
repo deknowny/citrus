@@ -127,6 +127,7 @@ pub fn std_fn(path: &[String]) -> Option<StdFn> {
 
 pub const STD_FUNCTIONS: &[&str] = &[
     "std::paths::cargo",
+    "std::paths::cargo_lock",
     "std::paths::next",
     "std::paths::package",
     "std::proc::Command::new",
@@ -1554,7 +1555,10 @@ impl<'a> Checker<'a> {
         // The files a package is built from, read when the file loads.
         if matches!(
             name.as_str(),
-            "std::paths::cargo" | "std::paths::next" | "std::paths::package"
+            "std::paths::cargo"
+                | "std::paths::cargo_lock"
+                | "std::paths::next"
+                | "std::paths::package"
         ) {
             if args.is_empty() {
                 return Err(Error::at(span, format!("`{name}` takes package names")));

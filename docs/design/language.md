@@ -357,6 +357,7 @@ the run reports with its place in the file.
 | `std::proc::Command::new(program)` | a command whose program is a value |
 | `std::fs::read(path) -> Result<str>`, `exists`, `glob`, `copy` | files |
 | `std::paths::cargo("pkg")`, `next("@app")`, `package("@lib")` | a package's files, at load |
+| `std::paths::cargo_lock("pkg")` | only the `Cargo.lock` packages a package's closure reaches (an image built in one Cargo run with it) |
 | `std::env::var(name) -> Option<str>` | |
 | `std::env::platform() -> str` | `macos-aarch64`, `linux-x86_64`…: the machine the step runs on |
 | `std::wait::http(url, timeout)`, `tcp(address, timeout)`, `file(path, timeout)` | readiness |

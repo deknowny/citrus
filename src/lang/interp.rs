@@ -1058,11 +1058,15 @@ impl<'a> Interp<'a> {
                         .collect(),
                 ))
             }
-            "std::paths::cargo" | "std::paths::next" | "std::paths::package" => {
+            "std::paths::cargo"
+            | "std::paths::cargo_lock"
+            | "std::paths::next"
+            | "std::paths::package" => {
                 let files = super::tools::RepoFiles::new(self.root, self.revision.as_deref());
                 let names: Vec<String> = args.iter().map(Value::text).collect();
                 let found = match name {
                     "std::paths::cargo" => crate::lang::cargo::crates(&files, &names),
+                    "std::paths::cargo_lock" => crate::lang::cargo::lock_only(&files, &names),
                     "std::paths::next" => {
                         crate::lang::web::closure(&files, &names, crate::lang::web::Kind::Next)
                     }

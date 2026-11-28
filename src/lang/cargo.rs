@@ -71,6 +71,18 @@ pub fn crates(files: &dyn Files, names: &[String]) -> Result<Vec<String>, String
     Ok(globs)
 }
 
+/// `cargo_lock("a", …)`: of the closures of these packages only what they
+/// take from `Cargo.lock` (the lock packages they reach), no files. For an
+/// image built in one Cargo run with other packages, whose features Cargo
+/// unifies with its own: their dependencies can change it without its crates
+/// changing.
+pub fn lock_only(files: &dyn Files, names: &[String]) -> Result<Vec<String>, String> {
+    Ok(crates(files, names)?
+        .into_iter()
+        .filter(|glob| glob == "Cargo.lock" || glob.starts_with(crate::lock::MARKER))
+        .collect())
+}
+
 /// Names of the Cargo packages in the repository.
 fn packages(files: &dyn Files) -> Vec<String> {
     files
