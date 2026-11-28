@@ -2869,14 +2869,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("citrus");
+        // Put together at run time: a version-shaped literal would sit in
+        // this test binary's bytes, which `this_build_carries_its_own_key` reads.
+        let say = |commit: &str| format!("echo 'citrus 0.3.0 ({commit})'");
         std::fs::write(
             &file,
-            "#!/bin/sh\n\
-             if [ -n \"$CITRUS_BIN\" ] || [ -z \"$CITRUS_NO_PIN\" ]; then\n\
-             echo 'citrus 0.3.0 (cf1d1dfef1657e3f01b594704854b05147701f22)'\n\
-             else\n\
-             echo 'citrus 0.3.0 (241cb0b7feec0ca6f4ac82f3070e357c30afbb88)'\n\
-             fi\n",
+            format!(
+                "#!/bin/sh\nif [ -n \"$CITRUS_BIN\" ] || [ -z \"$CITRUS_NO_PIN\" ]; then\n{}\nelse\n{}\nfi\n",
+                say("cf1d1dfef1657e3f01b594704854b05147701f22"),
+                say("241cb0b7feec0ca6f4ac82f3070e357c30afbb88")
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
