@@ -92,7 +92,7 @@ fn citrus(dir: &Path, pool: &str, cache: &Path, args: &[&str]) -> Command {
 }
 
 fn agent(dir: &Path, pool: &str, cache: &Path, name: &str, labels: &str) -> Child {
-    citrus(
+    let child = citrus(
         dir,
         pool,
         cache,
@@ -112,7 +112,32 @@ fn agent(dir: &Path, pool: &str, cache: &Path, name: &str, labels: &str) -> Chil
     .stdout(Stdio::null())
     .stderr(Stdio::null())
     .spawn()
-    .unwrap()
+    .unwrap();
+    // In the pool before the test goes on: a run sent to the pool stays here when no live agent
+    // fits a check, so an agent still starting would take nothing.
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        let overview = citrus_command()
+            .args(["pool", "--json"])
+            .env("CITRUS_POOL", pool)
+            .output()
+            .unwrap();
+        let ready = serde_json::from_slice::<Value>(&overview.stdout)
+            .ok()
+            .and_then(|value| value["pool"]["agents"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .any(|row| {
+                row["name"] == name
+                    && row["state"] != "gone"
+                    && row["seen_seconds"].as_f64().is_some_and(|seen| seen < 10.0)
+            });
+        if ready {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    child
 }
 
 fn json(output: &Output) -> Value {
@@ -712,6 +737,78 @@ fn a_long_check_does_not_hold_the_agent() {
     assert_eq!(output.status.code(), Some(0), "{run}");
     assert_eq!(result(&run, "slow")["result"], "passed", "{run}");
     assert_eq!(result(&run, "fast")["result"], "passed", "{run}");
+    assert!(agent.wait().unwrap().success());
+}
+
+/// A run whose check no live agent can take (a fork's macOS build beside a Linux pool) stays
+/// here and says why, instead of waiting in the pool for an agent that is not there; the queue
+/// and release gates ask for `--remote` whenever the pool has any agent.
+#[test]
+fn a_check_no_agent_fits_runs_here() {
+    let Ok(pool) = std::env::var("CITRUS_TEST_POOL") else {
+        eprintln!("CITRUS_TEST_POOL is not set: pool tests skipped");
+        return;
+    };
+    let _serial = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let work = tempfile::tempdir().unwrap();
+    let project = work.path().join("project");
+    let origin = work.path().join("origin.git");
+    let cache = work.path().join("agents");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("citrus.ci"),
+        "#![citrus(2)]\n\n#[paths(\"src/**\")]\n#[meta(requires = [\"nowhere\"])]\ncheck mac_only {\n    \
+         run!(\"touch ran-here.txt\")?;\n}\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/a.txt"), "one\n").unwrap();
+    fs::write(project.join(".gitignore"), "ran-here.txt\n").unwrap();
+    git(&project, &["init", "-q", "-b", "main"]);
+    git(&project, &["add", "-A"]);
+    git(
+        &project,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    git(
+        work.path(),
+        &["init", "-q", "--bare", "-b", "main", "origin.git"],
+    );
+    git(
+        &project,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&project, &["push", "-q", "-u", "origin", "main"]);
+    fs::write(project.join("src/a.txt"), "two\n").unwrap();
+
+    let mut agent = agent(&project, &pool, &cache.join("one"), "one", "plain");
+    let output = citrus(&project, &pool, &cache, &["run", "--remote", "--json"])
+        .output()
+        .unwrap();
+    let run = json(&output);
+    let id = run["run"]["id"].as_str().unwrap().to_owned();
+    let waited = citrus(&project, &pool, &cache, &["wait", &id, "--json"])
+        .output()
+        .unwrap();
+    let run = json(&waited);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(waited.status.code(), Some(0), "{run}\n{stderr}");
+    assert_eq!(run["run"]["mode"], "local", "{run}");
+    assert_eq!(result(&run, "mac-only")["result"], "passed", "{run}");
+    assert!(project.join("ran-here.txt").exists(), "{run}");
+    assert!(
+        stderr.contains("no agent in the pool can take mac-only"),
+        "{stderr}"
+    );
     assert!(agent.wait().unwrap().success());
 }
 

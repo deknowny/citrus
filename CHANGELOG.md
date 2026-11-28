@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A run for the pool (`--remote`, and the queue's and release gates' runs) whose
+  pending check no live agent can take, natively or in the run's image, runs on
+  this machine and says which check made it stay: a repository with Mac-only
+  checks beside a Linux-only pool no longer waits for an agent that is not there.
 - `citrus pool publish` reads the commit from the build's own `--version`,
   never from a Citrus it hands over to (a pool executor's CITRUS_BIN, a pin);
   Citrus's own `build` check refuses a build that does not report the tree's

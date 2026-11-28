@@ -166,6 +166,30 @@ impl Context {
 
     /// Every check passed before within a minute: not worth a pool's queue.
     /// A check that never passed is assumed heavy.
+    /// The pending checks no agent of the pool, as it is now, can take (`pool::unservable`).
+    fn pool_cannot_take(&self, pending: &[&RunTarget]) -> Vec<String> {
+        let services: &[crate::model::Service] = self
+            .project
+            .as_ref()
+            .map_or(&[], |project| project.services.as_slice());
+        let checks: Vec<(String, Vec<String>)> = pending
+            .iter()
+            .map(|decision| {
+                let needs = self
+                    .manifest
+                    .targets
+                    .get(&decision.target)
+                    .map(|target| crate::pool::requirements(target, services))
+                    .unwrap_or_default();
+                (decision.target.clone(), needs)
+            })
+            .collect();
+        crate::pool::unservable(&checks, &crate::pool::live_agents())
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn all_quick(&self, pending: &[&RunTarget]) -> Result<bool> {
         for decision in pending {
             match self.store.typical_seconds(&decision.target)? {
@@ -334,12 +358,24 @@ impl Context {
             .iter()
             .filter(|decision| decision.result == "pending")
             .collect();
-        let mode = match request.mode {
+        let mut mode = match request.mode {
             Mode::Local => "local",
             Mode::Remote => "remote",
             Mode::Auto if explicit || !remote_available || self.all_quick(&pending)? => "local",
             Mode::Auto => "remote",
         };
+        // A pool run of a check no live agent can take would wait for good (the queue and a
+        // release gate ask for the pool whenever it has any agent): the run stays here.
+        if mode == "remote" && self.uses_pool() {
+            let left = self.pool_cannot_take(&pending);
+            if !left.is_empty() {
+                eprintln!(
+                    "no agent in the pool can take {}: running here",
+                    left.join(", ")
+                );
+                mode = "local";
+            }
+        }
         let started = now();
         let id = format!("r-{}-{:04x}", compact_utc(started), random16());
         crate::repo::private_dir(&self.repo.log_dir())?;

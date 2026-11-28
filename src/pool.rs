@@ -75,6 +75,50 @@ pub fn has_live_agent() -> bool {
         .unwrap_or(false)
 }
 
+/// What each agent seen in the last ninety seconds offers: its labels (a check run natively) and
+/// its container labels (a check run in the run's image). Empty without a pool or when it does not
+/// answer.
+pub fn live_agents() -> Vec<(Vec<String>, Vec<String>)> {
+    let Some(url) = url() else {
+        return Vec::new();
+    };
+    let Ok(mut client) = connect(&url) else {
+        return Vec::new();
+    };
+    client
+        .query(
+            "select labels, container from citrus.agents
+             where state <> 'gone' and seen > now() - make_interval(secs => 90)",
+            &[],
+        )
+        .map(|rows| rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+        .unwrap_or_default()
+}
+
+/// Whether an agent offering `labels` natively or `container` in an image can take a check that
+/// needs `needs` (`requirements`), as `claim` matches them.
+pub fn agent_fits(needs: &[String], labels: &[String], container: &[String]) -> bool {
+    let within = |offered: &[String]| needs.iter().all(|need| offered.contains(need));
+    within(labels) || (!container.is_empty() && within(container))
+}
+
+/// The checks (name, requirements) no agent in `agents` can take: a pool run of them would wait
+/// for an agent that is not there (a `macos` check of a fork while the pool has only Linux).
+pub fn unservable<'a>(
+    checks: &'a [(String, Vec<String>)],
+    agents: &[(Vec<String>, Vec<String>)],
+) -> Vec<&'a str> {
+    checks
+        .iter()
+        .filter(|(_, needs)| {
+            !agents
+                .iter()
+                .any(|(labels, container)| agent_fits(needs, labels, container))
+        })
+        .map(|(name, _)| name.as_str())
+        .collect()
+}
+
 /// Checks of open runs at `min_priority` or above still waiting for a slot; 0 without a pool.
 pub fn waiting(min_priority: i32) -> Result<i64> {
     let Some(url) = url() else {
@@ -2838,6 +2882,42 @@ fn maintain(client: &mut Client, machine: &Machine) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn words(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    /// A check goes to the pool only when some live agent can take it, natively or in the run's
+    /// image; the others (a fork's macOS build beside a Linux-only pool) are named.
+    #[test]
+    fn unservable_checks_are_those_no_live_agent_fits() {
+        let linux = (
+            words(&["builder", "docker", "linux", "web", "x86_64"]),
+            words(&["linux", "x86_64"]),
+        );
+        let checks = vec![
+            ("lint".to_owned(), Vec::new()),
+            ("web".to_owned(), words(&["web"])),
+            ("ios".to_owned(), words(&["macos"])),
+            ("both".to_owned(), words(&["linux", "macos"])),
+        ];
+        assert_eq!(
+            unservable(&checks, std::slice::from_ref(&linux)),
+            vec!["ios", "both"]
+        );
+        let mac = (words(&["aarch64", "mac", "macos"]), Vec::new());
+        assert_eq!(unservable(&checks, &[linux.clone(), mac]), vec!["both"]);
+        // No live agent: nothing can be taken.
+        assert_eq!(unservable(&checks, &[]), vec!["lint", "web", "ios", "both"]);
+        // Container labels count only for an agent that runs images.
+        assert!(agent_fits(
+            &words(&["linux"]),
+            &words(&["macos"]),
+            &words(&["linux"])
+        ));
+        assert!(!agent_fits(&words(&["linux"]), &words(&["macos"]), &[]));
+        assert!(agent_fits(&[], &[], &[]));
+    }
 
     /// The pool keys a build by the commit and platform its bytes carry; a
     /// build stored under another key is refused.
