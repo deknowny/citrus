@@ -244,7 +244,7 @@ pub fn builtin_field(receiver: &Ty, name: &str) -> Option<Ty> {
         (Ty::Release, "previous") => Some(Ty::Option(Box::new(Ty::Version))),
         (Ty::Release, "commit" | "unit") => Some(Ty::Str),
         (Ty::Error, "message") => Some(Ty::Str),
-        (Ty::Plan, "checks" | "groups" | "labels" | "signals" | "notes") => {
+        (Ty::Plan, "checks" | "groups" | "labels" | "signals" | "notes" | "artifacts") => {
             Some(Ty::List(Box::new(Ty::Str)))
         }
         (Ty::Plan, "unclaimed") => Some(Ty::List(Box::new(Ty::Path))),

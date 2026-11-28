@@ -324,7 +324,10 @@ fn clyer_alone_is_the_clyer_scope() -> Result<()> {
 ```
 
 A `Plan` has `checks`, `groups`, `labels`, `signals`, `notes` (checks left
-out by profile or `covers`) and `unclaimed` (paths no group or check owns);
+out by profile or `covers`), `unclaimed` (paths no group or check owns) and
+`artifacts`, the artifacts whose key the paths can change (`Cargo.lock`
+counts for every artifact built from it: a plan of paths has no lock to
+compare; one with inputs from a command counts for any path);
 `owners(path)` are the checks owning a path and `groups_of(path)` its
 groups. `selects(name)` fails on a name that is not a check, so a typo
 cannot pass. A failed `==` or `!=` shows both sides. Names are the outside

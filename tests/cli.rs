@@ -3127,6 +3127,54 @@ artifact whole;
 }
 
 #[test]
+fn tests_assert_which_artifacts_a_change_rebuilds() {
+    let project = Project::new(
+        r#"#[inputs(std::paths::cargo("app") + ["Dockerfile"])]
+artifact app_image;
+
+#[inputs(["crates/tool/**", "Cargo.lock"])]
+artifact tool_image;
+
+#[paths("crates/**", "Cargo.lock", "Dockerfile")]
+group rust {}
+
+#[test]
+fn another_crate_rebuilds_only_its_image() -> Result<()> {
+    let plan = std::plan::of(["crates/tool/Cargo.toml", "crates/tool/src/main.rs"])?;
+    assert plan.artifacts == ["tool-image"];
+}
+
+#[test]
+fn the_app_and_the_shared_files_rebuild_the_app_image() -> Result<()> {
+    assert std::plan::of(["crates/lib/src/lib.rs"])?.artifacts == ["app-image"];
+    assert std::plan::of(["Dockerfile"])?.artifacts == ["app-image"];
+    assert std::plan::of(["Cargo.lock"])?.artifacts == ["app-image", "tool-image"];
+}
+
+"#,
+    );
+    project.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+    project.write("Dockerfile", "FROM scratch\n");
+    project.write(
+        "crates/app/Cargo.toml",
+        "[package]\nname = \"app\"\n[dependencies]\nlib = { path = \"../lib\" }\n",
+    );
+    project.write("crates/app/src/main.rs", "fn main() {}\n");
+    project.write("crates/lib/Cargo.toml", "[package]\nname = \"lib\"\n");
+    project.write("crates/lib/src/lib.rs", "\n");
+    project.write("crates/tool/Cargo.toml", "[package]\nname = \"tool\"\n");
+    project.write("crates/tool/src/main.rs", "fn main() {}\n");
+    project.write(
+        "Cargo.lock",
+        "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"lib\"]\n\n\
+         [[package]]\nname = \"lib\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"tool\"\nversion = \"0.1.0\"\n",
+    );
+    project.commit("workspace");
+    let (tested, code) = project.json(&["test"]);
+    assert_eq!(code, 0, "{tested}");
+}
+
+#[test]
 fn a_lock_change_selects_only_the_checks_whose_crates_reach_the_changed_package() {
     let project = Project::new(
         r#"#[paths(std::paths::cargo("app"))]

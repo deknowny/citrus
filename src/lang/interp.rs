@@ -977,6 +977,7 @@ impl<'a> Interp<'a> {
                 ("labels".to_owned(), list(&plan.labels, Value::Str)),
                 ("signals".to_owned(), list(&plan.signals, Value::Str)),
                 ("notes".to_owned(), list(&plan.notes, Value::Str)),
+                ("artifacts".to_owned(), list(&plan.artifacts, Value::Str)),
                 ("unclaimed".to_owned(), list(&plan.unmapped, Value::Path)),
                 ("__mapped".to_owned(), list(&mapped, Value::Str)),
             ])),

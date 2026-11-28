@@ -27,6 +27,9 @@ pub struct Plan {
     pub signals: Vec<String>,
     /// Labels whose condition holds.
     pub labels: Vec<String>,
+    /// Artifacts whose key the changed paths can change (`std::plan` only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
 }
 
 /// The plan for the changes since `base`.
@@ -148,11 +151,17 @@ pub struct Change {
 /// loaded on first use, and a change without a profile is planned in the
 /// project's first one, whatever the caller's environment says.
 pub fn planner(root: &std::path::Path) -> impl Fn(&Change) -> Result<Plan> + '_ {
-    let loaded: std::cell::OnceCell<std::result::Result<(Repo, Manifest, String), String>> =
+    type Loaded = (
+        Repo,
+        Manifest,
+        String,
+        std::collections::BTreeMap<String, crate::deploy::Artifact>,
+    );
+    let loaded: std::cell::OnceCell<std::result::Result<Loaded, String>> =
         std::cell::OnceCell::new();
     move |change| {
         let found = loaded.get_or_init(|| {
-            (|| -> Result<(Repo, Manifest, String)> {
+            (|| -> Result<Loaded> {
                 let mut repo = Repo::discover_at(root)?;
                 let (project, sources) = crate::model::load(root)
                     .map_err(|rendered| anyhow::anyhow!("{rendered}"))?
@@ -165,13 +174,24 @@ pub fn planner(root: &std::path::Path) -> impl Fn(&Change) -> Result<Plan> + '_ 
                 let before = repo
                     .git(&["merge-base", &repo.config.plan.base, "HEAD"])
                     .unwrap_or_default();
-                Ok((repo, manifest, before))
+                Ok((repo, manifest, before, project.artifacts))
             })()
             .map_err(|error| format!("{error:#}"))
         });
-        let (repo, manifest, before) =
+        let (repo, manifest, before, artifacts) =
             found.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
-        for_change(repo, manifest, change, before)
+        let mut plan = for_change(repo, manifest, change, before)?;
+        plan.artifacts = artifacts
+            .iter()
+            .filter(|(_, artifact)| {
+                change
+                    .paths
+                    .iter()
+                    .any(|path| crate::deploy::touches(artifact, path))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        Ok(plan)
     }
 }
 

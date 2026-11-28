@@ -254,6 +254,35 @@ fn lock_reach(inputs: &[String]) -> Option<std::collections::BTreeSet<String>> {
     found.then_some(reach)
 }
 
+/// The globs of `inputs` that name files: without the lock markers, and
+/// without a literal "Cargo.lock" when a closure's lock entries replace it.
+fn file_patterns(inputs: &[String], sliced: bool) -> Vec<&String> {
+    inputs
+        .iter()
+        .filter(|pattern| !pattern.starts_with(crate::lock::MARKER))
+        .filter(|pattern| !(sliced && pattern.as_str() == "Cargo.lock"))
+        .collect()
+}
+
+/// Whether a change to `path` can change the artifact's key (`std::plan`'s
+/// `Plan.artifacts`). `Cargo.lock` counts when the artifact takes it whole or
+/// through a closure (a plan of paths has no lock to compare); an artifact
+/// whose inputs come from a command counts for every path.
+pub fn touches(artifact: &Artifact, path: &str) -> bool {
+    if !artifact.inputs_command.is_empty() {
+        return true;
+    }
+    let sliced = lock_reach(&artifact.inputs).is_some();
+    if sliced && path == "Cargo.lock" {
+        return true;
+    }
+    file_patterns(&artifact.inputs, sliced)
+        .iter()
+        .any(|pattern| {
+            pattern_matches_any(pattern, std::slice::from_ref(&path.to_owned())).unwrap_or(false)
+        })
+}
+
 /// Content key of an artifact at `commit`: its input files (path, mode, blob
 /// id) and its declaration, from Git objects without a checkout. `paths`
 /// replaces the globs when the artifact lists its inputs by command.
@@ -284,12 +313,7 @@ pub fn key_at(
         Some(_) => None,
         None => lock_reach(&artifact.inputs),
     };
-    let patterns: Vec<&String> = artifact
-        .inputs
-        .iter()
-        .filter(|pattern| !pattern.starts_with(crate::lock::MARKER))
-        .filter(|pattern| !(lock_reach.is_some() && pattern.as_str() == "Cargo.lock"))
-        .collect();
+    let patterns = file_patterns(&artifact.inputs, lock_reach.is_some());
     let mut files: Vec<(String, String)> = match paths {
         Some(paths) => paths
             .iter()
