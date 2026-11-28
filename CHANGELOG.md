@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `citrus pool publish` reads the commit from the build's own `--version`,
+  never from a Citrus it hands over to (a pool executor's CITRUS_BIN, a pin);
+  Citrus's own `build` check refuses a build that does not report the tree's
+  commit. `citrus deps` reads Cargo 1.100's build-dir layout
+  (`build/<package>/<hash>/out/*.d`, `…/run/stdout`). Citrus's own checks on
+  an agent use the slot's target directory and never the executor's build.
 - Tracked work (docs/tasks.md): `citrus work new|claim|report|link|verify|close|show`
   follow one piece of work from its card to a verified release, with a step
   (open → claimed → in-queue → merged → released → verified → closed) and

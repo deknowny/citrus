@@ -2512,11 +2512,11 @@ environment two;
     project.write("src/a.txt", "v2\n");
     project.write("web/index.html", "v2\n");
     project.commit("both change");
-    let output = Command::new(env!("CARGO_BIN_EXE_citrus"))
+    // Without the environment of the Citrus running the tests: a pool
+    // executor's CITRUS_BIN would answer instead of the build under test.
+    let output = citrus_command()
         .args(["apply", "two", "--approve", "--json"])
         .current_dir(project.root())
-        .env("CITRUS_POOL", "")
-        .env("CITRUS_STATE", test_state())
         .env("FAKE_ROLLOUT_SECONDS", "1")
         .output()
         .unwrap();

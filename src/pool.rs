@@ -2039,18 +2039,28 @@ pub fn fetch_published(commit: &str, platform: &str, to: &Path) -> Result<bool> 
 /// Publish a Citrus build to the pool under the commit it reports
 /// (`citrus --version`) and `platform` (default: this machine's). The first
 /// build of a commit stays: whoever took it keeps the same bytes.
+/// `file --version` as that build says it, not a build it hands over to: a
+/// pool executor sets CITRUS_BIN, and a pinned checkout names its own build.
+/// 2026-11-28 a build of 241cb0b answered through the executor's CITRUS_BIN
+/// and was published as cf1d1df.
+fn own_version(file: &Path) -> Result<String> {
+    let output = Command::new(file)
+        .arg("--version")
+        .env_remove("CITRUS_BIN")
+        .env("CITRUS_NO_PIN", "1")
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("run {} --version", file.display()))?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, String, String)> {
     let own = format!("{}-{}", os_label(), arch());
     let platform = platform.map(str::to_owned).unwrap_or_else(|| own.clone());
     // A cross-compiled build cannot run here: its `--version` text is read
     // from its bytes instead.
     let text = if platform == own {
-        let output = Command::new(file)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .output()
-            .with_context(|| format!("run {} --version", file.display()))?;
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        own_version(file)?
     } else {
         embedded_version(&std::fs::read(file)?).unwrap_or_default()
     };
@@ -2766,6 +2776,31 @@ fn maintain(client: &mut Client, machine: &Machine) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A build that would hand `--version` over (to a pin, or to the
+    /// executor's CITRUS_BIN) still reports its own commit to `publish`.
+    #[test]
+    fn a_build_reports_its_own_version_not_the_one_it_hands_over_to() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("citrus");
+        std::fs::write(
+            &file,
+            "#!/bin/sh\n\
+             if [ -n \"$CITRUS_BIN\" ] || [ -z \"$CITRUS_NO_PIN\" ]; then\n\
+             echo 'citrus 0.3.0 (cf1d1dfef1657e3f01b594704854b05147701f22)'\n\
+             else\n\
+             echo 'citrus 0.3.0 (241cb0b7feec0ca6f4ac82f3070e357c30afbb88)'\n\
+             fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            own_version(&file)
+                .unwrap()
+                .contains("241cb0b7feec0ca6f4ac82f3070e357c30afbb88")
+        );
+    }
 
     #[test]
     fn prepare_runs_before_the_executor_in_one_shell() {

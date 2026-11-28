@@ -25,9 +25,12 @@ check test {
     // reach it, so they see no Docker there.
     let hidden = if std::env::var("CITRUS_POOL_RUN").is_some() { "unix:///nonexistent" } else { "" };
     // Its own target directory: a build beside it would replace the
-    // executable the tests' workers start.
-    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or("target") + "-test";
-    let tests = cmd!("cargo test --locked --bins --test cli").env("CITRUS_TEST_STATE", url).env("CARGO_TARGET_DIR", target).env("DOCKER_HOST", hidden).output()?;
+    // executable the tests' workers start. Inside the run's target, which is
+    // the pool slot's own: another slot's build never replaces it.
+    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or("target") + "/citrus-test";
+    // The build under test answers for itself: not the executor's
+    // CITRUS_BIN (an older Citrus that runs these checks on an agent).
+    let tests = cmd!("cargo test --locked --bins --test cli").env("CITRUS_TEST_STATE", url).env("CARGO_TARGET_DIR", target).env("DOCKER_HOST", hidden).env("CITRUS_BIN", "").env("CITRUS_NO_PIN", "1").output()?;
     run!("docker rm -f {name}")?;
     assert tests.code == 0, "{tests.stdout}\n{tests.stderr}";
 }
@@ -49,8 +52,8 @@ check pool {
     let hidden = if std::env::var("CITRUS_POOL_RUN").is_some() { "unix:///nonexistent" } else { "" };
     // Its own target directory: rebuilding the binary under the `test`
     // check running beside it would delete the executable its workers start.
-    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or("target") + "-pool";
-    let tests = cmd!("cargo test --locked --test pool").env("CITRUS_TEST_POOL", url).env("CARGO_TARGET_DIR", target).env("DOCKER_HOST", hidden).output()?;
+    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or("target") + "/citrus-pool";
+    let tests = cmd!("cargo test --locked --test pool").env("CITRUS_TEST_POOL", url).env("CARGO_TARGET_DIR", target).env("DOCKER_HOST", hidden).env("CITRUS_BIN", "").env("CITRUS_NO_PIN", "1").output()?;
     run!("docker rm -f {name}")?;
     assert tests.code == 0, "{tests.stdout}\n{tests.stderr}";
 }
@@ -82,7 +85,13 @@ check doctor {
 check build {
     run!("cargo build --quiet --locked --profile fast")?;
     let target = std::env::var("CARGO_TARGET_DIR").unwrap_or("target");
-    run!("{target}/fast/citrus pool publish {target}/fast/citrus")?;
+    // The build itself answers and publishes: not a Citrus it would hand over
+    // to (an agent's CITRUS_BIN published a build of 241cb0b as cf1d1df).
+    let version = cmd!("{target}/fast/citrus --version").env("CITRUS_BIN", "").env("CITRUS_NO_PIN", "1").output()?.stdout.trim();
+    let head = cmd!("git rev-parse HEAD").output()?.stdout.trim();
+    assert version.contains(head), "the build says {version}, the tree is at {head}";
+    let published = cmd!("{target}/fast/citrus pool publish {target}/fast/citrus").env("CITRUS_BIN", "").env("CITRUS_NO_PIN", "1").output()?;
+    assert published.code == 0, "{published.stdout}\n{published.stderr}";
 }
 
 /// Run on a Mac, also the static Linux build the pool agents and production

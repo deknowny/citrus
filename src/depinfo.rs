@@ -34,15 +34,8 @@ pub struct Report {
 fn compiled(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)>> {
     let mut newest: BTreeMap<String, (std::time::SystemTime, PathBuf)> = BTreeMap::new();
     for profile in std::fs::read_dir(target)?.flatten() {
-        let deps = profile.path().join("deps");
-        let Ok(entries) = std::fs::read_dir(&deps) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+        for entry in dep_info_files(&profile.path()) {
             let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "d") {
-                continue;
-            }
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
             let name = stem
                 .rsplit_once('-')
@@ -86,6 +79,53 @@ fn compiled(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)>> {
     Ok(crates)
 }
 
+/// The dep-info files of a profile directory: `deps/*.d` (Cargo before
+/// 1.100), or `build/<package>/<hash>/out/*.d` (its build-dir layout).
+fn dep_info_files(profile: &Path) -> Vec<std::fs::DirEntry> {
+    let is_dep_info = |entry: &std::fs::DirEntry| {
+        entry.path().extension().is_some_and(|ext| ext == "d")
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+    };
+    let mut files: Vec<std::fs::DirEntry> = std::fs::read_dir(profile.join("deps"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(is_dep_info)
+        .collect();
+    for package in std::fs::read_dir(profile.join("build"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        for unit in std::fs::read_dir(package.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            files.extend(
+                std::fs::read_dir(unit.path().join("out"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(is_dep_info),
+            );
+        }
+    }
+    files
+}
+
+/// In Cargo's build-dir layout, `build/<package>/` holds one directory per
+/// unit; a build script's output is the newest `<hash>/run/stdout`.
+fn newest_run_output(package: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(package)
+        .ok()?
+        .flatten()
+        .map(|unit| unit.path().join("run/stdout"))
+        .filter_map(|path| Some((std::fs::metadata(&path).ok()?.modified().ok()?, path)))
+        .max_by_key(|(time, _)| *time)
+        .map(|(_, path)| path)
+}
+
 /// What build scripts said they read (`cargo:rerun-if-changed=`), as crates
 /// rooted at the package's `Cargo.toml`. Paths are relative to the package.
 fn build_scripts(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)>> {
@@ -115,14 +155,21 @@ fn build_scripts(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)
             continue;
         };
         for entry in entries.flatten() {
-            let output = entry.path().join("output");
+            // Cargo before 1.100: build/<name>-<hash>/output; after:
+            // build/<name>/<hash>/run/stdout (the newest run of the package).
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            let (name, output) = match newest_run_output(&entry.path()) {
+                Some(output) => (dir_name.as_str(), output),
+                None => (
+                    dir_name
+                        .rsplit_once('-')
+                        .map_or(dir_name.as_str(), |(name, _)| name),
+                    entry.path().join("output"),
+                ),
+            };
             let Ok(meta) = std::fs::metadata(&output) else {
                 continue;
             };
-            let dir_name = entry.file_name().to_string_lossy().into_owned();
-            let name = dir_name
-                .rsplit_once('-')
-                .map_or(dir_name.as_str(), |(name, _)| name);
             let Some(package) = dirs.get(&name.replace('-', "_")) else {
                 continue;
             };
@@ -262,7 +309,62 @@ pub fn verify(root: &Path, target: &Path, manifest: &Manifest) -> Result<Report>
 
 #[cfg(test)]
 mod tests {
-    use super::split_escaped;
+    use super::{compiled, split_escaped};
+
+    /// Cargo 1.100 keeps dep-info and build-script output under
+    /// `build/<package>/<hash>/` instead of `deps/` and `build/<name>-<hash>/`.
+    #[test]
+    fn reads_the_build_dir_layout_of_newer_cargo() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |path: &str, text: &str| {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        };
+        write(
+            "crates/api/Cargo.toml",
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
+        );
+        write("crates/api/src/lib.rs", "");
+        write("crates/api/build.rs", "");
+        write("shared/msg.txt", "hello\n");
+        write("crates/api/schema.sql", "");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let target = root.path().join("target");
+        write(
+            "target/debug/build/api/1a2b/out/api-1a2b.d",
+            &format!(
+                "{0}/target/debug/build/api/1a2b/out/libapi.rlib: crates/api/src/lib.rs crates/api/src/../../../shared/msg.txt\n",
+                root.path().display()
+            ),
+        );
+        write(
+            "target/debug/build/api/9f8e/run/stdout",
+            "cargo:rerun-if-changed=schema.sql\n",
+        );
+        let crates = compiled(root.path(), &target).unwrap();
+        assert!(
+            crates
+                .iter()
+                .any(|(first, files)| first == "crates/api/src/lib.rs"
+                    && files.contains(&"shared/msg.txt".to_owned())),
+            "{crates:?}"
+        );
+        assert!(
+            crates
+                .iter()
+                .any(|(first, files)| first == "crates/api/Cargo.toml"
+                    && files.contains(&"crates/api/schema.sql".to_owned())),
+            "{crates:?}"
+        );
+    }
 
     #[test]
     fn dep_info_paths_keep_escaped_spaces() {
