@@ -55,7 +55,7 @@ their results shared, reusable and short.
 | `citrus integrate [--push]` | Merge the base branch, keep checks the incoming changes do not touch, re-check the rest, and land through the merge queue with `--push` |
 | `citrus queue add [--release <unit>]` | Queue the committed branch: it lands on the base in a checked batch, then releases the unit |
 | `citrus tasks` / `citrus task <title>` / `citrus agree <key>` | Every worktree as a task — branch, unmerged commits, runs, what it does and what blocks it — and the agreements between tasks |
-| `citrus task new/claim/report/verify/close` / `citrus tasks --stuck` | Tracked tasks: one piece of work from its card through the queue to a verified release, whose turn it is, and what nobody moves ([docs/tasks.md](docs/tasks.md)) |
+| `citrus work new/claim/report/verify/close` / `citrus works --stuck` | Tracked work: one piece of work from its card through the queue to a verified release, whose turn it is, and what nobody moves ([docs/tasks.md](docs/tasks.md)) |
 | `citrus version reserve <start> --scope …` / `check` / `source` / `list` | Release versions held by one committed source; a retry gets the same one, another source the next free one ([docs/releases.md](docs/releases.md#versions)) |
 | `citrus diff <env>` / `citrus apply <env> --approve` | What an environment runs versus what HEAD builds; build what is missing by input key and roll it out by digest ([docs/design/declarative.md](docs/design/declarative.md)) |
 | `citrus release start <unit> --approve` | Release a unit from HEAD: version → build → deploy → postcheck with gates, an environment lock, recovery of interrupted steps and rollback ([docs/releases.md](docs/releases.md)) |

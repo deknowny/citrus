@@ -1,11 +1,13 @@
-//! Tracked tasks (`citrus task new/claim/report/link/verify/close`): one unit
-//! of agent work from an owner-hub card to a verified release.
+//! Tracked work (`citrus work new/claim/report/link/verify/close/show`,
+//! `citrus works`): one piece of agent work from an owner-hub card to a
+//! verified release.
 //!
 //! A task holds a step (open → claimed → in-queue → merged → released →
 //! verified → closed) and whose turn it is (owner, lead, lead2, agent,
-//! citrus). People move it with commands; Citrus moves it on what it already
-//! knows: the queue entries (`citrus queue add --task`) and releases linked to
-//! it. `citrus tasks --stuck` names the tasks nobody moves.
+//! citrus). People move it with commands, each under a row lock; Citrus moves
+//! it forward on what it already knows — the queue entries (`citrus queue add
+//! --task`) and the releases linked to it — only if nobody moved it since it
+//! was read. `citrus works --stuck` names the work nobody moves.
 
 use std::collections::BTreeSet;
 
@@ -30,21 +32,20 @@ pub fn step_rank(step: &str) -> usize {
 /// `90`, `90s`, `15m`, `2h`, `1d` in seconds.
 pub fn parse_duration(text: &str) -> Result<i64> {
     let text = text.trim();
+    let wrong = || anyhow::anyhow!("a duration is a number with s, m, h or d: {text}");
     let (number, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
         Some(at) => text.split_at(at),
         None => (text, "s"),
     };
-    let value: i64 = number
-        .parse()
-        .map_err(|_| anyhow::anyhow!("a duration is a number with s, m, h or d: {text}"))?;
+    let value: i64 = number.parse().map_err(|_| wrong())?;
     let scale = match unit {
         "s" => 1,
         "m" => 60,
         "h" => 3600,
         "d" => 86400,
-        _ => bail!("a duration is a number with s, m, h or d: {text}"),
+        _ => bail!(wrong()),
     };
-    Ok(value * scale)
+    value.checked_mul(scale).ok_or_else(wrong)
 }
 
 pub fn check_turn(turn: &str) -> Result<()> {
@@ -82,6 +83,16 @@ pub fn check_text(value: &str) -> Result<()> {
                 .chars()
                 .any(|c| c.is_control() && c != '\n' && c != '\t'),
         "a task's text holds at most 2000 characters"
+    );
+    Ok(())
+}
+
+/// A title is one line.
+pub fn check_title(value: &str) -> Result<()> {
+    ensure!(!value.trim().is_empty(), "a task has a title");
+    ensure!(
+        value.chars().count() <= 200 && !value.chars().any(char::is_control),
+        "a task's title is one line of at most 200 characters"
     );
     Ok(())
 }
@@ -138,6 +149,9 @@ pub struct Progress {
     pub merged: Vec<(String, i64)>,
     /// A linked entry still waits or is checked.
     pub queued: bool,
+    /// Linked entries, none landed and none waiting: each failed, conflicted
+    /// or was cancelled (`entry state`).
+    pub queue_failed: Vec<String>,
     /// A linked entry asked for releases the queue still runs.
     pub releasing: bool,
     /// Units with a passed release of the change.
@@ -146,6 +160,8 @@ pub struct Progress {
     pub verified: BTreeSet<String>,
     /// Releases that ended without passing (and no later one passed).
     pub failed: Vec<String>,
+    /// A linked release has not ended.
+    pub release_running: bool,
     /// When the last release passed.
     pub released_at: Option<i64>,
     /// Units the task must reach: its own and those its entries asked for.
@@ -178,19 +194,28 @@ pub fn verify_step(name: &str) -> bool {
         .any(|part| matches!(part, "verify" | "postcheck"))
 }
 
-/// Read the task's links, link the releases its merges led to, and move its
-/// step forward to what they prove (never back). Returns the task as stored.
-pub fn refresh(context: &Context, mut task: WorkTask) -> Result<(WorkTask, Progress)> {
+/// A release that counts for its unit: passed, or still on its way. Its
+/// state is read as stored: whether its worker lives is known only on the
+/// machine that runs it (`citrus release show` there settles it).
+fn covers(release: &Release) -> bool {
+    matches!(release.state.as_str(), "passed" | "running" | "queued")
+}
+
+/// What the task's links prove; links the releases its merges led to.
+pub fn progress(context: &Context, task: &WorkTask) -> Result<Progress> {
     let store = &context.store;
     let mut progress = Progress {
-        due: units_of(&task),
+        due: units_of(task),
         ..Progress::default()
     };
     let links = store.work_links(&task.id)?;
+    let mut entries = 0;
+    let mut failed_entries = Vec::new();
     for link in links.iter().filter(|link| link.kind == "queue") {
         let Some(entry) = store.queue_entry(&link.value)? else {
             continue;
         };
+        entries += 1;
         for (unit, _) in entry.release_units() {
             if !progress.due.contains(&unit) {
                 progress.due.push(unit);
@@ -207,38 +232,43 @@ pub fn refresh(context: &Context, mut task: WorkTask) -> Result<(WorkTask, Progr
             }
         } else if matches!(entry.state.as_str(), "queued" | "checking") {
             progress.queued = true;
+        } else {
+            failed_entries.push(format!("{} {}", entry.id, entry.state));
         }
         if entry.state == "releasing" {
             progress.releasing = true;
         }
     }
+    if entries > 0 && progress.merged.is_empty() && !progress.queued {
+        progress.queue_failed = failed_entries;
+    }
     // A due unit released later (by hand, from a newer base) still counts:
     // a release whose commit carries every merge of the task.
     if !progress.merged.is_empty() {
-        let linked = store.work_links(&task.id)?;
+        let linked: Vec<Release> = store
+            .work_links(&task.id)?
+            .iter()
+            .filter(|link| link.kind == "release")
+            .filter_map(|link| store.release(&link.value).ok().flatten())
+            .collect();
         for unit in &progress.due {
-            let covered = linked
+            if linked
                 .iter()
-                .filter(|link| link.kind == "release")
-                .filter_map(|link| store.release(&link.value).ok().flatten())
-                .any(|release| release.unit == *unit && release.state != "failed");
-            if covered {
+                .any(|release| release.unit == *unit && covers(release))
+            {
                 continue;
             }
             for release in store.releases_of(unit, 20)? {
-                if release.kind != "release"
-                    || !matches!(release.state.as_str(), "passed" | "running" | "queued")
+                if release.kind == "release"
+                    && covers(&release)
+                    && carries(context, &release.commit, &progress.merged)
                 {
-                    continue;
-                }
-                if carries(context, &release.commit, &progress.merged) {
                     store.work_link(&task.id, "release", &release.id)?;
                     break;
                 }
             }
         }
     }
-    let mut passed_units: Vec<(String, i64)> = Vec::new();
     let mut failed = Vec::new();
     for link in store
         .work_links(&task.id)?
@@ -248,25 +278,17 @@ pub fn refresh(context: &Context, mut task: WorkTask) -> Result<(WorkTask, Progr
         let Some(release) = store.release(&link.value)? else {
             continue;
         };
-        let release = crate::release::reconcile(context, release)?;
         if release.state == "passed" {
-            passed_units.push((
-                release.unit.clone(),
-                release.ended.unwrap_or(release.started),
-            ));
+            let ended = release.ended.unwrap_or(release.started);
             progress.released.insert(release.unit.clone());
-            progress.released_at = progress
-                .released_at
-                .max(Some(release.ended.unwrap_or(release.started)));
+            progress.released_at = progress.released_at.max(Some(ended));
             if verifies(context, &release)? {
                 progress.verified.insert(release.unit.clone());
             }
         } else if release.finished() {
-            failed.push((
-                release.unit.clone(),
-                release.id.clone(),
-                release.state.clone(),
-            ));
+            failed.push((release.unit.clone(), release.id.clone(), release.state));
+        } else {
+            progress.release_running = true;
         }
     }
     progress.failed = failed
@@ -274,10 +296,14 @@ pub fn refresh(context: &Context, mut task: WorkTask) -> Result<(WorkTask, Progr
         .filter(|(unit, _, _)| !progress.released.contains(unit))
         .map(|(unit, id, state)| format!("{unit} {id} {state}"))
         .collect();
-    // Manual verification (`citrus task verify`) counts for every unit.
-    let verified_by_hand = links.iter().any(|link| link.kind == "verified");
+    Ok(progress)
+}
 
-    let derived = if !progress.merged.is_empty() || !progress.released.is_empty() {
+/// The step the links prove, with the turn and the event that go with
+/// reaching it.
+fn derive(progress: &Progress, verified_by_hand: bool) -> (&'static str, &'static str, String) {
+    let names = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>().join(", ");
+    if !progress.merged.is_empty() || !progress.released.is_empty() {
         let targets: Vec<&String> = if progress.due.is_empty() {
             progress.released.iter().collect()
         } else {
@@ -288,65 +314,93 @@ pub fn refresh(context: &Context, mut task: WorkTask) -> Result<(WorkTask, Progr
         let all_verified =
             all_released && targets.iter().all(|unit| progress.verified.contains(*unit));
         if all_verified || (all_released && verified_by_hand) {
-            "verified"
-        } else if all_released {
-            "released"
-        } else if !progress.merged.is_empty() {
-            "merged"
-        } else {
-            "open"
+            return (
+                "verified",
+                "lead",
+                format!("verified {}", names(&progress.verified)),
+            );
         }
-    } else if progress.queued {
-        "in-queue"
-    } else {
-        "open"
-    };
-    if task.closed.is_none() && step_rank(derived) > step_rank(&task.step) {
-        let (turn, text) = match derived {
-            "in-queue" => ("citrus", "queued: Citrus lands it".to_owned()),
-            "merged" if progress.releasing => (
+        if all_released {
+            return (
+                "released",
+                "lead",
+                format!(
+                    "released {}; no verify or postcheck step proved it (citrus work verify)",
+                    names(&progress.released)
+                ),
+            );
+        }
+        if progress.merged.is_empty() {
+            return ("open", "lead", String::new());
+        }
+        if progress.releasing || progress.release_running {
+            return (
+                "merged",
                 "citrus",
                 format!("merged; Citrus releases {}", progress.due.join(", ")),
-            ),
-            "merged" if progress.due.is_empty() => (
+            );
+        }
+        if progress.due.is_empty() {
+            return (
+                "merged",
                 "lead",
-                "merged; no release asked (close it, or link the release)".to_owned(),
-            ),
-            "merged" => (
-                "lead",
-                format!("merged; release {} is due", progress.due.join(", ")),
-            ),
-            "released" => (
-                "lead",
-                format!(
-                    "released {}; verify the result (citrus task verify)",
-                    progress
-                        .released
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            ),
-            _ => (
-                "lead",
-                format!(
-                    "verified {}",
-                    progress
-                        .verified
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            ),
-        };
-        task.step = derived.to_owned();
-        task.turn = turn.to_owned();
-        task.updated = now() as i64;
-        store.work_update(&task, "citrus", &text)?;
+                "merged; no release asked (close it, or link the release)".into(),
+            );
+        }
+        return (
+            "merged",
+            "lead",
+            format!("merged; release {} is due", progress.due.join(", ")),
+        );
     }
-    Ok((task, progress))
+    if progress.queued {
+        return ("in-queue", "citrus", "queued: Citrus lands it".into());
+    }
+    ("open", "lead", String::new())
+}
+
+/// Bring a task up to what its links prove: the step moves forward (never
+/// back); from `merged` on the claim is released, the claimant's part being
+/// done; a queue that failed every entry gives the turn back. Written only if
+/// nobody moved the task since it was read. Returns the task as stored.
+pub fn refresh(context: &Context, task: WorkTask) -> Result<(WorkTask, Progress)> {
+    let progress = progress(context, &task)?;
+    if task.closed.is_some() {
+        return Ok((task, progress));
+    }
+    let links = context.store.work_links(&task.id)?;
+    let verified_by_hand = links.iter().any(|link| link.kind == "verified");
+    let (step, turn, text) = derive(&progress, verified_by_hand);
+    let mut next = task.clone();
+    let mut text = text;
+    if step_rank(step) > step_rank(&task.step) {
+        next.step = step.to_owned();
+        next.turn = turn.to_owned();
+        if step_rank(step) >= step_rank("merged") {
+            next.claimed_by.clear();
+        }
+    } else if task.step == "in-queue" && task.turn == "citrus" && !progress.queue_failed.is_empty()
+    {
+        next.turn = if task.claimed_by.is_empty() {
+            "lead".into()
+        } else {
+            turn_of(&task.claimed_by).to_owned()
+        };
+        text = format!(
+            "the queue did not land it: {}",
+            progress.queue_failed.join(", ")
+        );
+    }
+    if next.step == task.step && next.turn == task.turn && next.claimed_by == task.claimed_by {
+        return Ok((task, progress));
+    }
+    if context.store.work_advance(&task, &next, &text)? {
+        let stored = context.store.work_task(&task.id)?.unwrap_or(next);
+        return Ok((stored, progress));
+    }
+    // Moved meanwhile (or closed): what is stored wins.
+    let stored = context.store.work_task(&task.id)?.unwrap_or(task);
+    Ok((stored, progress))
 }
 
 /// Whether `commit` carries every one of `merged`.
@@ -360,12 +414,14 @@ fn carries(context: &Context, commit: &str, merged: &[(String, i64)]) -> bool {
     })
 }
 
-/// Thresholds of `citrus tasks --stuck`.
+/// Thresholds of `citrus works --stuck`.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Merged but not released (or released but not verified) this long.
+    /// Merged but not released this long.
     pub unreleased: i64,
-    /// No event on an open task this long.
+    /// Released but not verified this long.
+    pub unverified: i64,
+    /// No event, commit or run on an open task this long.
     pub idle: i64,
 }
 
@@ -373,6 +429,7 @@ impl Default for Limits {
     fn default() -> Limits {
         Limits {
             unreleased: 15 * 60,
+            unverified: 2 * 3600,
             idle: 24 * 3600,
         }
     }
@@ -382,9 +439,9 @@ impl Default for Limits {
 pub struct Stuck {
     pub task: String,
     pub card: String,
-    /// silent, unreleased, release_failed, unverified or idle.
+    /// silent, queue_failed, release_failed, unreleased, unverified or idle.
     pub kind: String,
-    /// Who should act: the lead, unless the turn is someone's who can.
+    /// Who should act.
     pub to: String,
     /// Seconds it has been so.
     pub since: i64,
@@ -432,9 +489,10 @@ pub fn stuck(
         return Ok(found);
     }
     let at = now() as i64;
-    let lead_unless_owner = |turn: &str| match turn {
-        "lead2" | "agent" | "owner" => turn.to_owned(),
-        _ => "lead".to_owned(),
+    // Whoever holds the turn, unless it is Citrus's: then the lead.
+    let holder = match task.turn.as_str() {
+        "citrus" => "lead".to_owned(),
+        turn => turn.to_owned(),
     };
     let mut push = |kind: &str, to: String, since: i64, text: String| {
         found.push(Stuck {
@@ -447,15 +505,16 @@ pub fn stuck(
         });
     };
     let links = context.store.work_links(&task.id)?;
-    if !task.claimed_by.is_empty() && !matches!(task.turn.as_str(), "owner" | "citrus") {
-        let silent = at - last_activity(context, task, &links);
+    let active = last_activity(context, task, &links);
+    if !task.claimed_by.is_empty() && task.turn == turn_of(&task.claimed_by) {
+        let silent = at - active;
         if silent > task.lease {
             push(
                 "silent",
                 "lead".into(),
                 silent,
                 format!(
-                    "{} claimed it and is silent for {} (lease {}); the turn is the lead's",
+                    "{} claimed it and is silent for {} (lease {})",
                     task.claimed_by,
                     crate::report::age(silent),
                     crate::report::age(task.lease)
@@ -463,68 +522,69 @@ pub fn stuck(
             );
         }
     }
+    if !progress.queue_failed.is_empty() {
+        push(
+            "queue_failed",
+            holder.clone(),
+            0,
+            format!(
+                "the queue did not land it: {} (fix, then citrus queue add)",
+                progress.queue_failed.join(", ")
+            ),
+        );
+    }
     if !progress.failed.is_empty() {
         push(
             "release_failed",
-            lead_unless_owner(&task.turn),
+            holder.clone(),
             0,
             format!(
-                "release failed: {} (citrus release resume/log)",
+                "release failed: {} (citrus release log/resume)",
                 progress.failed.join("; ")
             ),
         );
     }
     let landed = progress.merged.iter().map(|(_, time)| *time).min();
-    let missing: Vec<&String> = progress
+    let missing: Vec<&str> = progress
         .due
         .iter()
         .filter(|unit| !progress.released.contains(*unit))
+        .map(String::as_str)
         .collect();
     if let Some(landed) = landed
         && !missing.is_empty()
         && progress.failed.is_empty()
+        && !progress.releasing
+        && !progress.release_running
         && at - landed > limits.unreleased
     {
-        let running = context
-            .store
-            .work_links(&task.id)?
-            .iter()
-            .filter(|link| link.kind == "release")
-            .filter_map(|link| context.store.release(&link.value).ok().flatten())
-            .any(|release| !release.finished());
-        if !running {
-            push(
-                "unreleased",
-                lead_unless_owner(&task.turn),
-                at - landed,
-                format!(
-                    "merged {} ago, {} not released",
-                    crate::report::age(at - landed),
-                    missing
-                        .iter()
-                        .map(|unit| unit.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            );
-        }
+        push(
+            "unreleased",
+            holder.clone(),
+            at - landed,
+            format!(
+                "merged {} ago, {} not released",
+                crate::report::age(at - landed),
+                missing.join(", ")
+            ),
+        );
     }
     if task.step == "released"
         && let Some(released) = progress.released_at
-        && at - released > limits.unreleased
+        && at - released > limits.unverified
     {
         push(
             "unverified",
-            lead_unless_owner(&task.turn),
+            holder.clone(),
             at - released,
             format!(
-                "released {} ago and not verified (citrus task verify {} \"what was checked\")",
+                "released {} ago and not verified: the unit has no verify or postcheck step (citrus work verify {} \"what was checked\")",
                 crate::report::age(at - released),
                 task.id
             ),
         );
     }
-    let idle = at - task.updated;
+    let idle = at - active;
     if idle > limits.idle {
         push(
             "idle",
@@ -570,6 +630,8 @@ mod tests {
         assert_eq!(parse_duration("1d").unwrap(), 86400);
         assert!(parse_duration("2w").is_err());
         assert!(parse_duration("h").is_err());
+        // Too large for seconds: refused, not wrapped.
+        assert!(parse_duration("9223372036854775807d").is_err());
     }
 
     #[test]
@@ -582,12 +644,117 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_slugs() {
+    fn ids_and_titles() {
         assert_eq!(new_id(Some("weekly-left")).unwrap(), "t-weekly-left");
         assert_eq!(new_id(Some("t-x1")).unwrap(), "t-x1");
         assert!(new_id(Some("Bad Id")).is_err());
         assert!(new_id(None).unwrap().starts_with("t-"));
         assert_eq!(turn_of("lead2"), "lead2");
         assert_eq!(turn_of("claude-hub"), "agent");
+        assert!(check_title("one line").is_ok());
+        assert!(check_title("two\nlines").is_err());
+        assert!(check_title("  ").is_err());
+    }
+
+    #[test]
+    fn releases_cover_only_while_they_may_pass() {
+        let release = |state: &str| Release {
+            id: "rel-app-1".into(),
+            unit: "app".into(),
+            kind: "release".into(),
+            environment: String::new(),
+            version: String::new(),
+            previous: String::new(),
+            commit: String::new(),
+            worktree: String::new(),
+            agent: String::new(),
+            state: state.into(),
+            note: String::new(),
+            pid: None,
+            started: 0,
+            ended: None,
+            log: String::new(),
+        };
+        for state in ["passed", "running", "queued"] {
+            assert!(covers(&release(state)), "{state}");
+        }
+        for state in ["failed", "unknown", "cancelled", "abandoned"] {
+            assert!(!covers(&release(state)), "{state}");
+        }
+    }
+
+    #[test]
+    fn a_failed_queue_gives_the_turn_back_and_merges_free_the_claim() {
+        let failed = Progress {
+            queue_failed: vec!["q-1 failed".into()],
+            ..Progress::default()
+        };
+        assert_eq!(derive(&failed, false).0, "open");
+        let merged = Progress {
+            merged: vec![("abc".into(), 1)],
+            due: vec!["app".into()],
+            ..Progress::default()
+        };
+        assert_eq!(derive(&merged, false).0, "merged");
+        assert_eq!(derive(&merged, false).1, "lead");
+        let releasing = Progress {
+            releasing: true,
+            ..merged
+        };
+        assert_eq!(derive(&releasing, false).1, "citrus");
+    }
+
+    /// A refresh that read the task before it was closed does not reopen it
+    /// (needs CITRUS_TEST_STATE, as the CLI tests).
+    #[test]
+    fn a_stale_refresh_does_not_reopen_a_closed_task() {
+        let Ok(url) = std::env::var("CITRUS_TEST_STATE") else {
+            return;
+        };
+        let schema = format!(
+            "citrus_unit_work_{}",
+            crate::exec::unique().replace('-', "_")
+        );
+        let store = crate::state::Store::open_schema(&url, &schema).unwrap();
+        let task = WorkTask {
+            id: "t-race".into(),
+            title: "race".into(),
+            card: String::new(),
+            step: "in-queue".into(),
+            turn: "citrus".into(),
+            claimed_by: "agent-a".into(),
+            lease: DEFAULT_LEASE,
+            units: String::new(),
+            agent: "test".into(),
+            created: 1,
+            updated: 1,
+            closed: None,
+        };
+        assert!(store.work_insert(&task, "opened").unwrap());
+        // A refresh reads it…
+        let seen = store.work_task("t-race").unwrap().unwrap();
+        // …the lead closes it…
+        store
+            .work_modify("t-race", "lead", |task| {
+                task.step = "closed".into();
+                task.closed = Some(2);
+                Ok("closed".into())
+            })
+            .unwrap();
+        // …and the refresh writes what it saw the links prove.
+        let mut next = seen.clone();
+        next.step = "merged".into();
+        next.turn = "lead".into();
+        assert!(!store.work_advance(&seen, &next, "merged").unwrap());
+        let stored = store.work_task("t-race").unwrap().unwrap();
+        assert_eq!(stored.step, "closed");
+        assert!(stored.closed.is_some());
+        // A command on the closed task sees it closed (under the lock).
+        let refused = store.work_modify("t-race", "agent-a", |task| {
+            ensure!(task.closed.is_none(), "{} is closed", task.id);
+            Ok("report".into())
+        });
+        assert!(refused.is_err());
+        crate::state::Store::drop_schema(&url, &schema).unwrap();
     }
 }

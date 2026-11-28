@@ -180,6 +180,9 @@ CREATE TABLE IF NOT EXISTS work_events (
     text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS work_events_task ON work_events (task, seq);
+CREATE INDEX IF NOT EXISTS work_links_value ON work_links (kind, value);
+CREATE INDEX IF NOT EXISTS releases_unit ON releases (unit, started);
+CREATE INDEX IF NOT EXISTS releases_environment_commit ON releases (environment, commit_id);
 ";
 
 #[derive(Debug, Clone, Serialize)]
@@ -529,8 +532,12 @@ impl Store {
     /// The state of the repository whose Git directory holds `dir`
     /// (`<git-common-dir>/citrus`).
     pub fn open(dir: &Path) -> Result<Store> {
-        let schema = schema_for(dir);
-        let mut client = crate::pool::connect(&database_url()?)?;
+        Store::open_schema(&database_url()?, &schema_for(dir))
+    }
+
+    /// The state in `schema` of the database at `url`, set up when new.
+    pub fn open_schema(url: &str, schema: &str) -> Result<Store> {
+        let mut client = crate::pool::connect(url)?;
         let current: bool = client
             .query_one(
                 "select exists (select 1 from information_schema.columns
@@ -1581,7 +1588,7 @@ impl Store {
 }
 
 /// A unit of agent work followed from an owner-hub card to its verified
-/// release (`citrus task new`): its step, whose turn it is, who holds it.
+/// release (`citrus work new`): its step, whose turn it is, who holds it.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkTask {
     pub id: String,
@@ -1661,9 +1668,22 @@ impl Store {
         })
     }
 
-    /// Store a task's new state with the event that explains it.
-    pub fn work_update(&self, task: &WorkTask, agent: &str, text: &str) -> Result<()> {
+    /// Change a task under a row lock: `change` sees the stored task and
+    /// returns the event explaining what it did (or refuses), so two writers
+    /// never undo each other.
+    pub fn work_modify(
+        &self,
+        id: &str,
+        agent: &str,
+        change: impl FnOnce(&mut WorkTask) -> Result<String>,
+    ) -> Result<WorkTask> {
         self.conn.transaction(|tx| {
+            let row = tx
+                .query_opt(&sql(&format!("{WORK_SELECT} WHERE id = ?1 FOR UPDATE")), params![id])?
+                .with_context(|| format!("no task {id}"))?;
+            let mut task = work_row(&Row(&row))?;
+            let text = change(&mut task)?;
+            task.updated = now() as i64;
             tx_execute(tx,
                 "UPDATE work_tasks SET title = ?2, card = ?3, step = ?4, turn = ?5, claimed_by = ?6, lease = ?7,
                      units = ?8, updated = ?9, closed = ?10 WHERE id = ?1",
@@ -1674,8 +1694,39 @@ impl Store {
                 "INSERT INTO work_events (task, at, agent, step, turn, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![task.id, task.updated, agent, task.step, task.turn, text],
             )?;
-            Ok(())
+            Ok(task)
         })
+    }
+
+    /// Citrus moves an open task on what it observed: step, turn and claim
+    /// change only if nobody changed them since `seen` was read. False when
+    /// the task moved meanwhile (or was closed).
+    pub fn work_advance(&self, seen: &WorkTask, next: &WorkTask, text: &str) -> Result<bool> {
+        let at = now() as i64;
+        self.conn.transaction(|tx| {
+            let changed = tx_execute(tx,
+                "UPDATE work_tasks SET step = ?2, turn = ?3, claimed_by = ?4, updated = ?5
+                 WHERE id = ?1 AND closed IS NULL AND step = ?6 AND turn = ?7 AND claimed_by = ?8",
+                params![seen.id, next.step, next.turn, next.claimed_by, at, seen.step, seen.turn, seen.claimed_by],
+            )? == 1;
+            if changed {
+                tx_execute(tx,
+                    "INSERT INTO work_events (task, at, agent, step, turn, text) VALUES (?1, ?2, 'citrus', ?3, ?4, ?5)",
+                    params![seen.id, at, next.step, next.turn, text],
+                )?;
+            }
+            Ok(changed)
+        })
+    }
+
+    /// Open tasks with a link of `kind` to `value`.
+    pub fn work_linked(&self, kind: &str, value: &str) -> Result<Vec<WorkTask>> {
+        self.conn.query_map(
+            &format!("{WORK_SELECT} WHERE closed IS NULL AND id IN
+                      (SELECT task FROM work_links WHERE kind = ?1 AND value = ?2) ORDER BY created"),
+            params![kind, value],
+            work_row,
+        )
     }
 
     pub fn work_task(&self, id: &str) -> Result<Option<WorkTask>> {
@@ -1698,6 +1749,11 @@ impl Store {
     /// A full id (`t-` may be left out), a card (`Q-123`: its newest open
     /// task) or a unique prefix.
     pub fn work_resolve(&self, reference: &str) -> Result<WorkTask> {
+        let reference = reference.trim();
+        anyhow::ensure!(
+            !reference.is_empty(),
+            "name a task: its id, card or a prefix"
+        );
         if let Some(task) = self.work_task(reference)? {
             return Ok(task);
         }
@@ -1708,7 +1764,7 @@ impl Store {
         }
         let by_card = self.conn.query_row(
             &format!(
-                "{WORK_SELECT} WHERE card = ?1 ORDER BY closed IS NULL DESC, created DESC LIMIT 1"
+                "{WORK_SELECT} WHERE card <> '' AND card = ?1 ORDER BY closed IS NULL DESC, created DESC LIMIT 1"
             ),
             params![reference],
             work_row,
@@ -1716,9 +1772,10 @@ impl Store {
         if let Some(task) = by_card {
             return Ok(task);
         }
+        let pattern = like_prefix(reference);
         let found = self.conn.query_map(
-            &format!("{WORK_SELECT} WHERE id LIKE ?1::text || '%' LIMIT 2"),
-            params![reference],
+            &format!(r"{WORK_SELECT} WHERE id LIKE ?1::text || '%' ESCAPE '\' LIMIT 2"),
+            params![pattern],
             work_row,
         )?;
         match found.len() {
@@ -1786,4 +1843,11 @@ impl Store {
             release_row,
         )
     }
+}
+
+/// `text` as a literal LIKE prefix (`%`, `_` and `\` escaped).
+fn like_prefix(text: &str) -> String {
+    text.replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_")
 }

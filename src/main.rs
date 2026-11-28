@@ -161,35 +161,16 @@ enum Command {
         #[command(subcommand)]
         action: Option<QueueAction>,
     },
-    /// Tracked tasks (step, whose turn) and every worktree as a task: branch,
-    /// unmerged commits, runs, notes.
+    /// Every worktree as a task: branch, unmerged commits, runs, notes.
     Tasks {
-        /// Include idle and merged worktrees, and closed tracked tasks.
+        /// Include idle and merged worktrees.
         #[arg(long)]
         all: bool,
         #[arg(long)]
         base: Option<String>,
-        /// Only tracked tasks nobody moves: a silent claim, merged and not
-        /// released, released and not verified, a failed release, no movement.
-        #[arg(long)]
-        stuck: bool,
-        /// Only tracked tasks whose turn this is (owner, lead, lead2, agent, citrus).
-        #[arg(long)]
-        turn: Option<String>,
-        /// --stuck: merged and not released (or released and not verified) this long.
-        #[arg(long, default_value = "15m", value_name = "DURATION")]
-        unreleased_after: String,
-        /// --stuck: an open task without an event this long.
-        #[arg(long, default_value = "24h", value_name = "DURATION")]
-        idle_after: String,
     },
-    /// Say what this worktree's task is doing and what blocks it (shown in
-    /// status and tasks); `citrus task new|claim|report|link|verify|close|show`
-    /// track a task from its card to a verified release.
-    #[command(args_conflicts_with_subcommands = true)]
+    /// Say what this worktree's task is doing and what blocks it (shown in status and tasks).
     Task {
-        #[command(subcommand)]
-        action: Option<TaskAction>,
         /// What it is doing, in a line.
         #[arg(value_name = "TITLE")]
         title: Vec<String>,
@@ -210,6 +191,38 @@ enum Command {
         /// Forget the task's description.
         #[arg(long)]
         clear: bool,
+    },
+    /// Tracked work from an owner-hub card to a verified release: its step and
+    /// whose turn it is (docs/tasks.md).
+    Work {
+        #[command(subcommand)]
+        action: WorkAction,
+    },
+    /// Tracked work as stored: step, whose turn, who holds it.
+    Works {
+        /// Closed ones too.
+        #[arg(long)]
+        all: bool,
+        /// Only those whose turn this is (owner, lead, lead2, agent, citrus).
+        #[arg(long)]
+        turn: Option<String>,
+        /// Only work nobody moves (it is brought up to date first): a silent
+        /// claim, a failed queue entry or release, merged and not released,
+        /// released and not verified, no movement.
+        #[arg(long)]
+        stuck: bool,
+        /// --stuck: exit 1 when something is stuck.
+        #[arg(long, requires = "stuck")]
+        exit_code: bool,
+        /// --stuck: merged and not released this long.
+        #[arg(long, default_value = "15m", value_name = "DURATION")]
+        unreleased_after: String,
+        /// --stuck: released and not verified this long.
+        #[arg(long, default_value = "2h", value_name = "DURATION")]
+        unverified_after: String,
+        /// --stuck: open without an event, commit or run this long.
+        #[arg(long, default_value = "24h", value_name = "DURATION")]
+        idle_after: String,
     },
     /// Record a decision between tasks: who does what, when it is reopened.
     Agree {
@@ -550,7 +563,8 @@ enum QueueAction {
         /// Queue a failed, conflicting or cancelled commit again.
         #[arg(long)]
         retry: bool,
-        /// The tracked task this lands (`citrus task new`): it follows the entry.
+        /// The tracked work this lands (`citrus work new`): it follows the entry
+        /// (and a later entry of this worktree).
         #[arg(long)]
         task: Option<String>,
     },
@@ -574,7 +588,7 @@ enum QueueAction {
 }
 
 #[derive(Subcommand, Debug)]
-enum TaskAction {
+enum WorkAction {
     /// Track a task: what it is, its owner-hub card, whose turn it is.
     New {
         #[arg(value_name = "TITLE", required = true)]
@@ -641,6 +655,9 @@ enum TaskAction {
         /// What was checked and how.
         #[arg(required = true, value_name = "TEXT")]
         note: Vec<String>,
+        /// Record it before the task is released.
+        #[arg(long)]
+        force: bool,
     },
     /// Close a task: nothing more happens to it.
     Close {
@@ -1127,32 +1144,8 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             release,
         } => integrate_command(&mut context, base, push, !no_run, &release, json),
         Command::Queue { action } => queue_command(&mut context, action, json),
-        Command::Tasks {
-            all,
-            base,
-            stuck,
-            turn,
-            unreleased_after,
-            idle_after,
-        } => {
-            let limits = work::Limits {
-                unreleased: work::parse_duration(&unreleased_after)?,
-                idle: work::parse_duration(&idle_after)?,
-            };
-            if let Some(turn) = &turn {
-                work::check_turn(turn)?;
-            }
-            if stuck {
-                return stuck_command(&context, limits, turn.as_deref(), json);
-            }
-            tasks_command(&context, all, base, turn.as_deref(), json)
-        }
+        Command::Tasks { all, base } => tasks_command(&context, all, base, json),
         Command::Task {
-            action: Some(action),
-            ..
-        } => task_action(&mut context, action, json),
-        Command::Task {
-            action: None,
             title,
             scope,
             blocked,
@@ -1184,6 +1177,29 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
                 println!("{}", describe_task(&info));
             }
             Ok(0)
+        }
+        Command::Work { action } => work_action(&mut context, action, json),
+        Command::Works {
+            all,
+            turn,
+            stuck,
+            exit_code,
+            unreleased_after,
+            unverified_after,
+            idle_after,
+        } => {
+            if let Some(turn) = &turn {
+                work::check_turn(turn)?;
+            }
+            if stuck {
+                let limits = work::Limits {
+                    unreleased: work::parse_duration(&unreleased_after)?,
+                    unverified: work::parse_duration(&unverified_after)?,
+                    idle: work::parse_duration(&idle_after)?,
+                };
+                return stuck_command(&context, limits, turn.as_deref(), exit_code, json);
+            }
+            works_command(&context, all, turn.as_deref(), json)
         }
         Command::Agree {
             key,
@@ -2646,12 +2662,26 @@ fn queue_command(context: &mut Context, action: Option<QueueAction>, json: bool)
         } => {
             let releases = queue::parse_releases(context, &release)?;
             let base = given.unwrap_or(base);
+            // The task first: a closed or unknown one queues nothing.
             let tracked = task
                 .map(|task| context.store.work_resolve(&task))
                 .transpose()?;
+            if let Some(tracked) = &tracked {
+                ensure_open(tracked)?;
+            }
+            let previous = context.store.queue_of(&here)?;
             let (entry, inserted) = queue::add(context, &base, &releases, retry)?;
-            if let Some(tracked) = tracked {
-                link_queue_entry(context, tracked, &entry)?;
+            match tracked {
+                Some(tracked) => link_queue_entry(context, &tracked.id, &entry)?,
+                // A new entry of this worktree carries on for the task its
+                // previous entry was linked to.
+                None => {
+                    if let Some(previous) = previous.filter(|previous| previous.id != entry.id) {
+                        for tracked in context.store.work_linked("queue", &previous.id)? {
+                            link_queue_entry(context, &tracked.id, &entry)?;
+                        }
+                    }
+                }
             }
             if !inserted && !json {
                 println!("already queued (the same commit):");
@@ -2734,34 +2764,8 @@ fn queue_command(context: &mut Context, action: Option<QueueAction>, json: bool)
     }
 }
 
-fn tasks_command(
-    context: &Context,
-    all: bool,
-    base: Option<String>,
-    turn: Option<&str>,
-    json: bool,
-) -> Result<i32> {
+fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool) -> Result<i32> {
     let base = base.unwrap_or_else(|| context.repo.config.plan.base.clone());
-    let mut tracked = Vec::new();
-    for task in context.store.work_tasks(all)? {
-        let (task, _) = work::refresh(context, task)?;
-        if turn.is_none_or(|turn| task.turn == turn && task.closed.is_none()) {
-            tracked.push(task);
-        }
-    }
-    if turn.is_some() {
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({"schema": SCHEMA, "tracked": tracked}))?
-            );
-        } else {
-            for task in &tracked {
-                println!("{}", work::describe(task));
-            }
-        }
-        return Ok(0);
-    }
     let tasks = tasks::list(context, &base)?;
     let shown: Vec<&tasks::Task> = tasks
         .iter()
@@ -2771,16 +2775,10 @@ fn tasks_command(
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"schema": SCHEMA, "base": base, "tracked": tracked, "total": tasks.len(), "tasks": shown, "agreements": context.store.agreements()?})
+                &json!({"schema": SCHEMA, "base": base, "total": tasks.len(), "tasks": shown, "agreements": context.store.agreements()?})
             )?
         );
         return Ok(0);
-    }
-    if !tracked.is_empty() {
-        println!("tracked tasks:");
-        for task in &tracked {
-            println!("  {}", work::describe(task));
-        }
     }
     println!(
         "{} of {} worktrees{} · base {base}",
@@ -2835,30 +2833,67 @@ fn tasks_command(
     Ok(0)
 }
 
-/// `citrus tasks --stuck`: the tracked tasks nobody moves, one line each.
+/// `citrus works`: tracked work as stored (nothing is brought up to date).
+fn works_command(context: &Context, all: bool, turn: Option<&str>, json: bool) -> Result<i32> {
+    let works: Vec<state::WorkTask> = context
+        .store
+        .work_tasks(all)?
+        .into_iter()
+        .filter(|task| turn.is_none_or(|turn| task.turn == turn && task.closed.is_none()))
+        .collect();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"schema": SCHEMA, "works": works}))?
+        );
+    } else if works.is_empty() {
+        println!("no tracked work{}", if all { "" } else { " open" });
+    } else {
+        for task in &works {
+            println!("{}", work::describe(task));
+        }
+    }
+    Ok(0)
+}
+
+/// `citrus works --stuck`: open work brought up to date, and what of it
+/// nobody moves; a task that cannot be read is named and skipped.
 fn stuck_command(
     context: &Context,
     limits: work::Limits,
     turn: Option<&str>,
+    exit_code: bool,
     json: bool,
 ) -> Result<i32> {
     let mut found = Vec::new();
+    let mut errors = Vec::new();
     for task in context.store.work_tasks(false)? {
-        let (task, progress) = work::refresh(context, task)?;
-        found.extend(
-            work::stuck(context, &task, &progress, limits)?
-                .into_iter()
-                .filter(|stuck| turn.is_none_or(|turn| stuck.to == turn)),
-        );
+        let id = task.id.clone();
+        let result = work::refresh(context, task)
+            .and_then(|(task, progress)| work::stuck(context, &task, &progress, limits));
+        match result {
+            Ok(stuck) => found.extend(
+                stuck
+                    .into_iter()
+                    .filter(|stuck| turn.is_none_or(|turn| stuck.to == turn)),
+            ),
+            Err(error) => errors.push(format!("{id}: {error:#}")),
+        }
     }
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({"schema": SCHEMA, "stuck": found}))?
+            serde_json::to_string_pretty(
+                &json!({"schema": SCHEMA, "stuck": found, "errors": errors})
+            )?
         );
-    } else if found.is_empty() {
-        println!("no stuck tasks");
     } else {
+        for error in &errors {
+            println!("! {error}");
+        }
+        if found.is_empty() {
+            println!("nothing stuck");
+        }
         for stuck in &found {
             println!(
                 "{} {}{} → {}: {}",
@@ -2874,31 +2909,30 @@ fn stuck_command(
             );
         }
     }
-    Ok(0)
+    Ok(if exit_code && !found.is_empty() { 1 } else { 0 })
 }
 
-/// Follow `entry` from `task`: the entry, its branch and worktree, its units.
-fn link_queue_entry(
-    context: &Context,
-    mut task: state::WorkTask,
-    entry: &state::QueueEntry,
-) -> Result<()> {
+/// Follow `entry` from task `id`: the entry, its branch and worktree, its
+/// units; the turn is Citrus's while the entry waits.
+fn link_queue_entry(context: &Context, id: &str, entry: &state::QueueEntry) -> Result<()> {
     let store = &context.store;
-    store.work_link(&task.id, "queue", &entry.id)?;
-    store.work_link(&task.id, "worktree", &entry.worktree)?;
+    store.work_modify(id, &exec::agent(), |task| {
+        anyhow::ensure!(task.closed.is_none(), "{} is closed", task.id);
+        work::add_units(
+            task,
+            entry.release_units().into_iter().map(|(unit, _)| unit),
+        );
+        if work::step_rank(&task.step) <= work::step_rank("in-queue") {
+            task.step = "in-queue".into();
+            task.turn = "citrus".into();
+        }
+        Ok(format!("queued {} ({})", entry.id, entry.branch))
+    })?;
+    store.work_link(id, "queue", &entry.id)?;
+    store.work_link(id, "worktree", &entry.worktree)?;
     if !entry.branch.is_empty() && entry.branch != "(detached)" {
-        store.work_link(&task.id, "branch", &entry.branch)?;
+        store.work_link(id, "branch", &entry.branch)?;
     }
-    work::add_units(
-        &mut task,
-        entry.release_units().into_iter().map(|(unit, _)| unit),
-    );
-    if work::step_rank(&task.step) < work::step_rank("in-queue") && task.closed.is_none() {
-        task.step = "in-queue".into();
-        task.turn = "citrus".into();
-    }
-    task.updated = now() as i64;
-    store.work_update(&task, &exec::agent(), &format!("queued {}", entry.id))?;
     Ok(())
 }
 
@@ -2911,29 +2945,37 @@ fn release_units(context: &mut Context, units: &[String]) -> Result<Vec<String>>
         .collect())
 }
 
-fn task_action(context: &mut Context, action: TaskAction, json: bool) -> Result<i32> {
+fn ensure_open(task: &state::WorkTask) -> Result<()> {
+    anyhow::ensure!(
+        task.closed.is_none(),
+        "{} is closed: nothing more happens to it",
+        task.id
+    );
+    Ok(())
+}
+
+fn work_action(context: &mut Context, action: WorkAction, json: bool) -> Result<i32> {
     let agent = exec::agent();
-    let at = now() as i64;
-    let (task, text) = match action {
-        TaskAction::New {
+    let store_task = match action {
+        WorkAction::New {
             title,
             id,
             card,
             turn,
             units,
-            about: text,
+            about,
         } => {
             let title = title.join(" ");
-            work::check_text(&title)?;
-            anyhow::ensure!(!title.trim().is_empty(), "a task has a title");
+            work::check_title(&title)?;
             work::check_turn(&turn)?;
             if let Some(card) = &card {
                 work::check_name("a card", card)?;
             }
-            if let Some(text) = &text {
-                work::check_text(text)?;
+            if let Some(about) = &about {
+                work::check_text(about)?;
             }
             let units = release_units(context, &units)?;
+            let at = now() as i64;
             let task = state::WorkTask {
                 id: work::new_id(id.as_deref())?,
                 title: title.trim().to_owned(),
@@ -2948,9 +2990,12 @@ fn task_action(context: &mut Context, action: TaskAction, json: bool) -> Result<
                 updated: at,
                 closed: None,
             };
-            let event = text.unwrap_or_else(|| format!("opened: {}", task.title));
+            let event = about.unwrap_or_else(|| format!("opened: {}", task.title));
             if !context.store.work_insert(&task, &event)? {
-                let existing = context.store.work_resolve(&task.id)?;
+                let existing = context
+                    .store
+                    .work_task(&task.id)?
+                    .context("the task disappeared")?;
                 anyhow::ensure!(
                     existing.title == task.title,
                     "task {} exists with another title: {}",
@@ -2958,27 +3003,30 @@ fn task_action(context: &mut Context, action: TaskAction, json: bool) -> Result<
                     existing.title
                 );
                 // Asking again (a lost terminal) returns the same task.
-                return show_task(context, existing, json);
+                return show_work(context, existing, json);
             }
-            return show_task(context, task, json);
+            task
         }
-        TaskAction::Claim { task, who, lease } => {
+        WorkAction::Claim { task, who, lease } => {
             work::check_name("a claimant", &who)?;
             let lease = work::parse_duration(&lease)?;
-            let mut task = context.store.work_resolve(&task)?;
-            anyhow::ensure!(task.closed.is_none(), "{} is closed", task.id);
-            if !task.claimed_by.is_empty() && task.claimed_by != who {
-                eprintln!(
-                    "citrus: {} was claimed by {}; now {who}",
-                    task.id, task.claimed_by
-                );
-            }
-            task.claimed_by = who.clone();
-            task.lease = lease;
-            task.turn = work::turn_of(&who).to_owned();
-            if task.step == "open" {
-                task.step = "claimed".into();
-            }
+            let id = context.store.work_resolve(&task)?.id;
+            let claimed = context.store.work_modify(&id, &agent, |task| {
+                ensure_open(task)?;
+                if !task.claimed_by.is_empty() && task.claimed_by != who {
+                    eprintln!(
+                        "citrus: {} was claimed by {}; now {who}",
+                        task.id, task.claimed_by
+                    );
+                }
+                task.claimed_by = who.clone();
+                task.lease = lease;
+                task.turn = work::turn_of(&who).to_owned();
+                if task.step == "open" {
+                    task.step = "claimed".into();
+                }
+                Ok(format!("claimed by {who} (lease {})", report::age(lease)))
+            })?;
             // The worktree and branch it is claimed from are where its work shows.
             let branch = context.repo.branch();
             let base_branch = context
@@ -2990,22 +3038,15 @@ fn task_action(context: &mut Context, action: TaskAction, json: bool) -> Result<
                 .next()
                 .unwrap_or_default()
                 .to_owned();
-            if branch != "(detached)"
-                && !branch.is_empty()
-                && branch != base_branch
-                && branch != "HEAD"
-            {
-                context.store.work_link(&task.id, "branch", &branch)?;
+            if !matches!(branch.as_str(), "" | "(detached)" | "HEAD") && branch != base_branch {
+                context.store.work_link(&id, "branch", &branch)?;
                 context
                     .store
-                    .work_link(&task.id, "worktree", &context.worktree())?;
+                    .work_link(&id, "worktree", &context.worktree())?;
             }
-            (
-                task,
-                format!("claimed by {who} (lease {})", report::age(lease)),
-            )
+            claimed
         }
-        TaskAction::Report {
+        WorkAction::Report {
             task,
             note,
             done,
@@ -3014,14 +3055,18 @@ fn task_action(context: &mut Context, action: TaskAction, json: bool) -> Result<
             let text = note.join(" ");
             work::check_text(&text)?;
             work::check_turn(&turn)?;
-            let mut task = context.store.work_resolve(&task)?;
-            task.turn = turn;
-            if done {
-                task.claimed_by.clear();
-            }
-            (task, if done { format!("done: {text}") } else { text })
+            let id = context.store.work_resolve(&task)?.id;
+            context.store.work_modify(&id, &agent, |task| {
+                ensure_open(task)?;
+                task.turn = turn;
+                if done {
+                    task.claimed_by.clear();
+                    return Ok(format!("done: {text}"));
+                }
+                Ok(text)
+            })?
         }
-        TaskAction::Link {
+        WorkAction::Link {
             task,
             branch,
             queue,
@@ -3029,82 +3074,112 @@ fn task_action(context: &mut Context, action: TaskAction, json: bool) -> Result<
             units,
             card,
         } => {
-            let mut task = context.store.work_resolve(&task)?;
+            let found = context.store.work_resolve(&task)?;
+            ensure_open(&found)?;
+            let id = found.id;
             let units = release_units(context, &units)?;
-            let mut linked = Vec::new();
             for name in &branch {
                 work::check_name("a branch", name)?;
-                context.store.work_link(&task.id, "branch", name)?;
-                linked.push(format!("branch {name}"));
             }
-            for id in &queue {
-                let entry = context
-                    .store
-                    .queue_entry(id)?
-                    .with_context(|| format!("no queue entry {id}"))?;
-                link_queue_entry(context, task.clone(), &entry)?;
-                task = context.store.work_resolve(&task.id)?;
-                linked.push(format!("queue {id}"));
+            if let Some(card) = &card {
+                work::check_name("a card", card)?;
             }
-            for reference in &release {
-                let found = context
-                    .store
-                    .resolve_release(reference, &context.worktree())?;
-                context.store.work_link(&task.id, "release", &found.id)?;
-                linked.push(format!("release {}", found.id));
-            }
-            if !units.is_empty() {
-                work::add_units(&mut task, units.iter().cloned());
-                linked.push(format!("units {}", units.join(",")));
-            }
-            if let Some(card) = card {
-                work::check_name("a card", &card)?;
-                linked.push(format!("card {card}"));
-                task.card = card;
-            }
+            let entries = queue
+                .iter()
+                .map(|entry| {
+                    context
+                        .store
+                        .queue_entry(entry)?
+                        .with_context(|| format!("no queue entry {entry}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let worktree = context.worktree();
+            let releases = release
+                .iter()
+                .map(|reference| context.store.resolve_release(reference, &worktree))
+                .collect::<Result<Vec<_>>>()?;
             anyhow::ensure!(
-                !linked.is_empty(),
+                !(branch.is_empty()
+                    && entries.is_empty()
+                    && releases.is_empty()
+                    && units.is_empty()
+                    && card.is_none()),
                 "link what: --branch, --queue, --release, --unit or --card"
             );
-            (task, format!("linked {}", linked.join(", ")))
+            for entry in &entries {
+                link_queue_entry(context, &id, entry)?;
+            }
+            for name in &branch {
+                context.store.work_link(&id, "branch", name)?;
+            }
+            for found in &releases {
+                context.store.work_link(&id, "release", &found.id)?;
+            }
+            let mut linked: Vec<String> =
+                branch.iter().map(|name| format!("branch {name}")).collect();
+            linked.extend(entries.iter().map(|entry| format!("queue {}", entry.id)));
+            linked.extend(releases.iter().map(|found| format!("release {}", found.id)));
+            context.store.work_modify(&id, &agent, |task| {
+                ensure_open(task)?;
+                if !units.is_empty() {
+                    work::add_units(task, units.iter().cloned());
+                    linked.push(format!("units {}", units.join(",")));
+                }
+                if let Some(card) = card {
+                    linked.push(format!("card {card}"));
+                    task.card = card;
+                }
+                Ok(format!("linked {}", linked.join(", ")))
+            })?
         }
-        TaskAction::Verify { task, note } => {
+        WorkAction::Verify { task, note, force } => {
             let text = note.join(" ");
             work::check_text(&text)?;
             anyhow::ensure!(!text.trim().is_empty(), "say what was checked");
-            let mut task = context.store.work_resolve(&task)?;
-            anyhow::ensure!(task.closed.is_none(), "{} is closed", task.id);
-            context.store.work_link(&task.id, "verified", &agent)?;
-            task.step = "verified".into();
-            task.turn = "lead".into();
-            (task, format!("verified by {agent}: {text}"))
+            // What the links prove first: a release that just passed counts.
+            let found = context.store.work_resolve(&task)?;
+            let (found, _) = work::refresh(context, found)?;
+            let id = found.id;
+            let verified = context.store.work_modify(&id, &agent, |task| {
+                ensure_open(task)?;
+                anyhow::ensure!(
+                    force || task.step == "released",
+                    "{} is {}: verify a released task (--force to record it anyway)",
+                    task.id,
+                    task.step
+                );
+                task.step = "verified".into();
+                task.turn = "lead".into();
+                Ok(format!(
+                    "verified by {agent}{}: {text}",
+                    if force { " (forced)" } else { "" }
+                ))
+            })?;
+            context.store.work_link(&id, "verified", &agent)?;
+            verified
         }
-        TaskAction::Close { task, note } => {
+        WorkAction::Close { task, note } => {
             let text = (!note.is_empty()).then(|| note.join(" "));
-            let mut task = context.store.work_resolve(&task)?;
             if let Some(text) = &text {
                 work::check_text(text)?;
             }
-            task.step = "closed".into();
-            task.claimed_by.clear();
-            task.closed = Some(at);
-            (
-                task,
-                text.map_or_else(|| "closed".to_owned(), |text| format!("closed: {text}")),
-            )
+            let id = context.store.work_resolve(&task)?.id;
+            context.store.work_modify(&id, &agent, |task| {
+                ensure_open(task)?;
+                task.step = "closed".into();
+                task.claimed_by.clear();
+                task.closed = Some(now() as i64);
+                Ok(text.map_or_else(|| "closed".to_owned(), |text| format!("closed: {text}")))
+            })?
         }
-        TaskAction::Show { task } => {
-            let task = context.store.work_resolve(&task)?;
-            return show_task(context, task, json);
-        }
+        WorkAction::Show { task } => context.store.work_resolve(&task)?,
     };
-    let mut task = task;
-    task.updated = at;
-    context.store.work_update(&task, &agent, &text)?;
-    show_task(context, task, json)
+    show_work(context, store_task, json)
 }
 
-fn show_task(context: &Context, task: state::WorkTask, json: bool) -> Result<i32> {
+/// A task with its links, latest events and what is stuck; an open one is
+/// brought up to date first.
+fn show_work(context: &Context, task: state::WorkTask, json: bool) -> Result<i32> {
     let (task, progress) = work::refresh(context, task)?;
     let links = context.store.work_links(&task.id)?;
     let events = context.store.work_events(&task.id, 10)?;
