@@ -862,6 +862,11 @@ fn tracked_work_carries_the_turn_from_claim_to_close() {
     std::thread::sleep(Duration::from_millis(1100));
     let (calm, code) = project.json(&["works", "--stuck", "--exit-code"]);
     assert_eq!(code, 0, "{calm}");
+    // A prefix without `t-` finds it too.
+    assert_eq!(
+        project.json(&["work", "show", "weekly"]).0["task"]["id"],
+        "t-weekly-left"
+    );
     let (lead, _) = project.json(&["works", "--turn", "lead"]);
     assert_eq!(lead["works"][0]["id"], "t-weekly-left", "{lead}");
     let (linked, code) =
@@ -5318,6 +5323,31 @@ fn a_task_whose_entry_failed_returns_the_turn_and_follows_the_next_entry() {
     assert_eq!(shown["task"]["step"], "merged", "{shown}");
     let (stuck, _) = at(&["works", "--stuck"]);
     assert!(stuck["stuck"].as_array().unwrap().is_empty(), "{stuck}");
+    // The worktree reused for another branch: its entry is not the task's.
+    git(&["checkout", "-q", "-b", "qf-next"]);
+    fs::write(branch.join("src/next.txt"), "next\n").unwrap();
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "next",
+    ]);
+    let (other, code) = at(&["queue", "add", "--wait"]);
+    assert_eq!(code, 0, "{other}");
+    let (shown, _) = at(&["work", "show", "fragile"]);
+    assert!(
+        !shown["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link["value"] == other["queue"]["id"] || link["value"] == "qf-next"),
+        "{shown}"
+    );
+    assert_eq!(shown["task"]["step"], "merged", "{shown}");
 }
 
 #[test]

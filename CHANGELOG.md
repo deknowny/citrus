@@ -5,8 +5,8 @@
 - Tracked work (docs/tasks.md): `citrus work new|claim|report|link|verify|close|show`
   follow one piece of work from its card to a verified release, with a step
   (open → claimed → in-queue → merged → released → verified → closed) and
-  whose turn it is. `queue add --task` links the entry (a later entry of the
-  worktree follows); Citrus moves the step on the queue and its releases,
+  whose turn it is. `queue add --task` links the entry (a retry of the same
+  branch that did not land follows); Citrus moves the step on the queue and its releases,
   never over a change made meanwhile. `citrus works --stuck [--exit-code]`
   names silent claims, failed queue entries and releases, merged-not-released,
   released-not-verified and idle work. `citrus task`/`tasks` are unchanged.

@@ -51,8 +51,11 @@ The turn is always one of `owner`, `lead`, `lead2`, `agent`, `citrus`.
 the claim); the queue and releases make it `citrus`; merged without a release
 in flight, released or verified it is the lead's, and the claim is released
 once merged. When every queue entry of the task failed, conflicted or was
-cancelled, the turn goes back to the claimant (else the lead); a later
-`queue add` from the same worktree follows the task without `--task`.
+cancelled, the turn goes back to the claimant (else the lead). A later
+`queue add` without `--task` follows the task only when it queues the same
+branch as the task's last entry from that worktree, that entry did not land
+and the task is not past `in-queue`; otherwise Citrus names the task and
+`--task` links it.
 
 The units a task must reach are those named by `--unit` and those its queue
 entries release (`queue add --release`).

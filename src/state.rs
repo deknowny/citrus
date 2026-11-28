@@ -540,8 +540,10 @@ impl Store {
         let mut client = crate::pool::connect(url)?;
         let current: bool = client
             .query_one(
-                "select exists (select 1 from information_schema.columns
-                 where table_schema = $1 and table_name = 'work_events' and column_name = 'text')",
+                // The newest object of SCHEMA: a schema without it is set up
+                // again (every statement there is idempotent).
+                "select exists (select 1 from pg_indexes
+                 where schemaname = $1 and indexname = 'releases_environment_commit')",
                 &[&schema],
             )?
             .get(0);
@@ -562,6 +564,7 @@ impl Store {
             "begin;
              create schema if not exists {schema};
              set local search_path to {schema};
+             set local lock_timeout = '30s';
              {SCHEMA}
              alter table runs add column if not exists linked_log text;
              commit;"
@@ -1772,10 +1775,14 @@ impl Store {
         if let Some(task) = by_card {
             return Ok(task);
         }
-        let pattern = like_prefix(reference);
+        // `weekly` finds `t-weekly-left` as `t-weekly` does.
+        let bare = like_prefix(reference);
+        let prefixed = like_prefix(&format!("t-{reference}"));
         let found = self.conn.query_map(
-            &format!(r"{WORK_SELECT} WHERE id LIKE ?1::text || '%' ESCAPE '\' LIMIT 2"),
-            params![pattern],
+            &format!(
+                r"{WORK_SELECT} WHERE id LIKE ?1::text || '%' ESCAPE '\' OR id LIKE ?2::text || '%' ESCAPE '\' LIMIT 2"
+            ),
+            params![bare, prefixed],
             work_row,
         )?;
         match found.len() {

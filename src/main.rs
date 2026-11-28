@@ -2673,12 +2673,28 @@ fn queue_command(context: &mut Context, action: Option<QueueAction>, json: bool)
             let (entry, inserted) = queue::add(context, &base, &releases, retry)?;
             match tracked {
                 Some(tracked) => link_queue_entry(context, &tracked.id, &entry)?,
-                // A new entry of this worktree carries on for the task its
-                // previous entry was linked to.
+                // A new entry carries on for the task of this worktree's
+                // previous entry only when it is the same branch trying again:
+                // that entry did not land and the task is not past the queue.
+                // A reused worktree's other branch is not that task's.
                 None => {
                     if let Some(previous) = previous.filter(|previous| previous.id != entry.id) {
+                        let retry = previous.branch == entry.branch
+                            && matches!(
+                                previous.state.as_str(),
+                                "queued" | "cancelled" | "failed" | "conflict"
+                            );
                         for tracked in context.store.work_linked("queue", &previous.id)? {
-                            link_queue_entry(context, &tracked.id, &entry)?;
+                            if retry
+                                && work::step_rank(&tracked.step) <= work::step_rank("in-queue")
+                            {
+                                link_queue_entry(context, &tracked.id, &entry)?;
+                            } else {
+                                eprintln!(
+                                    "citrus: {} follows {} ({}), not this entry; if it is that task's: citrus queue add --task {}",
+                                    tracked.id, previous.id, previous.branch, tracked.id
+                                );
+                            }
                         }
                     }
                 }
@@ -2867,9 +2883,10 @@ fn stuck_command(
 ) -> Result<i32> {
     let mut found = Vec::new();
     let mut errors = Vec::new();
+    let ancestry = work::Ancestry::default();
     for task in context.store.work_tasks(false)? {
         let id = task.id.clone();
-        let result = work::refresh(context, task)
+        let result = work::refresh(context, task, &ancestry)
             .and_then(|(task, progress)| work::stuck(context, &task, &progress, limits));
         match result {
             Ok(stuck) => found.extend(
@@ -2916,6 +2933,9 @@ fn stuck_command(
 /// units; the turn is Citrus's while the entry waits.
 fn link_queue_entry(context: &Context, id: &str, entry: &state::QueueEntry) -> Result<()> {
     let store = &context.store;
+    // The link first (asking again changes nothing), then the step: an
+    // interrupted call leaves the entry linked, and the next read moves it.
+    store.work_link(id, "queue", &entry.id)?;
     store.work_modify(id, &exec::agent(), |task| {
         anyhow::ensure!(task.closed.is_none(), "{} is closed", task.id);
         work::add_units(
@@ -2928,7 +2948,6 @@ fn link_queue_entry(context: &Context, id: &str, entry: &state::QueueEntry) -> R
         }
         Ok(format!("queued {} ({})", entry.id, entry.branch))
     })?;
-    store.work_link(id, "queue", &entry.id)?;
     store.work_link(id, "worktree", &entry.worktree)?;
     if !entry.branch.is_empty() && entry.branch != "(detached)" {
         store.work_link(id, "branch", &entry.branch)?;
@@ -3138,7 +3157,7 @@ fn work_action(context: &mut Context, action: WorkAction, json: bool) -> Result<
             anyhow::ensure!(!text.trim().is_empty(), "say what was checked");
             // What the links prove first: a release that just passed counts.
             let found = context.store.work_resolve(&task)?;
-            let (found, _) = work::refresh(context, found)?;
+            let (found, _) = work::refresh(context, found, &work::Ancestry::default())?;
             let id = found.id;
             let verified = context.store.work_modify(&id, &agent, |task| {
                 ensure_open(task)?;
@@ -3180,8 +3199,8 @@ fn work_action(context: &mut Context, action: WorkAction, json: bool) -> Result<
 /// A task with its links, latest events and what is stuck; an open one is
 /// brought up to date first.
 fn show_work(context: &Context, task: state::WorkTask, json: bool) -> Result<i32> {
-    let (task, progress) = work::refresh(context, task)?;
-    let links = context.store.work_links(&task.id)?;
+    let (task, progress) = work::refresh(context, task, &work::Ancestry::default())?;
+    let links = &progress.links;
     let events = context.store.work_events(&task.id, 10)?;
     let stuck = work::stuck(context, &task, &progress, work::Limits::default())?;
     if json {
@@ -3198,7 +3217,7 @@ fn show_work(context: &Context, task: state::WorkTask, json: bool) -> Result<i32
     if !task.units.is_empty() {
         println!("  units: {}", task.units);
     }
-    for link in &links {
+    for link in links {
         println!("  {}: {}", link.kind, link.value);
     }
     for event in &events {

@@ -9,7 +9,8 @@
 //! --task`) and the releases linked to it — only if nobody moved it since it
 //! was read. `citrus works --stuck` names the work nobody moves.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Result, bail, ensure};
 use serde::Serialize;
@@ -166,7 +167,14 @@ pub struct Progress {
     pub released_at: Option<i64>,
     /// Units the task must reach: its own and those its entries asked for.
     pub due: Vec<String>,
+    /// Its links, read once (with the releases linked while reading).
+    #[serde(skip)]
+    pub links: Vec<WorkLink>,
 }
+
+/// Answers of `git merge-base --is-ancestor` within one command: many tasks
+/// ask about the same merges and releases.
+pub type Ancestry = RefCell<HashMap<(String, String), bool>>;
 
 /// A release proves its result when one of its steps verifies it, or when it
 /// applied a deployed environment (an apply ends with `verify`).
@@ -202,17 +210,36 @@ fn covers(release: &Release) -> bool {
 }
 
 /// What the task's links prove; links the releases its merges led to.
-pub fn progress(context: &Context, task: &WorkTask) -> Result<Progress> {
+pub fn progress(context: &Context, task: &WorkTask, ancestry: &Ancestry) -> Result<Progress> {
     let store = &context.store;
     let mut progress = Progress {
         due: units_of(task),
         ..Progress::default()
     };
-    let links = store.work_links(&task.id)?;
+    let mut links = store.work_links(&task.id)?;
+    let link_release = |links: &mut Vec<WorkLink>, id: &str| -> Result<()> {
+        if !links
+            .iter()
+            .any(|link| link.kind == "release" && link.value == id)
+        {
+            store.work_link(&task.id, "release", id)?;
+            links.push(WorkLink {
+                kind: "release".into(),
+                value: id.to_owned(),
+                added: now() as i64,
+            });
+        }
+        Ok(())
+    };
+    let queue: Vec<String> = links
+        .iter()
+        .filter(|link| link.kind == "queue")
+        .map(|link| link.value.clone())
+        .collect();
     let mut entries = 0;
     let mut failed_entries = Vec::new();
-    for link in links.iter().filter(|link| link.kind == "queue") {
-        let Some(entry) = store.queue_entry(&link.value)? else {
+    for id in &queue {
+        let Some(entry) = store.queue_entry(id)? else {
             continue;
         };
         entries += 1;
@@ -227,7 +254,7 @@ pub fn progress(context: &Context, task: &WorkTask) -> Result<Progress> {
                 .push((entry.merged.clone(), entry.ended.unwrap_or(entry.updated)));
             for (_, id) in entry.started() {
                 if !id.starts_with("error:") {
-                    store.work_link(&task.id, "release", &id)?;
+                    link_release(&mut links, &id)?;
                 }
             }
         } else if matches!(entry.state.as_str(), "queued" | "checking") {
@@ -244,9 +271,8 @@ pub fn progress(context: &Context, task: &WorkTask) -> Result<Progress> {
     }
     // A due unit released later (by hand, from a newer base) still counts:
     // a release whose commit carries every merge of the task.
-    if !progress.merged.is_empty() {
-        let linked: Vec<Release> = store
-            .work_links(&task.id)?
+    if !progress.merged.is_empty() && !progress.due.is_empty() {
+        let linked: Vec<Release> = links
             .iter()
             .filter(|link| link.kind == "release")
             .filter_map(|link| store.release(&link.value).ok().flatten())
@@ -261,20 +287,16 @@ pub fn progress(context: &Context, task: &WorkTask) -> Result<Progress> {
             for release in store.releases_of(unit, 20)? {
                 if release.kind == "release"
                     && covers(&release)
-                    && carries(context, &release.commit, &progress.merged)
+                    && carries(context, ancestry, &release.commit, &progress.merged)
                 {
-                    store.work_link(&task.id, "release", &release.id)?;
+                    link_release(&mut links, &release.id)?;
                     break;
                 }
             }
         }
     }
     let mut failed = Vec::new();
-    for link in store
-        .work_links(&task.id)?
-        .iter()
-        .filter(|link| link.kind == "release")
-    {
+    for link in links.iter().filter(|link| link.kind == "release") {
         let Some(release) = store.release(&link.value)? else {
             continue;
         };
@@ -296,6 +318,7 @@ pub fn progress(context: &Context, task: &WorkTask) -> Result<Progress> {
         .filter(|(unit, _, _)| !progress.released.contains(unit))
         .map(|(unit, id, state)| format!("{unit} {id} {state}"))
         .collect();
+    progress.links = links;
     Ok(progress)
 }
 
@@ -363,13 +386,16 @@ fn derive(progress: &Progress, verified_by_hand: bool) -> (&'static str, &'stati
 /// back); from `merged` on the claim is released, the claimant's part being
 /// done; a queue that failed every entry gives the turn back. Written only if
 /// nobody moved the task since it was read. Returns the task as stored.
-pub fn refresh(context: &Context, task: WorkTask) -> Result<(WorkTask, Progress)> {
-    let progress = progress(context, &task)?;
+pub fn refresh(
+    context: &Context,
+    task: WorkTask,
+    ancestry: &Ancestry,
+) -> Result<(WorkTask, Progress)> {
+    let progress = progress(context, &task, ancestry)?;
     if task.closed.is_some() {
         return Ok((task, progress));
     }
-    let links = context.store.work_links(&task.id)?;
-    let verified_by_hand = links.iter().any(|link| link.kind == "verified");
+    let verified_by_hand = progress.links.iter().any(|link| link.kind == "verified");
     let (step, turn, text) = derive(&progress, verified_by_hand);
     let mut next = task.clone();
     let mut text = text;
@@ -404,13 +430,21 @@ pub fn refresh(context: &Context, task: WorkTask) -> Result<(WorkTask, Progress)
 }
 
 /// Whether `commit` carries every one of `merged`.
-fn carries(context: &Context, commit: &str, merged: &[(String, i64)]) -> bool {
+fn carries(context: &Context, ancestry: &Ancestry, commit: &str, merged: &[(String, i64)]) -> bool {
     merged.iter().all(|(merge, _)| {
-        merge == commit
-            || context
-                .repo
-                .git(&["merge-base", "--is-ancestor", merge, commit])
-                .is_ok()
+        if merge == commit {
+            return true;
+        }
+        let key = (merge.clone(), commit.to_owned());
+        if let Some(known) = ancestry.borrow().get(&key) {
+            return *known;
+        }
+        let carried = context
+            .repo
+            .git(&["merge-base", "--is-ancestor", merge, commit])
+            .is_ok();
+        ancestry.borrow_mut().insert(key, carried);
+        carried
     })
 }
 
@@ -504,8 +538,7 @@ pub fn stuck(
             text,
         });
     };
-    let links = context.store.work_links(&task.id)?;
-    let active = last_activity(context, task, &links);
+    let active = last_activity(context, task, &progress.links);
     if !task.claimed_by.is_empty() && task.turn == turn_of(&task.claimed_by) {
         let silent = at - active;
         if silent > task.lease {
@@ -702,6 +735,37 @@ mod tests {
             ..merged
         };
         assert_eq!(derive(&releasing, false).1, "citrus");
+    }
+
+    /// A schema set up before the newest index (an earlier build) gets it
+    /// on the next open (needs CITRUS_TEST_STATE).
+    #[test]
+    fn a_schema_without_the_newest_index_is_set_up_again() {
+        let Ok(url) = std::env::var("CITRUS_TEST_STATE") else {
+            return;
+        };
+        let schema = format!(
+            "citrus_unit_index_{}",
+            crate::exec::unique().replace('-', "_")
+        );
+        drop(crate::state::Store::open_schema(&url, &schema).unwrap());
+        let mut client = crate::pool::connect(&url).unwrap();
+        let exists = |client: &mut postgres::Client| -> bool {
+            client
+                .query_one(
+                    "select exists (select 1 from pg_indexes where schemaname = $1 and indexname = 'releases_environment_commit')",
+                    &[&schema],
+                )
+                .unwrap()
+                .get(0)
+        };
+        client
+            .batch_execute(&format!("drop index {schema}.releases_environment_commit"))
+            .unwrap();
+        assert!(!exists(&mut client));
+        drop(crate::state::Store::open_schema(&url, &schema).unwrap());
+        assert!(exists(&mut client));
+        crate::state::Store::drop_schema(&url, &schema).unwrap();
     }
 
     /// A refresh that read the task before it was closed does not reopen it
