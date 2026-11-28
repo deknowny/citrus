@@ -36,6 +36,7 @@ mod slots;
 mod state;
 mod tasks;
 mod versions;
+mod work;
 
 use std::io::IsTerminal;
 use std::time::Duration;
@@ -160,16 +161,35 @@ enum Command {
         #[command(subcommand)]
         action: Option<QueueAction>,
     },
-    /// Every worktree as a task: branch, unmerged commits, runs, notes.
+    /// Tracked tasks (step, whose turn) and every worktree as a task: branch,
+    /// unmerged commits, runs, notes.
     Tasks {
-        /// Include idle and merged worktrees.
+        /// Include idle and merged worktrees, and closed tracked tasks.
         #[arg(long)]
         all: bool,
         #[arg(long)]
         base: Option<String>,
+        /// Only tracked tasks nobody moves: a silent claim, merged and not
+        /// released, released and not verified, a failed release, no movement.
+        #[arg(long)]
+        stuck: bool,
+        /// Only tracked tasks whose turn this is (owner, lead, lead2, agent, citrus).
+        #[arg(long)]
+        turn: Option<String>,
+        /// --stuck: merged and not released (or released and not verified) this long.
+        #[arg(long, default_value = "15m", value_name = "DURATION")]
+        unreleased_after: String,
+        /// --stuck: an open task without an event this long.
+        #[arg(long, default_value = "24h", value_name = "DURATION")]
+        idle_after: String,
     },
-    /// Say what this worktree's task is doing and what blocks it (shown in status and tasks).
+    /// Say what this worktree's task is doing and what blocks it (shown in
+    /// status and tasks); `citrus task new|claim|report|link|verify|close|show`
+    /// track a task from its card to a verified release.
+    #[command(args_conflicts_with_subcommands = true)]
     Task {
+        #[command(subcommand)]
+        action: Option<TaskAction>,
         /// What it is doing, in a line.
         #[arg(value_name = "TITLE")]
         title: Vec<String>,
@@ -530,6 +550,9 @@ enum QueueAction {
         /// Queue a failed, conflicting or cancelled commit again.
         #[arg(long)]
         retry: bool,
+        /// The tracked task this lands (`citrus task new`): it follows the entry.
+        #[arg(long)]
+        task: Option<String>,
     },
     /// What waits, what is checked, what landed (also `citrus queue`).
     List {
@@ -548,6 +571,86 @@ enum QueueAction {
     /// The queue processor (started by `queue add`).
     #[command(hide = true)]
     Work,
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskAction {
+    /// Track a task: what it is, its owner-hub card, whose turn it is.
+    New {
+        #[arg(value_name = "TITLE", required = true)]
+        title: Vec<String>,
+        /// Its id (`t-` is added); default `t-<utc>-<random>`.
+        #[arg(long)]
+        id: Option<String>,
+        /// The owner-hub card it answers (`Q-123`).
+        #[arg(long)]
+        card: Option<String>,
+        /// owner, lead, lead2, agent or citrus.
+        #[arg(long, default_value = "lead")]
+        turn: String,
+        /// A release unit the change must reach (repeatable).
+        #[arg(long = "unit", value_name = "UNIT")]
+        units: Vec<String>,
+        /// The assignment in full.
+        #[arg(long)]
+        about: Option<String>,
+    },
+    /// Take a task: the turn is the claimant's while it reports within the lease.
+    Claim {
+        task: String,
+        /// Who takes it: lead, lead2 or an agent's name.
+        #[arg(long = "as", value_name = "WHO")]
+        who: String,
+        /// Silence the claim survives (`2h`, `90m`).
+        #[arg(long, default_value = "2h")]
+        lease: String,
+    },
+    /// Say how it goes; the turn returns to the lead (`--turn` to another).
+    Report {
+        task: String,
+        /// What was done, what is next.
+        #[arg(required = true, value_name = "TEXT")]
+        note: Vec<String>,
+        /// The claimant's part is done: the claim is released.
+        #[arg(long)]
+        done: bool,
+        #[arg(long, default_value = "lead")]
+        turn: String,
+    },
+    /// Link what the task is made of: branches, queue entries, releases, units.
+    Link {
+        task: String,
+        #[arg(long)]
+        branch: Vec<String>,
+        /// A queue entry (`q-…`).
+        #[arg(long)]
+        queue: Vec<String>,
+        /// A release (`rel-…`, a unique prefix).
+        #[arg(long)]
+        release: Vec<String>,
+        /// A release unit the change must reach.
+        #[arg(long = "unit", value_name = "UNIT")]
+        units: Vec<String>,
+        #[arg(long)]
+        card: Option<String>,
+    },
+    /// Record that the released result was checked (when no verify or
+    /// postcheck step of its release proved it).
+    Verify {
+        task: String,
+        /// What was checked and how.
+        #[arg(required = true, value_name = "TEXT")]
+        note: Vec<String>,
+    },
+    /// Close a task: nothing more happens to it.
+    Close {
+        task: String,
+        /// Why, in a line.
+        #[arg(value_name = "TEXT")]
+        note: Vec<String>,
+    },
+    /// A task with its links and latest events.
+    Show { task: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1024,8 +1127,32 @@ fn execute(command: Option<Command>, json: bool, profile: Option<String>) -> Res
             release,
         } => integrate_command(&mut context, base, push, !no_run, &release, json),
         Command::Queue { action } => queue_command(&mut context, action, json),
-        Command::Tasks { all, base } => tasks_command(&context, all, base, json),
+        Command::Tasks {
+            all,
+            base,
+            stuck,
+            turn,
+            unreleased_after,
+            idle_after,
+        } => {
+            let limits = work::Limits {
+                unreleased: work::parse_duration(&unreleased_after)?,
+                idle: work::parse_duration(&idle_after)?,
+            };
+            if let Some(turn) = &turn {
+                work::check_turn(turn)?;
+            }
+            if stuck {
+                return stuck_command(&context, limits, turn.as_deref(), json);
+            }
+            tasks_command(&context, all, base, turn.as_deref(), json)
+        }
         Command::Task {
+            action: Some(action),
+            ..
+        } => task_action(&mut context, action, json),
+        Command::Task {
+            action: None,
             title,
             scope,
             blocked,
@@ -2515,10 +2642,17 @@ fn queue_command(context: &mut Context, action: Option<QueueAction>, json: bool)
             wait,
             wait_release,
             retry,
+            task,
         } => {
             let releases = queue::parse_releases(context, &release)?;
             let base = given.unwrap_or(base);
+            let tracked = task
+                .map(|task| context.store.work_resolve(&task))
+                .transpose()?;
             let (entry, inserted) = queue::add(context, &base, &releases, retry)?;
+            if let Some(tracked) = tracked {
+                link_queue_entry(context, tracked, &entry)?;
+            }
             if !inserted && !json {
                 println!("already queued (the same commit):");
             }
@@ -2600,8 +2734,34 @@ fn queue_command(context: &mut Context, action: Option<QueueAction>, json: bool)
     }
 }
 
-fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool) -> Result<i32> {
+fn tasks_command(
+    context: &Context,
+    all: bool,
+    base: Option<String>,
+    turn: Option<&str>,
+    json: bool,
+) -> Result<i32> {
     let base = base.unwrap_or_else(|| context.repo.config.plan.base.clone());
+    let mut tracked = Vec::new();
+    for task in context.store.work_tasks(all)? {
+        let (task, _) = work::refresh(context, task)?;
+        if turn.is_none_or(|turn| task.turn == turn && task.closed.is_none()) {
+            tracked.push(task);
+        }
+    }
+    if turn.is_some() {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"schema": SCHEMA, "tracked": tracked}))?
+            );
+        } else {
+            for task in &tracked {
+                println!("{}", work::describe(task));
+            }
+        }
+        return Ok(0);
+    }
     let tasks = tasks::list(context, &base)?;
     let shown: Vec<&tasks::Task> = tasks
         .iter()
@@ -2611,10 +2771,16 @@ fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool)
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"schema": SCHEMA, "base": base, "total": tasks.len(), "tasks": shown, "agreements": context.store.agreements()?})
+                &json!({"schema": SCHEMA, "base": base, "tracked": tracked, "total": tasks.len(), "tasks": shown, "agreements": context.store.agreements()?})
             )?
         );
         return Ok(0);
+    }
+    if !tracked.is_empty() {
+        println!("tracked tasks:");
+        for task in &tracked {
+            println!("  {}", work::describe(task));
+        }
     }
     println!(
         "{} of {} worktrees{} · base {base}",
@@ -2665,6 +2831,313 @@ fn tasks_command(context: &Context, all: bool, base: Option<String>, json: bool)
             );
             println!("      reopen: {}", agreement.reopen);
         }
+    }
+    Ok(0)
+}
+
+/// `citrus tasks --stuck`: the tracked tasks nobody moves, one line each.
+fn stuck_command(
+    context: &Context,
+    limits: work::Limits,
+    turn: Option<&str>,
+    json: bool,
+) -> Result<i32> {
+    let mut found = Vec::new();
+    for task in context.store.work_tasks(false)? {
+        let (task, progress) = work::refresh(context, task)?;
+        found.extend(
+            work::stuck(context, &task, &progress, limits)?
+                .into_iter()
+                .filter(|stuck| turn.is_none_or(|turn| stuck.to == turn)),
+        );
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"schema": SCHEMA, "stuck": found}))?
+        );
+    } else if found.is_empty() {
+        println!("no stuck tasks");
+    } else {
+        for stuck in &found {
+            println!(
+                "{} {}{} → {}: {}",
+                stuck.task,
+                stuck.kind,
+                if stuck.card.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", stuck.card)
+                },
+                stuck.to,
+                stuck.text
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// Follow `entry` from `task`: the entry, its branch and worktree, its units.
+fn link_queue_entry(
+    context: &Context,
+    mut task: state::WorkTask,
+    entry: &state::QueueEntry,
+) -> Result<()> {
+    let store = &context.store;
+    store.work_link(&task.id, "queue", &entry.id)?;
+    store.work_link(&task.id, "worktree", &entry.worktree)?;
+    if !entry.branch.is_empty() && entry.branch != "(detached)" {
+        store.work_link(&task.id, "branch", &entry.branch)?;
+    }
+    work::add_units(
+        &mut task,
+        entry.release_units().into_iter().map(|(unit, _)| unit),
+    );
+    if work::step_rank(&task.step) < work::step_rank("in-queue") && task.closed.is_none() {
+        task.step = "in-queue".into();
+        task.turn = "citrus".into();
+    }
+    task.updated = now() as i64;
+    store.work_update(&task, &exec::agent(), &format!("queued {}", entry.id))?;
+    Ok(())
+}
+
+/// Units named on the command line, checked against the declared release units.
+fn release_units(context: &mut Context, units: &[String]) -> Result<Vec<String>> {
+    Ok(queue::parse_releases(context, units)?
+        .split(',')
+        .filter(|item| !item.is_empty())
+        .map(|item| item.split(':').next().unwrap_or(item).to_owned())
+        .collect())
+}
+
+fn task_action(context: &mut Context, action: TaskAction, json: bool) -> Result<i32> {
+    let agent = exec::agent();
+    let at = now() as i64;
+    let (task, text) = match action {
+        TaskAction::New {
+            title,
+            id,
+            card,
+            turn,
+            units,
+            about: text,
+        } => {
+            let title = title.join(" ");
+            work::check_text(&title)?;
+            anyhow::ensure!(!title.trim().is_empty(), "a task has a title");
+            work::check_turn(&turn)?;
+            if let Some(card) = &card {
+                work::check_name("a card", card)?;
+            }
+            if let Some(text) = &text {
+                work::check_text(text)?;
+            }
+            let units = release_units(context, &units)?;
+            let task = state::WorkTask {
+                id: work::new_id(id.as_deref())?,
+                title: title.trim().to_owned(),
+                card: card.unwrap_or_default(),
+                step: "open".into(),
+                turn,
+                claimed_by: String::new(),
+                lease: work::DEFAULT_LEASE,
+                units: units.join(","),
+                agent: agent.clone(),
+                created: at,
+                updated: at,
+                closed: None,
+            };
+            let event = text.unwrap_or_else(|| format!("opened: {}", task.title));
+            if !context.store.work_insert(&task, &event)? {
+                let existing = context.store.work_resolve(&task.id)?;
+                anyhow::ensure!(
+                    existing.title == task.title,
+                    "task {} exists with another title: {}",
+                    task.id,
+                    existing.title
+                );
+                // Asking again (a lost terminal) returns the same task.
+                return show_task(context, existing, json);
+            }
+            return show_task(context, task, json);
+        }
+        TaskAction::Claim { task, who, lease } => {
+            work::check_name("a claimant", &who)?;
+            let lease = work::parse_duration(&lease)?;
+            let mut task = context.store.work_resolve(&task)?;
+            anyhow::ensure!(task.closed.is_none(), "{} is closed", task.id);
+            if !task.claimed_by.is_empty() && task.claimed_by != who {
+                eprintln!(
+                    "citrus: {} was claimed by {}; now {who}",
+                    task.id, task.claimed_by
+                );
+            }
+            task.claimed_by = who.clone();
+            task.lease = lease;
+            task.turn = work::turn_of(&who).to_owned();
+            if task.step == "open" {
+                task.step = "claimed".into();
+            }
+            // The worktree and branch it is claimed from are where its work shows.
+            let branch = context.repo.branch();
+            let base_branch = context
+                .repo
+                .config
+                .plan
+                .base
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            if branch != "(detached)"
+                && !branch.is_empty()
+                && branch != base_branch
+                && branch != "HEAD"
+            {
+                context.store.work_link(&task.id, "branch", &branch)?;
+                context
+                    .store
+                    .work_link(&task.id, "worktree", &context.worktree())?;
+            }
+            (
+                task,
+                format!("claimed by {who} (lease {})", report::age(lease)),
+            )
+        }
+        TaskAction::Report {
+            task,
+            note,
+            done,
+            turn,
+        } => {
+            let text = note.join(" ");
+            work::check_text(&text)?;
+            work::check_turn(&turn)?;
+            let mut task = context.store.work_resolve(&task)?;
+            task.turn = turn;
+            if done {
+                task.claimed_by.clear();
+            }
+            (task, if done { format!("done: {text}") } else { text })
+        }
+        TaskAction::Link {
+            task,
+            branch,
+            queue,
+            release,
+            units,
+            card,
+        } => {
+            let mut task = context.store.work_resolve(&task)?;
+            let units = release_units(context, &units)?;
+            let mut linked = Vec::new();
+            for name in &branch {
+                work::check_name("a branch", name)?;
+                context.store.work_link(&task.id, "branch", name)?;
+                linked.push(format!("branch {name}"));
+            }
+            for id in &queue {
+                let entry = context
+                    .store
+                    .queue_entry(id)?
+                    .with_context(|| format!("no queue entry {id}"))?;
+                link_queue_entry(context, task.clone(), &entry)?;
+                task = context.store.work_resolve(&task.id)?;
+                linked.push(format!("queue {id}"));
+            }
+            for reference in &release {
+                let found = context
+                    .store
+                    .resolve_release(reference, &context.worktree())?;
+                context.store.work_link(&task.id, "release", &found.id)?;
+                linked.push(format!("release {}", found.id));
+            }
+            if !units.is_empty() {
+                work::add_units(&mut task, units.iter().cloned());
+                linked.push(format!("units {}", units.join(",")));
+            }
+            if let Some(card) = card {
+                work::check_name("a card", &card)?;
+                linked.push(format!("card {card}"));
+                task.card = card;
+            }
+            anyhow::ensure!(
+                !linked.is_empty(),
+                "link what: --branch, --queue, --release, --unit or --card"
+            );
+            (task, format!("linked {}", linked.join(", ")))
+        }
+        TaskAction::Verify { task, note } => {
+            let text = note.join(" ");
+            work::check_text(&text)?;
+            anyhow::ensure!(!text.trim().is_empty(), "say what was checked");
+            let mut task = context.store.work_resolve(&task)?;
+            anyhow::ensure!(task.closed.is_none(), "{} is closed", task.id);
+            context.store.work_link(&task.id, "verified", &agent)?;
+            task.step = "verified".into();
+            task.turn = "lead".into();
+            (task, format!("verified by {agent}: {text}"))
+        }
+        TaskAction::Close { task, note } => {
+            let text = (!note.is_empty()).then(|| note.join(" "));
+            let mut task = context.store.work_resolve(&task)?;
+            if let Some(text) = &text {
+                work::check_text(text)?;
+            }
+            task.step = "closed".into();
+            task.claimed_by.clear();
+            task.closed = Some(at);
+            (
+                task,
+                text.map_or_else(|| "closed".to_owned(), |text| format!("closed: {text}")),
+            )
+        }
+        TaskAction::Show { task } => {
+            let task = context.store.work_resolve(&task)?;
+            return show_task(context, task, json);
+        }
+    };
+    let mut task = task;
+    task.updated = at;
+    context.store.work_update(&task, &agent, &text)?;
+    show_task(context, task, json)
+}
+
+fn show_task(context: &Context, task: state::WorkTask, json: bool) -> Result<i32> {
+    let (task, progress) = work::refresh(context, task)?;
+    let links = context.store.work_links(&task.id)?;
+    let events = context.store.work_events(&task.id, 10)?;
+    let stuck = work::stuck(context, &task, &progress, work::Limits::default())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": SCHEMA, "task": task, "links": links, "progress": progress,
+                "events": events, "stuck": stuck,
+            }))?
+        );
+        return Ok(0);
+    }
+    println!("{}", work::describe(&task));
+    if !task.units.is_empty() {
+        println!("  units: {}", task.units);
+    }
+    for link in &links {
+        println!("  {}: {}", link.kind, link.value);
+    }
+    for event in &events {
+        println!(
+            "  {} {} [{} · {}] {}",
+            report::compact_utc(event.at as u64),
+            event.agent,
+            event.step,
+            event.turn,
+            event.text
+        );
+    }
+    for stuck in &stuck {
+        println!("! {}: {}", stuck.kind, stuck.text);
     }
     Ok(0)
 }

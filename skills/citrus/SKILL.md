@@ -48,7 +48,10 @@ commands in `next`.
    `--blocked "<action>" --needs "<decision or data, from whom>"` what you wait
    for (`--clear-blocker` when it is resolved). `citrus agree <key> --terms …
    --reopen … --evidence …` records who does what (`--revision N` to change
-   one you read). Instead of messages.
+   one you read). Instead of messages. A tracked task given to you
+   (`t-…`): `citrus task claim <t> --as <you>`, `citrus task report <t> "…"`
+   while working (silence past the lease returns it to the lead), `citrus
+   queue add --task <t> --release <unit>` to land it ([docs/tasks.md](../../docs/tasks.md)).
 9. **Release** — `citrus release` lists units; `citrus release start <unit>
    --dry-run` shows the exact commands; `citrus release start <unit> --approve`
    runs them. After a failure or a lost session: `citrus release resume <id>

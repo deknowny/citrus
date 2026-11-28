@@ -800,6 +800,123 @@ fn tasks_say_what_other_worktrees_do_and_need() {
 }
 
 #[test]
+fn tracked_tasks_carry_the_turn_from_claim_to_close() {
+    let project = Project::new("");
+    let (created, code) = project.json(&[
+        "task",
+        "new",
+        "Weekly left",
+        "--id",
+        "weekly-left",
+        "--card",
+        "Q-436",
+        "--about",
+        "add the weekly counter",
+    ]);
+    assert_eq!(code, 0, "{created}");
+    assert_eq!(created["task"]["id"], "t-weekly-left", "{created}");
+    assert_eq!(created["task"]["step"], "open");
+    assert_eq!(created["task"]["turn"], "lead");
+    // Asking again returns the same task.
+    let (again, code) = project.json(&["task", "new", "Weekly left", "--id", "weekly-left"]);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again["task"]["card"], "Q-436", "{again}");
+    // A wrong turn is refused.
+    assert_ne!(project.json(&["task", "new", "x", "--turn", "nobody"]).1, 0);
+
+    let (claimed, code) =
+        project.json(&["task", "claim", "Q-436", "--as", "lead2", "--lease", "1s"]);
+    assert_eq!(code, 0, "{claimed}");
+    assert_eq!(claimed["task"]["step"], "claimed", "{claimed}");
+    assert_eq!(claimed["task"]["turn"], "lead2");
+    assert_eq!(claimed["task"]["claimed_by"], "lead2");
+    // Silent past its lease: the lead hears of it.
+    std::thread::sleep(Duration::from_millis(2100));
+    let (stuck, _) = project.json(&["tasks", "--stuck"]);
+    let silent: Vec<&Value> = stuck["stuck"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["task"] == "t-weekly-left")
+        .collect();
+    assert_eq!(silent.len(), 1, "{stuck}");
+    assert_eq!(silent[0]["kind"], "silent", "{stuck}");
+    assert_eq!(silent[0]["to"], "lead");
+    assert_eq!(silent[0]["card"], "Q-436");
+    // No movement for a day, as far as a zero threshold knows.
+    let (idle, _) = project.json(&["tasks", "--stuck", "--idle-after", "0s"]);
+    assert!(
+        idle["stuck"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["kind"] == "idle"),
+        "{idle}"
+    );
+
+    let (reported, code) = project.json(&[
+        "task",
+        "report",
+        "t-weekly",
+        "migration and handler ready",
+        "--done",
+    ]);
+    assert_eq!(code, 0, "{reported}");
+    assert_eq!(reported["task"]["turn"], "lead", "{reported}");
+    assert_eq!(reported["task"]["claimed_by"], "");
+    let (lead, _) = project.json(&["tasks", "--turn", "lead"]);
+    assert!(
+        lead["tracked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == "t-weekly-left"),
+        "{lead}"
+    );
+    let (linked, code) =
+        project.json(&["task", "link", "t-weekly-left", "--branch", "claude-weekly"]);
+    assert_eq!(code, 0, "{linked}");
+    assert!(
+        linked["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link["kind"] == "branch" && link["value"] == "claude-weekly"),
+        "{linked}"
+    );
+    assert_ne!(project.json(&["task", "verify", "t-weekly-left", ""]).1, 0);
+    let (verified, code) =
+        project.json(&["task", "verify", "t-weekly-left", "hub shows the counter"]);
+    assert_eq!(code, 0, "{verified}");
+    assert_eq!(verified["task"]["step"], "verified", "{verified}");
+    let (closed, code) = project.json(&["task", "close", "t-weekly-left"]);
+    assert_eq!(code, 0, "{closed}");
+    assert_eq!(closed["task"]["step"], "closed");
+    let events: Vec<&str> = closed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(events[0], "add the weekly counter", "{closed}");
+    assert!(
+        events
+            .iter()
+            .any(|text| text.starts_with("verified by test")),
+        "{closed}"
+    );
+    let (open, _) = project.json(&["tasks"]);
+    assert!(open["tracked"].as_array().unwrap().is_empty(), "{open}");
+    let (all, _) = project.json(&["tasks", "--all"]);
+    assert_eq!(all["tracked"].as_array().unwrap().len(), 1, "{all}");
+    // A worktree's own description still works.
+    assert_eq!(
+        project.json(&["task", "Schema change"]).0["task"]["title"],
+        "Schema change"
+    );
+}
+
+#[test]
 fn agreements_keep_revisions_and_refuse_stale_updates() {
     let project = Project::new("");
     let agree = |revision: &str, terms: &str| {
@@ -4982,6 +5099,155 @@ fn the_queue_lands_a_batch_and_leaves_out_the_branch_that_breaks_it() {
     assert!(landed.contains("qb\n"), "{landed}\n{status}");
     assert!(!landed.contains("qc"), "{landed}\n{status}");
     assert!(landed.contains("Merge qb into main"), "{landed}\n{status}");
+}
+
+#[test]
+fn a_tracked_task_follows_its_queue_entry_to_the_release() {
+    let project = release_project();
+    with_origin(&project);
+    let queue_dir = tempfile::tempdir().unwrap();
+    let branch = branch_with(&project, "qt", "src/qt.txt", "tracked\n");
+    let (created, code) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &["task", "new", "Tracked change", "--id", "tracked"],
+    );
+    assert_eq!(code, 0, "{created}");
+    let (claimed, _) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &["task", "claim", "t-tracked", "--as", "agent-q"],
+    );
+    assert_eq!(claimed["task"]["turn"], "agent", "{claimed}");
+    let (done, code) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &[
+            "queue",
+            "add",
+            "--task",
+            "t-tracked",
+            "--release",
+            "app",
+            "--wait-release",
+        ],
+    );
+    assert_eq!(code, 0, "{done}");
+    assert_eq!(done["queue"]["state"], "released", "{done}");
+    let release = done["queue"]["started_releases"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("app=")
+        .unwrap()
+        .to_owned();
+    let (shown, code) = citrus_at(&branch, queue_dir.path(), &["task", "show", "t-tracked"]);
+    assert_eq!(code, 0, "{shown}");
+    // `app` has no verify step: released, and the lead verifies by hand.
+    assert_eq!(shown["task"]["step"], "released", "{shown}");
+    assert_eq!(shown["task"]["turn"], "lead", "{shown}");
+    assert_eq!(shown["task"]["units"], "app", "{shown}");
+    let links = shown["links"].as_array().unwrap();
+    for (kind, value) in [
+        ("queue", done["queue"]["id"].as_str().unwrap()),
+        ("release", release.as_str()),
+        ("branch", "qt"),
+    ] {
+        assert!(
+            links
+                .iter()
+                .any(|link| link["kind"] == kind && link["value"] == value),
+            "{kind} {value}: {shown}"
+        );
+    }
+    assert_eq!(
+        shown["progress"]["merged"][0][0], done["queue"]["merged"],
+        "{shown}"
+    );
+    // Released and not verified past the threshold: stuck.
+    let (stuck, _) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &["tasks", "--stuck", "--unreleased-after", "0s"],
+    );
+    assert!(
+        stuck["stuck"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["task"] == "t-tracked" && row["kind"] == "unverified"),
+        "{stuck}"
+    );
+    let (verified, _) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &["task", "verify", "t-tracked", "smoke passed"],
+    );
+    assert_eq!(verified["task"]["step"], "verified", "{verified}");
+    let (stuck, _) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &["tasks", "--stuck", "--unreleased-after", "0s"],
+    );
+    assert!(stuck["stuck"].as_array().unwrap().is_empty(), "{stuck}");
+}
+
+#[test]
+fn a_merged_task_whose_unit_is_not_released_is_stuck() {
+    let project = release_project();
+    with_origin(&project);
+    let queue_dir = tempfile::tempdir().unwrap();
+    let branch = branch_with(&project, "qu", "src/qu.txt", "unreleased\n");
+    let (created, code) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &[
+            "task",
+            "new",
+            "Needs app",
+            "--id",
+            "needs-app",
+            "--unit",
+            "app",
+        ],
+    );
+    assert_eq!(code, 0, "{created}");
+    let (done, code) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &["queue", "add", "--task", "needs-app", "--wait"],
+    );
+    assert_eq!(code, 0, "{done}");
+    assert_eq!(done["queue"]["state"], "merged", "{done}");
+    let (shown, _) = citrus_at(&branch, queue_dir.path(), &["task", "show", "t-needs-app"]);
+    assert_eq!(shown["task"]["step"], "merged", "{shown}");
+    assert_eq!(shown["task"]["turn"], "lead", "{shown}");
+    let (stuck, _) = citrus_at(
+        &branch,
+        queue_dir.path(),
+        &["tasks", "--stuck", "--unreleased-after", "0s"],
+    );
+    let row = stuck["stuck"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["task"] == "t-needs-app")
+        .cloned();
+    let row = row.unwrap_or_else(|| panic!("{stuck}"));
+    assert_eq!(row["kind"], "unreleased", "{stuck}");
+    assert!(
+        row["text"].as_str().unwrap().contains("app not released"),
+        "{stuck}"
+    );
+    // Not yet past the default 15 minutes.
+    let (calm, _) = citrus_at(&branch, queue_dir.path(), &["tasks", "--stuck"]);
+    assert!(
+        calm["stuck"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["task"] != "t-needs-app"),
+        "{calm}"
+    );
 }
 
 #[test]

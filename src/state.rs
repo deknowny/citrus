@@ -1,5 +1,5 @@
 //! Shared state in Postgres: runs, their targets, the evidence they produced,
-//! releases, tasks, agreements and versions. Each repository has its own
+//! releases, tasks, agreements, versions and tracked work (`work_*`). Each repository has its own
 //! schema in the database the pool uses (or CITRUS_STATE).
 
 use std::cell::RefCell;
@@ -149,6 +149,37 @@ CREATE TABLE IF NOT EXISTS queue (
     UNIQUE (worktree, commit_sha, base)
 );
 CREATE INDEX IF NOT EXISTS queue_state ON queue (state, added);
+CREATE TABLE IF NOT EXISTS work_tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    card TEXT NOT NULL DEFAULT '',
+    step TEXT NOT NULL,
+    turn TEXT NOT NULL,
+    claimed_by TEXT NOT NULL DEFAULT '',
+    lease BIGINT NOT NULL DEFAULT 7200,
+    units TEXT NOT NULL DEFAULT '',
+    agent TEXT NOT NULL,
+    created BIGINT NOT NULL,
+    updated BIGINT NOT NULL,
+    closed BIGINT
+);
+CREATE TABLE IF NOT EXISTS work_links (
+    task TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL,
+    added BIGINT NOT NULL,
+    PRIMARY KEY (task, kind, value)
+);
+CREATE TABLE IF NOT EXISTS work_events (
+    seq BIGSERIAL PRIMARY KEY,
+    task TEXT NOT NULL,
+    at BIGINT NOT NULL,
+    agent TEXT NOT NULL,
+    step TEXT NOT NULL,
+    turn TEXT NOT NULL,
+    text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS work_events_task ON work_events (task, seq);
 ";
 
 #[derive(Debug, Clone, Serialize)]
@@ -503,7 +534,7 @@ impl Store {
         let current: bool = client
             .query_one(
                 "select exists (select 1 from information_schema.columns
-                 where table_schema = $1 and table_name = 'queue' and column_name = 'started_releases')",
+                 where table_schema = $1 and table_name = 'work_events' and column_name = 'text')",
                 &[&schema],
             )?
             .get(0);
@@ -1546,5 +1577,213 @@ impl Store {
             params![id, value, now() as i64],
         )?;
         Ok(())
+    }
+}
+
+/// A unit of agent work followed from an owner-hub card to its verified
+/// release (`citrus task new`): its step, whose turn it is, who holds it.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkTask {
+    pub id: String,
+    pub title: String,
+    /// The owner-hub card it answers (`Q-123`), if any.
+    pub card: String,
+    /// open, claimed, in-queue, merged, released, verified or closed.
+    pub step: String,
+    /// owner, lead, lead2, agent or citrus.
+    pub turn: String,
+    /// Who claimed it; empty when nobody holds it.
+    pub claimed_by: String,
+    /// Seconds of silence the claim survives.
+    pub lease: i64,
+    /// Release units its change must reach, separated by commas.
+    pub units: String,
+    pub agent: String,
+    pub created: i64,
+    /// Its last event.
+    pub updated: i64,
+    pub closed: Option<i64>,
+}
+
+/// A branch, queue entry, release or worktree a tracked task is made of.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkLink {
+    pub kind: String,
+    pub value: String,
+    pub added: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkEvent {
+    pub at: i64,
+    pub agent: String,
+    pub step: String,
+    pub turn: String,
+    pub text: String,
+}
+
+const WORK_SELECT: &str = "SELECT id, title, card, step, turn, claimed_by, lease, units, agent, created, updated, closed FROM work_tasks";
+
+fn work_row(row: &Row) -> Result<WorkTask> {
+    Ok(WorkTask {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        card: row.get(2)?,
+        step: row.get(3)?,
+        turn: row.get(4)?,
+        claimed_by: row.get(5)?,
+        lease: row.get(6)?,
+        units: row.get(7)?,
+        agent: row.get(8)?,
+        created: row.get(9)?,
+        updated: row.get(10)?,
+        closed: row.get(11)?,
+    })
+}
+
+impl Store {
+    /// Track a new task; false when its id is taken.
+    pub fn work_insert(&self, task: &WorkTask, text: &str) -> Result<bool> {
+        self.conn.transaction(|tx| {
+            let inserted = tx_execute(tx,
+                "INSERT INTO work_tasks (id, title, card, step, turn, claimed_by, lease, units, agent, created, updated, closed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT (id) DO NOTHING",
+                params![task.id, task.title, task.card, task.step, task.turn, task.claimed_by, task.lease, task.units,
+                        task.agent, task.created, task.updated, task.closed],
+            )? == 1;
+            if inserted {
+                tx_execute(tx,
+                    "INSERT INTO work_events (task, at, agent, step, turn, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![task.id, task.updated, task.agent, task.step, task.turn, text],
+                )?;
+            }
+            Ok(inserted)
+        })
+    }
+
+    /// Store a task's new state with the event that explains it.
+    pub fn work_update(&self, task: &WorkTask, agent: &str, text: &str) -> Result<()> {
+        self.conn.transaction(|tx| {
+            tx_execute(tx,
+                "UPDATE work_tasks SET title = ?2, card = ?3, step = ?4, turn = ?5, claimed_by = ?6, lease = ?7,
+                     units = ?8, updated = ?9, closed = ?10 WHERE id = ?1",
+                params![task.id, task.title, task.card, task.step, task.turn, task.claimed_by, task.lease,
+                        task.units, task.updated, task.closed],
+            )?;
+            tx_execute(tx,
+                "INSERT INTO work_events (task, at, agent, step, turn, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![task.id, task.updated, agent, task.step, task.turn, text],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn work_task(&self, id: &str) -> Result<Option<WorkTask>> {
+        self.conn.query_row(
+            &format!("{WORK_SELECT} WHERE id = ?1"),
+            params![id],
+            work_row,
+        )
+    }
+
+    /// Tracked tasks, newest first; closed ones only with `closed`.
+    pub fn work_tasks(&self, closed: bool) -> Result<Vec<WorkTask>> {
+        self.conn.query_map(
+            &format!("{WORK_SELECT} WHERE ?1 OR closed IS NULL ORDER BY created DESC, id"),
+            params![closed],
+            work_row,
+        )
+    }
+
+    /// A full id (`t-` may be left out), a card (`Q-123`: its newest open
+    /// task) or a unique prefix.
+    pub fn work_resolve(&self, reference: &str) -> Result<WorkTask> {
+        if let Some(task) = self.work_task(reference)? {
+            return Ok(task);
+        }
+        if !reference.starts_with("t-")
+            && let Some(task) = self.work_task(&format!("t-{reference}"))?
+        {
+            return Ok(task);
+        }
+        let by_card = self.conn.query_row(
+            &format!(
+                "{WORK_SELECT} WHERE card = ?1 ORDER BY closed IS NULL DESC, created DESC LIMIT 1"
+            ),
+            params![reference],
+            work_row,
+        )?;
+        if let Some(task) = by_card {
+            return Ok(task);
+        }
+        let found = self.conn.query_map(
+            &format!("{WORK_SELECT} WHERE id LIKE ?1::text || '%' LIMIT 2"),
+            params![reference],
+            work_row,
+        )?;
+        match found.len() {
+            1 => Ok(found.into_iter().next().unwrap_or_else(|| unreachable!())),
+            0 => bail!("no task {reference}: citrus tasks lists them"),
+            _ => bail!("task prefix {reference} is ambiguous"),
+        }
+    }
+
+    /// Link `value` of `kind` to a task; false when it was linked already.
+    pub fn work_link(&self, task: &str, kind: &str, value: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT INTO work_links (task, kind, value, added) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+            params![task, kind, value, now() as i64],
+        )? == 1)
+    }
+
+    pub fn work_links(&self, task: &str) -> Result<Vec<WorkLink>> {
+        self.conn.query_map(
+            "SELECT kind, value, added FROM work_links WHERE task = ?1 ORDER BY added, kind, value",
+            params![task],
+            |row| {
+                Ok(WorkLink {
+                    kind: row.get(0)?,
+                    value: row.get(1)?,
+                    added: row.get(2)?,
+                })
+            },
+        )
+    }
+
+    /// The last `limit` events of a task, oldest first.
+    pub fn work_events(&self, task: &str, limit: i64) -> Result<Vec<WorkEvent>> {
+        let mut events = self.conn.query_map(
+            "SELECT at, agent, step, turn, text FROM work_events WHERE task = ?1 ORDER BY seq DESC LIMIT ?2",
+            params![task, limit],
+            |row| {
+                Ok(WorkEvent {
+                    at: row.get(0)?,
+                    agent: row.get(1)?,
+                    step: row.get(2)?,
+                    turn: row.get(3)?,
+                    text: row.get(4)?,
+                })
+            },
+        )?;
+        events.reverse();
+        Ok(events)
+    }
+
+    /// The passed `citrus apply` of `environment` at `commit` started since
+    /// `since`: a release unit's apply step, whose last step is `verify`.
+    pub fn passed_apply(
+        &self,
+        environment: &str,
+        commit: &str,
+        since: i64,
+    ) -> Result<Option<Release>> {
+        self.conn.query_row(
+            &format!(
+                "{RELEASE_SELECT} WHERE kind = 'apply' AND environment = ?1 AND commit_id = ?2
+                      AND state = 'passed' AND started >= ?3 ORDER BY started DESC LIMIT 1"
+            ),
+            params![environment, commit, since],
+            release_row,
+        )
     }
 }

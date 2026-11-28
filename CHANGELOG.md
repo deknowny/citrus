@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Tracked tasks (docs/tasks.md): `citrus task new|claim|report|link|verify|close|show`
+  follow one piece of work from its card to a verified release, with a step
+  (open → claimed → in-queue → merged → released → verified → closed) and
+  whose turn it is. `queue add --task` links the entry; Citrus moves the step
+  on the queue and its releases. `citrus tasks --stuck` names silent claims,
+  merged-not-released, released-not-verified, failed releases and idle tasks.
+  The text of `task report`/`verify`/`close` is positional (`--text` is the
+  output mode).
 - `citrus queue`: a merge queue. `queue add` queues the committed branch and
   returns; one processor lands waiting branches in batches on the tip of the
   base, halves a red batch to leave out the branch that breaks it, and starts
