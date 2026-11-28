@@ -1416,10 +1416,11 @@ fn integrate_runs_the_after_merge_hook() {
     );
 }
 
-/// The pool tells a build by the one `X.Y.Z (<commit>)` text in its bytes
-/// (`pool publish` of a cross build, `pool fetch` checking what it took).
+/// The pool tells a build by the `X.Y.Z (<commit>)` texts in its bytes
+/// (`pool publish` of a cross build, `pool fetch` checking what it took):
+/// there is one at least, and every one names the commit `--version` says.
 #[test]
-fn the_binary_carries_its_version_once() {
+fn the_binary_carries_only_its_own_version() {
     let output = citrus_command()
         .arg("--version")
         .env("CITRUS_NO_PIN", "1")
@@ -1434,12 +1435,20 @@ fn the_binary_carries_its_version_once() {
         return; // not a clean build: no commit to look for
     }
     let bytes = fs::read(env!("CARGO_BIN_EXE_citrus")).unwrap();
-    let needle = version.as_bytes();
-    let found = bytes
-        .windows(needle.len())
-        .filter(|window| *window == needle)
-        .count();
-    assert_eq!(found, 1, "{version}");
+    let hex = |c: &u8| c.is_ascii_hexdigit() && !c.is_ascii_uppercase();
+    let found: Vec<String> = bytes
+        .windows(42)
+        .filter(|window| window[0] == b'(' && window[41] == b')' && window[1..41].iter().all(hex))
+        .map(|window| String::from_utf8_lossy(&window[1..41]).into_owned())
+        .collect();
+    assert!(
+        found.iter().any(|seen| seen == commit),
+        "{version}: {found:?}"
+    );
+    assert!(
+        found.iter().all(|seen| seen == commit),
+        "{version}: {found:?}"
+    );
 }
 
 #[test]

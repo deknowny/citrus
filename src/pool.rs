@@ -2097,11 +2097,16 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
 /// That `bytes` are a Citrus build of `commit`, and for `platform` when their
 /// header tells (64-bit ELF or Mach-O).
 fn check_binary(bytes: &[u8], commit: &str, platform: &str) -> Result<()> {
-    let version = embedded_version(bytes).context("the file carries no Citrus version")?;
-    anyhow::ensure!(
-        version.ends_with(&format!("({commit})")),
-        "the build is {version}, not {commit}"
-    );
+    // A build holds its version text more than once (clap's and its own):
+    // every one names the same commit.
+    let versions = embedded_versions(bytes);
+    anyhow::ensure!(!versions.is_empty(), "the file carries no Citrus version");
+    if let Some(other) = versions
+        .iter()
+        .find(|version| !version.ends_with(&format!("({commit})")))
+    {
+        bail!("the build is {other}, not {commit}");
+    }
     if let Some(found) = binary_platform(bytes) {
         anyhow::ensure!(
             found == platform,
@@ -2138,21 +2143,30 @@ fn binary_platform(bytes: &[u8]) -> Option<String> {
 
 /// The `X.Y.Z (<commit>)` version text a Citrus binary carries (`--version`).
 fn embedded_version(bytes: &[u8]) -> Option<String> {
+    embedded_versions(bytes).into_iter().next()
+}
+
+/// Every `X.Y.Z (<commit>)` text in `bytes`, in order.
+fn embedded_versions(bytes: &[u8]) -> Vec<String> {
     let hex = |c: &u8| c.is_ascii_hexdigit() && !c.is_ascii_uppercase();
-    bytes.windows(42).enumerate().find_map(|(at, window)| {
-        if window[0] != b'(' || window[41] != b')' || !window[1..41].iter().all(hex) {
-            return None;
-        }
-        // Preceded by "<digits>.<digits>.<digits> ".
-        let head = &bytes[at.saturating_sub(16)..at];
-        let head = std::str::from_utf8(head).ok()?;
-        let version = head
-            .rsplit(|c: char| !(c.is_ascii_digit() || c == '.' || c == ' '))
-            .next()?;
-        let version = version.trim();
-        (version.split('.').count() == 3 && head.ends_with(' '))
-            .then(|| format!("{version} ({})", String::from_utf8_lossy(&window[1..41])))
-    })
+    bytes
+        .windows(42)
+        .enumerate()
+        .filter_map(|(at, window)| {
+            if window[0] != b'(' || window[41] != b')' || !window[1..41].iter().all(hex) {
+                return None;
+            }
+            // Preceded by "<digits>.<digits>.<digits> ".
+            let head = &bytes[at.saturating_sub(16)..at];
+            let head = std::str::from_utf8(head).ok()?;
+            let version = head
+                .rsplit(|c: char| !(c.is_ascii_digit() || c == '.' || c == ' '))
+                .next()?;
+            let version = version.trim();
+            (version.split('.').count() == 3 && head.ends_with(' '))
+                .then(|| format!("{version} ({})", String::from_utf8_lossy(&window[1..41])))
+        })
+        .collect()
 }
 
 /// Published Citrus builds, newest first: commit, platform, sha256, bytes.
@@ -2847,6 +2861,16 @@ mod tests {
         macho.extend_from_slice(format!("x 0.3.0 ({commit})").as_bytes());
         assert_eq!(binary_platform(&macho).as_deref(), Some("macos-aarch64"));
         assert!(check_binary(b"no version here", commit, "linux-x86_64").is_err());
+        // Twice the same version (as real builds hold it): fine; a second,
+        // other version: not that build.
+        let mut twice = elf.clone();
+        twice.extend_from_slice(format!(" 0.3.0 ({commit})").as_bytes());
+        assert!(check_binary(&twice, commit, "linux-x86_64").is_ok());
+        let mut mixed = elf.clone();
+        mixed.extend_from_slice(b" 0.3.0 (");
+        mixed.extend_from_slice(b"cf1d1dfef1657e3f01b594704854b05147701f22");
+        mixed.extend_from_slice(b")");
+        assert!(check_binary(&mixed, commit, "linux-x86_64").is_err());
     }
 
     /// A real executable (this test binary): its header gives this platform
