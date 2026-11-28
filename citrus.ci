@@ -89,7 +89,8 @@ check build {
     // to (an agent's CITRUS_BIN published a build of 241cb0b as cf1d1df).
     let version = cmd!("{target}/fast/citrus --version").env("CITRUS_BIN", "").env("CITRUS_NO_PIN", "1").output()?.stdout.trim();
     let head = cmd!("git rev-parse HEAD").output()?.stdout.trim();
-    assert version.contains(head), "the build says {version}, the tree is at {head}";
+    assert !version.ends_with("-dirty)"), "{version}: the tree has uncommitted changes; commit them, then build";
+    assert version.ends_with("(" + head + ")"), "the build says {version}, the tree is at {head}";
     let published = cmd!("{target}/fast/citrus pool publish {target}/fast/citrus").env("CITRUS_BIN", "").env("CITRUS_NO_PIN", "1").output()?;
     assert published.code == 0, "{published.stdout}\n{published.stderr}";
 }

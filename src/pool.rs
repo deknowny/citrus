@@ -2018,6 +2018,10 @@ fn fetch_binary(client: &mut Client, commit: &str, platform: &str, to: &Path) ->
     if hex::encode(Sha256::digest(&data)) != expected {
         bail!("the pool's Citrus {commit} for {platform} fails its checksum");
     }
+    // Stored under the wrong key (a build that reported another commit):
+    // not taken, the caller builds the commit itself.
+    check_binary(&data, commit, platform)
+        .with_context(|| format!("the pool's Citrus {commit} for {platform} is not that build"))?;
     let dir = to.parent().context("binary dir")?;
     std::fs::create_dir_all(dir)?;
     let staging = dir.join(format!(".citrus-{}", std::process::id()));
@@ -2036,9 +2040,6 @@ pub fn fetch_published(commit: &str, platform: &str, to: &Path) -> Result<bool> 
     fetch_binary(&mut client, commit, platform, to)
 }
 
-/// Publish a Citrus build to the pool under the commit it reports
-/// (`citrus --version`) and `platform` (default: this machine's). The first
-/// build of a commit stays: whoever took it keeps the same bytes.
 /// `file --version` as that build says it, not a build it hands over to: a
 /// pool executor sets CITRUS_BIN, and a pinned checkout names its own build.
 /// 2026-11-28 a build of 241cb0b answered through the executor's CITRUS_BIN
@@ -2054,6 +2055,9 @@ fn own_version(file: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Publish a Citrus build to the pool under the commit it reports
+/// (`citrus --version`) and `platform` (default: this machine's). The first
+/// build of a commit stays: whoever took it keeps the same bytes.
 pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, String, String)> {
     let own = format!("{}-{}", os_label(), arch());
     let platform = platform.map(str::to_owned).unwrap_or_else(|| own.clone());
@@ -2076,6 +2080,8 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
             )
         })?
         .to_owned();
+    // What it says when run must be what its bytes say, for this key.
+    check_binary(&std::fs::read(file)?, &commit, &platform)?;
     let url = url()
         .or_else(|| {
             std::env::var("CITRUS_AGENT_POOL")
@@ -2086,6 +2092,48 @@ pub fn publish_binary(file: &Path, platform: Option<&str>) -> Result<(String, St
     let mut client = connect(&url)?;
     let sha = store_binary(&mut client, &commit, &platform, file)?;
     Ok((commit, platform, sha))
+}
+
+/// That `bytes` are a Citrus build of `commit`, and for `platform` when their
+/// header tells (64-bit ELF or Mach-O).
+fn check_binary(bytes: &[u8], commit: &str, platform: &str) -> Result<()> {
+    let version = embedded_version(bytes).context("the file carries no Citrus version")?;
+    anyhow::ensure!(
+        version.ends_with(&format!("({commit})")),
+        "the build is {version}, not {commit}"
+    );
+    if let Some(found) = binary_platform(bytes) {
+        anyhow::ensure!(
+            found == platform,
+            "the build is for {found}, not {platform}"
+        );
+    }
+    Ok(())
+}
+
+/// `linux-x86_64`, `macos-aarch64`… of a 64-bit ELF or Mach-O executable.
+fn binary_platform(bytes: &[u8]) -> Option<String> {
+    let u16_at = |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    let (os, arch) =
+        if bytes.starts_with(b"\x7fELF") && bytes.get(4) == Some(&2) && bytes.get(5) == Some(&1) {
+            let arch = match u16_at(18)? {
+                0x3e => "x86_64",
+                0xb7 => "aarch64",
+                _ => return None,
+            };
+            ("linux", arch)
+        } else if bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) {
+            let arch = match u32_at(4)? {
+                0x0100_0007 => "x86_64",
+                0x0100_000c => "aarch64",
+                _ => return None,
+            };
+            ("macos", arch)
+        } else {
+            return None;
+        };
+    Some(format!("{os}-{arch}"))
 }
 
 /// The `X.Y.Z (<commit>)` version text a Citrus binary carries (`--version`).
@@ -2713,7 +2761,7 @@ fn disk_short(dir: &Path) -> Option<String> {
 fn trim_caches(machine: &Machine) {
     if let Ok(repos) = std::fs::read_dir(machine.cache.join("slots")) {
         for repo in repos.flatten() {
-            crate::slots::remove_idle(&repo.path(), 1);
+            crate::slots::remove_idle_with_volumes(&repo.path(), 1);
         }
     }
 }
@@ -2733,7 +2781,7 @@ fn maintain(client: &mut Client, machine: &Machine) -> Result<()> {
     // Slots nobody used for two weeks go with their build directories.
     if let Ok(repos) = std::fs::read_dir(machine.cache.join("slots")) {
         for repo in repos.flatten() {
-            crate::slots::remove_idle(&repo.path(), crate::slots::IDLE_DAYS);
+            crate::slots::remove_idle_with_volumes(&repo.path(), crate::slots::IDLE_DAYS);
         }
     }
     let work = machine.cache.join("work");
@@ -2776,6 +2824,43 @@ fn maintain(client: &mut Client, machine: &Machine) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pool keys a build by the commit and platform its bytes carry; a
+    /// build stored under another key is refused.
+    #[test]
+    fn a_build_matches_its_key_or_is_refused() {
+        let commit = "241cb0b7feec0ca6f4ac82f3070e357c30afbb88";
+        let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+        elf.resize(64, 0);
+        elf[18] = 0x3e;
+        elf.extend_from_slice(format!("citrus 0.3.0 ({commit}) ").as_bytes());
+        assert_eq!(binary_platform(&elf).as_deref(), Some("linux-x86_64"));
+        assert!(check_binary(&elf, commit, "linux-x86_64").is_ok());
+        let wrong = check_binary(
+            &elf,
+            "cf1d1dfef1657e3f01b594704854b05147701f22",
+            "linux-x86_64",
+        );
+        assert!(wrong.unwrap_err().to_string().contains(commit));
+        assert!(check_binary(&elf, commit, "macos-aarch64").is_err());
+        let mut macho = vec![0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 0x01];
+        macho.extend_from_slice(format!("x 0.3.0 ({commit})").as_bytes());
+        assert_eq!(binary_platform(&macho).as_deref(), Some("macos-aarch64"));
+        assert!(check_binary(b"no version here", commit, "linux-x86_64").is_err());
+    }
+
+    /// This very build: its bytes carry its version and platform as the pool
+    /// reads them (a clean build only: elsewhere it has no commit).
+    #[test]
+    fn this_build_carries_its_own_key() {
+        let commit = env!("CITRUS_COMMIT");
+        if commit.len() != 40 {
+            return;
+        }
+        let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let platform = format!("{}-{}", os_label(), arch());
+        check_binary(&bytes, commit, &platform).unwrap();
+    }
 
     /// A build that would hand `--version` over (to a pin, or to the
     /// executor's CITRUS_BIN) still reports its own commit to `publish`.

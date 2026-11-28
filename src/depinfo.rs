@@ -34,13 +34,15 @@ pub struct Report {
 fn compiled(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)>> {
     let mut newest: BTreeMap<String, (std::time::SystemTime, PathBuf)> = BTreeMap::new();
     for profile in std::fs::read_dir(target)?.flatten() {
-        for entry in dep_info_files(&profile.path()) {
+        for (package, entry) in dep_info_files(&profile.path()) {
             let path = entry.path();
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
             let name = stem
                 .rsplit_once('-')
                 .map_or(stem.as_ref(), |(name, _)| name);
-            let key = format!("{}:{name}", profile.file_name().to_string_lossy());
+            // In the build-dir layout every package's build script is
+            // `build_script_build.d`: the package keeps them apart.
+            let key = format!("{}:{package}:{name}", profile.file_name().to_string_lossy());
             let modified = entry.metadata()?.modified()?;
             if newest.get(&key).is_none_or(|(time, _)| modified > *time) {
                 newest.insert(key, (modified, path));
@@ -50,7 +52,11 @@ fn compiled(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)>> {
     let root = root.canonicalize()?;
     let mut crates = Vec::new();
     for (_, path) in newest.values() {
-        let text = std::fs::read_to_string(path)?;
+        // Not UTF-8 (a path Cargo wrote as bytes): that crate is skipped,
+        // not the whole report.
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
         // The first rule lists the crate's sources: `<output>: <src> <src> …`.
         let Some(line) = text.lines().find(|line| line.contains(": ")) else {
             continue;
@@ -79,35 +85,44 @@ fn compiled(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)>> {
     Ok(crates)
 }
 
-/// The dep-info files of a profile directory: `deps/*.d` (Cargo before
-/// 1.100), or `build/<package>/<hash>/out/*.d` (its build-dir layout).
-fn dep_info_files(profile: &Path) -> Vec<std::fs::DirEntry> {
+/// The dep-info files of a profile directory, each with its package (empty
+/// when the layout does not say): `deps/*.d` (Cargo before 1.100), or
+/// `build/<package>/<unit>/out/*.d` (its build-dir layout). A unit that ran a
+/// build script (`run/`) has the script's OUT_DIR as `out/`: whatever the
+/// script wrote there is not Cargo's dep-info.
+fn dep_info_files(profile: &Path) -> Vec<(String, std::fs::DirEntry)> {
     let is_dep_info = |entry: &std::fs::DirEntry| {
         entry.path().extension().is_some_and(|ext| ext == "d")
             && entry.file_type().is_ok_and(|kind| kind.is_file())
     };
-    let mut files: Vec<std::fs::DirEntry> = std::fs::read_dir(profile.join("deps"))
+    let mut files: Vec<(String, std::fs::DirEntry)> = std::fs::read_dir(profile.join("deps"))
         .into_iter()
         .flatten()
         .flatten()
         .filter(is_dep_info)
+        .map(|entry| (String::new(), entry))
         .collect();
     for package in std::fs::read_dir(profile.join("build"))
         .into_iter()
         .flatten()
         .flatten()
     {
+        let name = package.file_name().to_string_lossy().into_owned();
         for unit in std::fs::read_dir(package.path())
             .into_iter()
             .flatten()
             .flatten()
         {
+            if unit.path().join("run").exists() {
+                continue;
+            }
             files.extend(
                 std::fs::read_dir(unit.path().join("out"))
                     .into_iter()
                     .flatten()
                     .flatten()
-                    .filter(is_dep_info),
+                    .filter(is_dep_info)
+                    .map(|entry| (name.clone(), entry)),
             );
         }
     }
@@ -181,7 +196,9 @@ fn build_scripts(root: &Path, target: &Path) -> Result<Vec<(String, Vec<String>)
     }
     let mut crates = Vec::new();
     for (dir, (_, output)) in newest {
-        let text = std::fs::read_to_string(&output)?;
+        let Ok(text) = std::fs::read_to_string(&output) else {
+            continue;
+        };
         let package_root = if dir.is_empty() {
             root.to_path_buf()
         } else {
@@ -349,7 +366,46 @@ mod tests {
             "target/debug/build/api/9f8e/run/stdout",
             "cargo:rerun-if-changed=schema.sql\n",
         );
+        // A second package with a build script: each package's
+        // `build_script_build.d` counts, not only the newest of them.
+        write(
+            "crates/web/Cargo.toml",
+            "[package]\nname = \"web\"\nversion = \"0.1.0\"\n",
+        );
+        write("crates/web/build.rs", "");
+        write("crates/api/build.rs", "");
+        write(
+            "target/debug/build/api/3c4d/out/build_script_build.d",
+            "build_script_build: crates/api/build.rs\n",
+        );
+        write(
+            "target/debug/build/web/5e6f/out/build_script_build.d",
+            "build_script_build: crates/web/build.rs\n",
+        );
+        // The OUT_DIR of a build script run (`run/` beside `out/`): a `.d` a
+        // C compiler left there is not Cargo's.
+        write(
+            "target/debug/build/web/7a8b/out/sneaky.d",
+            "sneaky.o: shared/msg.txt\n",
+        );
+        write("target/debug/build/web/7a8b/run/stdout", "");
+        // Not UTF-8: skipped, the rest is still read.
+        let bytes = root
+            .path()
+            .join("target/debug/build/web/9c0d/out/odd-9c0d.d");
+        std::fs::create_dir_all(bytes.parent().unwrap()).unwrap();
+        std::fs::write(&bytes, [0xff, 0xfe, b':', b' ', b'x']).unwrap();
         let crates = compiled(root.path(), &target).unwrap();
+        for script in ["crates/api/build.rs", "crates/web/build.rs"] {
+            assert!(
+                crates.iter().any(|(first, _)| first == script),
+                "{script}: {crates:?}"
+            );
+        }
+        assert!(
+            !crates.iter().any(|(first, _)| first == "shared/msg.txt"),
+            "{crates:?}"
+        );
         assert!(
             crates
                 .iter()

@@ -141,6 +141,55 @@ pub fn remove_idle(root: &Path, days: u64) -> Vec<usize> {
     removed
 }
 
+/// The Docker volumes holding a slot's Cargo targets where the agent keeps
+/// them in volumes (Docker Desktop: `citrus-slot-<repo>-<index>-<name>`),
+/// among the volume names `listing` holds one per line.
+pub fn volumes_of(listing: &str, repo: &str, index: usize) -> Vec<String> {
+    let prefix = format!("citrus-slot-{repo}-{index}-");
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|name| name.starts_with(&prefix))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Deletes the idle slots of `root` (`remove_idle`) and, on a machine that
+/// keeps slot targets in Docker volumes, those volumes too: they are the
+/// slot's build directories, and nothing else removes them.
+pub fn remove_idle_with_volumes(root: &Path, days: u64) -> Vec<usize> {
+    let removed = remove_idle(root, days);
+    if removed.is_empty() || std::env::consts::OS == "linux" {
+        return removed;
+    }
+    let repo = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let listing = std::process::Command::new("docker")
+        .args(["volume", "ls", "--format", "{{.Name}}"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    for index in &removed {
+        let volumes = volumes_of(&listing, &repo, *index);
+        if !volumes.is_empty() {
+            let _ = std::process::Command::new("docker")
+                .args(["volume", "rm"])
+                .args(&volumes)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+    removed
+}
+
 /// The directories under /citrus-cache an image's environment points Cargo at
 /// (`CARGO_TARGET_DIR=/citrus-cache/cargo-target`, a second target, …): each
 /// becomes a directory of the slot.
@@ -161,6 +210,21 @@ pub fn target_dirs(environment: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slots_volumes_are_its_own() {
+        let listing = "citrus-slot-abc-1-cargo-target\ncitrus-slot-abc-10-cargo-target\n\
+                       citrus-slot-abc-1-cargo-target-clyerbot\ncitrus-slot-xyz-1-cargo-target\n\
+                       citrus-cache-abc\n";
+        assert_eq!(
+            volumes_of(listing, "abc", 1),
+            vec![
+                "citrus-slot-abc-1-cargo-target".to_owned(),
+                "citrus-slot-abc-1-cargo-target-clyerbot".to_owned()
+            ]
+        );
+        assert!(volumes_of(listing, "abc", 2).is_empty());
+    }
 
     #[test]
     fn slots_are_claimed_lowest_first_and_given_back_on_drop() {
