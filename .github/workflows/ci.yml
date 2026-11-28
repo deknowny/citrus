@@ -23,6 +23,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # The CLI tests keep their state in Postgres (CITRUS_TEST_STATE; each
+      # throwaway repository its own schema), as citrus.ci's `test` check:
+      # the same postgres:17 with room for the tests' many processes. Not a
+      # `services:` container: those run on Linux runners only and take no
+      # server flags (max_connections).
+      - name: postgres (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run -d --name citrus-test-pg -e POSTGRES_PASSWORD=t -p 127.0.0.1:55432:5432 \
+            postgres:17-alpine -c max_connections=1000
+          until docker exec citrus-test-pg pg_isready -U postgres -h 127.0.0.1 -q; do sleep 0.5; done
+          echo "CITRUS_TEST_STATE=postgres://postgres:t@127.0.0.1:55432/postgres?sslmode=disable" >> "$GITHUB_ENV"
+      - name: postgres (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install --quiet postgresql@17
+          PG="$(brew --prefix postgresql@17)/bin"
+          rm -rf "$RUNNER_TEMP/pg"
+          "$PG/initdb" -D "$RUNNER_TEMP/pg" -U postgres --auth=trust >/dev/null
+          "$PG/pg_ctl" -D "$RUNNER_TEMP/pg" -l "$RUNNER_TEMP/pg.log" \
+            -o "-p 55432 -c max_connections=1000 -k $RUNNER_TEMP" -w start
+          echo "CITRUS_TEST_STATE=postgres://postgres@127.0.0.1:55432/postgres?sslmode=disable" >> "$GITHUB_ENV"
       - name: test
         run: |
           git config --global user.name ci
