@@ -7,7 +7,9 @@
 //! marker among its globs); the planner selects the check for `Cargo.lock`
 //! only if one of those packages changed between the commit the change is
 //! measured from and the working tree, and the check's fingerprint hashes just
-//! their entries. Artifacts keep the whole lock file.
+//! their entries. An artifact whose inputs carry the marker is keyed the same
+//! way (`build_slice_digest`): an image built from `userbot` is not rebuilt or
+//! released again for a new dev-dependency of an unrelated crate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -129,6 +131,23 @@ pub fn slice_digest(lock: &str, reach: &BTreeSet<String>) -> String {
     hex::encode(digest.finalize())
 }
 
+/// What a build from closures reaching `reach` takes from `lock`: the entries
+/// of those packages and everything outside `[[package]]` (the lock format
+/// `version`, which Cargo reads for every build). A lock file that cannot be
+/// read counts whole.
+pub fn build_slice_digest(lock: &str, reach: &BTreeSet<String>) -> String {
+    use sha2::{Digest, Sha256};
+    let Ok(mut table) = lock.parse::<toml::Table>() else {
+        return hex::encode(Sha256::digest(lock.as_bytes()));
+    };
+    table.remove("package");
+    let mut digest = Sha256::new();
+    digest.update(format!("{table:?}").as_bytes());
+    digest.update([0]);
+    digest.update(slice_digest(lock, reach).as_bytes());
+    hex::encode(digest.finalize())
+}
+
 /// The packages the plan being made sees changed; None: unknown, all of them.
 static CHANGED: Mutex<Option<BTreeSet<String>>> = Mutex::new(None);
 
@@ -241,6 +260,29 @@ version = "0.2.0"
         );
         let clyer = reach(LOCK, &["clyer".to_owned()]).unwrap();
         assert_ne!(slice_digest(LOCK, &clyer), slice_digest(&edited, &clyer));
+    }
+
+    #[test]
+    fn the_build_slice_follows_the_packages_and_the_lock_format() {
+        let userbot = reach(LOCK, &["userbot".to_owned()]).unwrap();
+        let other = LOCK.replace("ton_core 0.2.0\"]", "ton_core 0.2.0\", \"mio\"]");
+        assert_eq!(
+            build_slice_digest(LOCK, &userbot),
+            build_slice_digest(&other, &userbot)
+        );
+        let tokio = LOCK.replace(
+            "name = \"tokio\"\nversion = \"1.0.0\"",
+            "name = \"tokio\"\nversion = \"1.1.0\"",
+        );
+        assert_ne!(
+            build_slice_digest(LOCK, &userbot),
+            build_slice_digest(&tokio, &userbot)
+        );
+        let format = LOCK.replace("version = 4", "version = 3");
+        assert_ne!(
+            build_slice_digest(LOCK, &userbot),
+            build_slice_digest(&format, &userbot)
+        );
     }
 
     #[test]

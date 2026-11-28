@@ -130,7 +130,12 @@ graph, and:
 - the check's fingerprint hashes those entries, not the file, so a result stays
   reused while only other packages change;
 - a lock file that cannot be read counts as changed for everyone;
-- artifacts (images) keep the whole file as an input: a build is a build.
+- an artifact whose inputs hold a closure is keyed the same way: its key
+  takes the entries of those packages and the lock format `version`, not the
+  file (`citrus artifacts`, `diff` and `apply` show it as
+  `Cargo.lock#reach`). A build with `--locked` reads the whole file, but
+  what it compiles is only the packages the built crates reach, so a new
+  dependency of another crate neither rebuilds nor re-releases the image.
 
 A literal `"Cargo.lock"` in the same glob list is replaced by this rule; keep it
 only in lists without a Cargo closure.

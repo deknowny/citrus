@@ -3055,6 +3055,78 @@ check test_app {
 }
 
 #[test]
+fn an_artifact_key_takes_only_the_lock_entries_its_crates_reach() {
+    let project = Project::new(
+        r#"#[inputs(std::paths::cargo("app") + ["Cargo.lock", "Dockerfile"])]
+artifact app;
+
+#[inputs(["Cargo.lock"])]
+artifact whole;
+
+"#,
+    );
+    let lock = |tool_dependencies: &str| {
+        format!(
+            "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"serde\"]\n\n\
+             [[package]]\nname = \"tool\"\nversion = \"0.1.0\"\ndependencies = [{tool_dependencies}]\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"extra\"\nversion = \"1.0.0\"\n"
+        )
+    };
+    project.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+    project.write("Dockerfile", "FROM scratch\n");
+    project.write("crates/app/Cargo.toml", "[package]\nname = \"app\"\n");
+    project.write("crates/app/src/main.rs", "fn main() {}\n");
+    project.write("crates/tool/Cargo.toml", "[package]\nname = \"tool\"\n");
+    project.write("crates/tool/src/main.rs", "fn main() {}\n");
+    project.write("Cargo.lock", &lock("\"serde\""));
+    project.commit("workspace");
+    let keys = |project: &Project| {
+        let (artifacts, _) = project.json(&["artifacts"]);
+        artifacts["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["artifact"].as_str().unwrap().to_owned(),
+                    row["key"].clone(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = keys(&project);
+
+    // Another crate gains a (dev-)dependency and a source change: the lock and
+    // that crate change, the app's image does not.
+    project.write("Cargo.lock", &lock("\"serde\", \"extra\""));
+    project.write(
+        "crates/tool/Cargo.toml",
+        "[package]\nname = \"tool\"\n[dev-dependencies]\nextra = \"1\"\n",
+    );
+    project.write("crates/tool/src/main.rs", "fn main() { /* tool */ }\n");
+    project.commit("tool depends on extra");
+    let after = keys(&project);
+    assert_eq!(after["app"], before["app"], "{after:?}");
+    assert_ne!(
+        after["whole"], before["whole"],
+        "no closure: the whole lock counts"
+    );
+
+    // A package the app reaches changes in the lock: its key changes.
+    project.write(
+        "Cargo.lock",
+        &lock("\"serde\", \"extra\"").replace(
+            "name = \"serde\"\nversion = \"1.0.0\"",
+            "name = \"serde\"\nversion = \"1.0.1\"",
+        ),
+    );
+    project.commit("serde bumped");
+    assert_ne!(keys(&project)["app"], after["app"]);
+    let (old, _) = project.json(&["artifacts", "--at", "HEAD~1"]);
+    assert_eq!(old["artifacts"][0]["key"], after["app"], "{old}");
+}
+
+#[test]
 fn a_lock_change_selects_only_the_checks_whose_crates_reach_the_changed_package() {
     let project = Project::new(
         r#"#[paths(std::paths::cargo("app"))]

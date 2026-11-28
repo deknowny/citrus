@@ -234,6 +234,26 @@ pub fn command_paths(context: &Context, artifact: &Artifact) -> Result<Option<Ve
     Ok(Some(paths))
 }
 
+/// The lock packages the Cargo closures among `inputs` reach (their
+/// `lock::MARKER` globs); None when there is no closure.
+fn lock_reach(inputs: &[String]) -> Option<std::collections::BTreeSet<String>> {
+    let mut reach = std::collections::BTreeSet::new();
+    let mut found = false;
+    for names in inputs
+        .iter()
+        .filter_map(|pattern| pattern.strip_prefix(crate::lock::MARKER))
+    {
+        found = true;
+        reach.extend(
+            names
+                .split(',')
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    found.then_some(reach)
+}
+
 /// Content key of an artifact at `commit`: its input files (path, mode, blob
 /// id) and its declaration, from Git objects without a checkout. `paths`
 /// replaces the globs when the artifact lists its inputs by command.
@@ -257,6 +277,19 @@ pub fn key_at(
         let blob = parts.nth(1).unwrap_or_default();
         tree.insert(path, format!("{mode} {blob}"));
     }
+    // A Cargo closure among the globs names the lock packages it reaches: of
+    // `Cargo.lock` only their entries count (`lock::build_slice_digest`), and
+    // a literal "Cargo.lock" in the same list gives way to them.
+    let lock_reach = match paths {
+        Some(_) => None,
+        None => lock_reach(&artifact.inputs),
+    };
+    let patterns: Vec<&String> = artifact
+        .inputs
+        .iter()
+        .filter(|pattern| !pattern.starts_with(crate::lock::MARKER))
+        .filter(|pattern| !(lock_reach.is_some() && pattern.as_str() == "Cargo.lock"))
+        .collect();
     let mut files: Vec<(String, String)> = match paths {
         Some(paths) => paths
             .iter()
@@ -272,13 +305,25 @@ pub fn key_at(
         None => tree
             .iter()
             .filter(|(path, _)| {
-                artifact.inputs.iter().any(|pattern| {
+                patterns.iter().any(|pattern| {
                     pattern_matches_any(pattern, &[path.to_string()]).unwrap_or(false)
                 })
             })
             .map(|(path, identity)| ((*path).to_owned(), identity.clone()))
             .collect(),
     };
+    if let Some(reach) = &lock_reach {
+        let slice = match tree.get("Cargo.lock") {
+            Some(_) => {
+                let text = context
+                    .repo
+                    .git(&["show", &format!("{commit}:Cargo.lock")])?;
+                format!("slice {}", crate::lock::build_slice_digest(&text, reach))
+            }
+            None => "missing".to_owned(),
+        };
+        files.push(("Cargo.lock#reach".to_owned(), slice));
+    }
     files.sort();
     if let Some(scope) = &artifact.dockerfile {
         for (path, identity) in files.iter_mut() {
